@@ -87,7 +87,33 @@ struct StatusPanel: View {
     @ObservedObject var controller: Controller
     @State private var portText = ""
     @State private var showSettings = false
+    @State private var contentHeight: CGFloat = 360
+    @State private var availableHeight = max(1, (NSScreen.main?.visibleFrame.height ?? 900) - 24)
+    private var popupHeight: CGFloat { min(contentHeight, availableHeight) }
     var body: some View {
+        // Measure the complete intrinsic content, not a flexible session
+        // ScrollView (whose ideal height does not grow with its rows).
+        ScrollView(.vertical) {
+            panelContent
+                .fixedSize(horizontal: false, vertical: true)
+                .background(GeometryReader { geometry in
+                    Color.clear.preference(key: PanelHeight.self, value: geometry.size.height)
+                })
+        }
+        .scrollDisabled(contentHeight <= availableHeight)
+        .scrollIndicators(contentHeight > availableHeight ? .automatic : .hidden)
+        .frame(width: 360, height: popupHeight)
+        .fixedSize(horizontal: false, vertical: true)
+        .background(PanelVisibility(size: CGSize(width: 360, height: popupHeight), screenHeightChanged: { availableHeight = $0 }) { controller.setPanelVisible($0) })
+        .onPreferenceChange(PanelHeight.self) { height in
+            guard height.isFinite, height > 0 else { return }
+            let measured = ceil(height)
+            if abs(contentHeight - measured) > 0.5 { contentHeight = measured }
+        }
+        .onAppear { portText = String(controller.settings.port) }
+        .onDisappear { controller.setPanelVisible(false) }
+    }
+    private var panelContent: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 Image(systemName: "sparkles").font(.title2).foregroundStyle(.orange)
@@ -111,23 +137,21 @@ struct StatusPanel: View {
             if controller.sessions.isEmpty {
                 Text("No active streams. Open the browser workspace and choose a device.").font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             } else {
-                ScrollView {
-                    VStack(spacing: 10) {
-                        ForEach(controller.sessions.indices, id: \.self) { index in
-                            let row = controller.sessions[index]
-                            HStack(alignment: .top, spacing: 9) {
-                                Image(systemName: "iphone").foregroundStyle(.secondary)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(row["name"] as? String ?? "Device").font(.callout.weight(.medium))
-                                    Text(row["state"] as? String ?? "Streaming").font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                                    Text(row["peer"] as? String ?? "").font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
-                                }
-                                Spacer()
-                                Text("\(row["fps"] as? Int ?? 0) fps").font(.caption).foregroundStyle(.secondary)
+                VStack(spacing: 10) {
+                    ForEach(controller.sessions.indices, id: \.self) { index in
+                        let row = controller.sessions[index]
+                        HStack(alignment: .top, spacing: 9) {
+                            Image(systemName: "iphone").foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(row["name"] as? String ?? "Device").font(.callout.weight(.medium))
+                                Text(row["state"] as? String ?? "Streaming").font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                                Text(row["peer"] as? String ?? "").font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                             }
+                            Spacer()
+                            Text("\(row["fps"] as? Int ?? 0) fps").font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                }.frame(maxHeight: 200)
+                }
             }
             if !controller.screenPermission || !controller.inputPermission {
                 Divider()
@@ -155,34 +179,70 @@ struct StatusPanel: View {
                 Spacer(); Button("Quit Simwisp") { NSApplication.shared.terminate(nil) }
             }.font(.caption)
         }
-        .padding(18).frame(width: 360)
-        .background(PanelVisibility { controller.setPanelVisible($0) })
-        .onAppear { portText = String(controller.settings.port) }
-        .onDisappear { controller.setPanelVisible(false) }
+        .padding(18).frame(maxWidth: .infinity, alignment: .leading)
     }
+}
+
+private struct PanelHeight: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
 // A MenuBarExtra window can stay mounted while hidden, so SwiftUI onAppear /
 // onDisappear alone are not a reliable visibility signal. Observe its actual
 // key-window lifetime; closing or resigning the popup stops the refresher.
 private struct PanelVisibility: NSViewRepresentable {
+    let size: CGSize
+    let screenHeightChanged: (CGFloat) -> Void
     let changed: (Bool) -> Void
-    func makeNSView(context: Context) -> PanelVisibilityView { let view = PanelVisibilityView(); view.changed = changed; return view }
-    func updateNSView(_ view: PanelVisibilityView, context: Context) { view.changed = changed }
+    func makeNSView(context: Context) -> PanelVisibilityView { let view = PanelVisibilityView(); updateNSView(view, context: context); return view }
+    func updateNSView(_ view: PanelVisibilityView, context: Context) {
+        view.changed = changed; view.screenHeightChanged = screenHeightChanged; view.preferredSize = size
+        view.requestResize()
+    }
     static func dismantleNSView(_ view: PanelVisibilityView, coordinator: ()) { view.detach() }
 }
 private final class PanelVisibilityView: NSView {
     var changed: ((Bool) -> Void)?
+    var screenHeightChanged: ((CGFloat) -> Void)?
+    var preferredSize = CGSize.zero
+    private var resizeScheduled = false
     private var observers: [NSObjectProtocol] = []
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow(); detach()
         guard let window else { return }
         let center = NotificationCenter.default
-        observers.append(center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in self?.changed?(true) })
+        observers.append(center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in self?.changed?(true); self?.requestResize() })
         for name in [NSWindow.didResignKeyNotification, NSWindow.willCloseNotification] {
             observers.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in self?.changed?(false) })
         }
-        DispatchQueue.main.async { [weak self, weak window] in self?.changed?(window?.isVisible == true && window?.isKeyWindow == true) }
+        observers.append(center.addObserver(forName: NSWindow.didChangeScreenNotification, object: window, queue: .main) { [weak self] _ in self?.requestResize() })
+        observers.append(center.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in self?.requestResize() })
+        DispatchQueue.main.async { [weak self, weak window] in
+            self?.changed?(window?.isVisible == true && window?.isKeyWindow == true); self?.requestResize()
+        }
+    }
+    func requestResize() {
+        guard window?.isVisible == true, !resizeScheduled else { return }
+        resizeScheduled = true
+        DispatchQueue.main.async { [weak self] in self?.resizeScheduled = false; self?.resizeToContent() }
+    }
+    private func resizeToContent() {
+        guard let window, window.isVisible, preferredSize.width > 0, preferredSize.height > 0 else { return }
+        let area = (window.screen ?? NSScreen.main)?.visibleFrame
+        let limit = max(1, (area?.height ?? 900) - 24)
+        screenHeightChanged?(limit)
+        let size = CGSize(width: preferredSize.width, height: min(preferredSize.height, limit))
+        let current = window.contentRect(forFrameRect: window.frame).size
+        guard abs(current.width - size.width) > 0.5 || abs(current.height - size.height) > 0.5 else { return }
+        // Grow down from the existing menu-bar anchor, without animation.
+        var frame = window.frameRect(forContentRect: CGRect(origin: .zero, size: size))
+        frame.origin = CGPoint(x: window.frame.maxX - frame.width, y: window.frame.maxY - frame.height)
+        if let area {
+            frame.origin.x = max(area.minX, min(frame.origin.x, area.maxX - frame.width))
+            frame.origin.y = max(area.minY + 12, min(frame.origin.y, area.maxY - frame.height))
+        }
+        window.setFrame(frame, display: true, animate: false)
     }
     func detach() {
         observers.forEach { NotificationCenter.default.removeObserver($0) }; observers.removeAll()

@@ -8,6 +8,7 @@ final class DeviceInput {
     let devices: Devices
     let queue = DispatchQueue(label: "Simwisp.input", qos: .userInteractive)
     private var gesture: (id: String, window: DeviceWindow, point: CGPoint, started: Double)?
+    private var adbInputSizes: [String: (checked: Double, width: Int, height: Int)] = [:]
     init(devices: Devices) { self.devices = devices }
     func cancel(_ id: String) {
         queue.async {
@@ -40,6 +41,22 @@ final class DeviceInput {
         let result = try command(adb, ["-s", id] + args, timeout: 8)
         if result.status != 0 { throw WispError(String(decoding: result.error, as: UTF8.self)) }
         return result
+    }
+    private func adbInputSize(_ id: String, landscape: Bool) throws -> (Int, Int) {
+        // ADB gestures require Android display pixels, not the Quartz-sized
+        // browser canvas. Resolve these on demand only on the input queue.
+        let size: (checked: Double, width: Int, height: Int)
+        if let cached = adbInputSizes[id], monotonic() - cached.checked < 8 { size = cached }
+        else {
+            let output = try adb(id, ["shell", "wm", "size"]).text
+            // The last size is the effective override, when one is present.
+            guard let line = output.components(separatedBy: .newlines).last(where: { $0.range(of: "[0-9]+x[0-9]+", options: .regularExpression) != nil }),
+                  let range = line.range(of: "[0-9]+x[0-9]+", options: .regularExpression) else { throw WispError("Cannot read Android input dimensions") }
+            let numbers = line[range].split(separator: "x").compactMap { Int($0) }
+            guard numbers.count == 2, numbers[0] > 0, numbers[1] > 0 else { throw WispError("Invalid Android input dimensions") }
+            size = (monotonic(), numbers[0], numbers[1]); adbInputSizes[id] = size
+        }
+        return landscape ? (max(size.width, size.height), min(size.width, size.height)) : (min(size.width, size.height), max(size.width, size.height))
     }
     func perform(_ message: [String: Any], id: String, completion: @escaping ([String: Any]?) -> Void) {
         queue.async {
@@ -82,9 +99,7 @@ final class DeviceInput {
             } else { Thread.sleep(forTimeInterval: 0.025); mouse(.leftMouseUp, first) }
         case "accessibility_swipe":
             guard android else { return nil }
-            let landscape = (window?.landscape ?? false)
-            let w = landscape ? max(device.width, device.height) : min(device.width, device.height)
-            let h = landscape ? min(device.width, device.height) : max(device.width, device.height)
+            let (w, h) = try adbInputSize(id, landscape: window?.landscape ?? false)
             _ = try adb(id, ["shell", "input", "swipe", String(Int(number("x1") * Double(w))), String(Int(number("y1") * Double(h))), String(Int(number("x2") * Double(w))), String(Int(number("y2") * Double(h))), "300"])
         case "key":
             let name = (m["key"] as? String ?? "").lowercased()

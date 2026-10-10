@@ -131,9 +131,14 @@ final class Devices {
                     }
                 }
             }
-            for device in androidCache {
+            for var device in androidCache {
                 let port = device.id.replacingOccurrences(of: "emulator-", with: "")
-                if let info = hostWindows.first(where: { ($0[kCGWindowOwnerName as String] as? String ?? "").lowercased().hasPrefix("qemu-system") && ($0[kCGWindowName as String] as? String ?? "").hasSuffix(":" + port) && Self.bounds($0).width > 100 }), let window = makeWindow(info, ios: false) { mapped[device.id] = window }
+                if let info = hostWindows.first(where: { ($0[kCGWindowOwnerName as String] as? String ?? "").lowercased().hasPrefix("qemu-system") && ($0[kCGWindowName as String] as? String ?? "").hasSuffix(":" + port) && Self.bounds($0).width > 100 }), let window = makeWindow(info, ios: false) {
+                    mapped[device.id] = window
+                    // Same Quartz crop geometry used for iOS, capture, and HID
+                    // input; Android's internal ADB display size is unrelated.
+                    device.width = Int(window.crop.width); device.height = Int(window.crop.height)
+                }
                 devices.append(device)
             }
             let runningNames = Set(androidCache.map { $0.name.replacingOccurrences(of: " ", with: "_") })
@@ -182,11 +187,10 @@ final class Devices {
             let columns = line.split(whereSeparator: { $0.isWhitespace })
             guard columns.count >= 2, columns[1] == "device", columns[0].hasPrefix("emulator-") else { return nil }
             let serial = String(columns[0])
-            guard let dimensions = try? command(adb, ["-s", serial, "shell", "wm", "size"], timeout: 3), let range = dimensions.text.range(of: "[0-9]+x[0-9]+", options: .regularExpression) else { return nil }
-            let numbers = dimensions.text[range].split(separator: "x").compactMap { Int($0) }
-            guard numbers.count == 2 else { return nil }
             let title = (try? command(adb, ["-s", serial, "emu", "avd", "name"], timeout: 3).text.components(separatedBy: .newlines).first) ?? serial
-            return Device(id: serial, name: title.replacingOccurrences(of: "_", with: " "), platform: "android", width: min(numbers[0], numbers[1]), height: max(numbers[0], numbers[1]))
+            // Unknown until a matching Quartz window is found. Do not present
+            // ADB's physical/override resolution as the streamed window size.
+            return Device(id: serial, name: title.replacingOccurrences(of: "_", with: " "), platform: "android", width: 0, height: 0)
         }
     }
     func boot(_ id: String) throws {
