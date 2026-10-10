@@ -1,0 +1,163 @@
+import Foundation
+import AppKit
+import ApplicationServices
+
+// Global HID mouse input must be serialized across devices. A new gesture
+// releases any prior pointer instead of leaving the host mouse pressed.
+final class DeviceInput {
+    let devices: Devices
+    let queue = DispatchQueue(label: "Simwisp.input", qos: .userInteractive)
+    private var gesture: (id: String, window: DeviceWindow, point: CGPoint, started: Double)?
+    init(devices: Devices) { self.devices = devices }
+    func cancel(_ id: String) {
+        queue.async {
+            if let state = self.gesture, state.id == id { self.mouse(.leftMouseUp, state.point); self.gesture = nil }
+        }
+    }
+    private func mouse(_ kind: CGEventType, _ point: CGPoint) {
+        CGEvent(mouseEventSource: nil, mouseType: kind, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
+    }
+    private func key(_ code: CGKeyCode, flags: CGEventFlags = []) {
+        for down in [true, false] {
+            let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down); event?.flags = flags; event?.post(tap: .cghidEventTap)
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+    private func focus(_ window: DeviceWindow) {
+        NSRunningApplication(processIdentifier: window.pid)?.activate()
+        let app = AXUIElementCreateApplication(window.pid)
+        for root in axAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? [] {
+            if let frame = axFrame(root), abs(frame.minX - window.bounds.minX) < 5, abs(frame.minY - window.bounds.minY) < 5 {
+                AXUIElementPerformAction(root, kAXRaiseAction as CFString)
+                AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, root)
+                break
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.06)
+    }
+    private func adb(_ id: String, _ args: [String]) throws -> CommandResult {
+        guard let adb = devices.adb else { throw WispError("Android SDK adb unavailable") }
+        let result = try command(adb, ["-s", id] + args, timeout: 8)
+        if result.status != 0 { throw WispError(String(decoding: result.error, as: UTF8.self)) }
+        return result
+    }
+    func perform(_ message: [String: Any], id: String, completion: @escaping ([String: Any]?) -> Void) {
+        queue.async {
+            do { completion(try self.handle(message, id: id)) }
+            catch { completion(["type": "input_error", "message": error.localizedDescription]); log("Input: \(error.localizedDescription)") }
+        }
+    }
+    private func handle(_ m: [String: Any], id: String) throws -> [String: Any]? {
+        guard let type = m["type"] as? String, let device = devices.device(id) else { throw WispError("Device is not available") }
+        let android = device.platform == "android"
+        let window = devices.window(id)
+        func number(_ key: String) -> Double { clamp((m[key] as? NSNumber)?.doubleValue ?? 0) }
+        switch type {
+        case "touch_down":
+            guard AXIsProcessTrusted(), let window else { throw WispError("Live input requires Accessibility and a visible device window") }
+            if let state = gesture { mouse(.leftMouseUp, state.point); gesture = nil }
+            let point = window.point(number("x"), number("y"))
+            // Matching the existing live-touch path: do not incur a focus delay per move.
+            mouse(.leftMouseDown, point); gesture = (id, window, point, monotonic())
+        case "touch_move":
+            if var state = gesture, state.id == id {
+                let point = state.window.point(number("x"), number("y")); if point != state.point { mouse(.leftMouseDragged, point); state.point = point; gesture = state }
+            }
+        case "touch_up":
+            if let state = gesture, state.id == id {
+                let point = state.window.point(number("x"), number("y"))
+                if point != state.point { mouse(.leftMouseDragged, point) }
+                Thread.sleep(forTimeInterval: max(0, 0.02 - (monotonic() - state.started)))
+                mouse(.leftMouseUp, point); gesture = nil
+            }
+        case "tap", "drag":
+            guard let window, AXIsProcessTrusted() else { throw WispError("Input requires a visible window and Accessibility permission") }
+            let first = window.point(number(type == "tap" ? "x" : "x1"), number(type == "tap" ? "y" : "y1"))
+            if let state = gesture { mouse(.leftMouseUp, state.point); gesture = nil }
+            mouse(.leftMouseDown, first)
+            if type == "drag" {
+                let end = window.point(number("x2"), number("y2"))
+                for step in 1...20 { let t = Double(step) / 20; mouse(.leftMouseDragged, CGPoint(x: first.x + (end.x - first.x) * t, y: first.y + (end.y - first.y) * t)); Thread.sleep(forTimeInterval: 0.015) }
+                mouse(.leftMouseUp, end)
+            } else { Thread.sleep(forTimeInterval: 0.025); mouse(.leftMouseUp, first) }
+        case "accessibility_swipe":
+            guard android else { return nil }
+            let landscape = (window?.landscape ?? false)
+            let w = landscape ? max(device.width, device.height) : min(device.width, device.height)
+            let h = landscape ? min(device.width, device.height) : max(device.width, device.height)
+            _ = try adb(id, ["shell", "input", "swipe", String(Int(number("x1") * Double(w))), String(Int(number("y1") * Double(h))), String(Int(number("x2") * Double(w))), String(Int(number("y2") * Double(h))), "300"])
+        case "key":
+            let name = (m["key"] as? String ?? "").lowercased()
+            if android {
+                let map = ["home": "KEYCODE_HOME", "back": "KEYCODE_BACK", "return": "KEYCODE_ENTER", "enter": "KEYCODE_ENTER", "delete": "KEYCODE_DEL", "backspace": "KEYCODE_DEL", "escape": "KEYCODE_ESCAPE", "space": "KEYCODE_SPACE", "tab": "KEYCODE_TAB", "arrowleft": "KEYCODE_DPAD_LEFT", "arrowright": "KEYCODE_DPAD_RIGHT", "arrowup": "KEYCODE_DPAD_UP", "arrowdown": "KEYCODE_DPAD_DOWN"]
+                if let key = map[name] { _ = try adb(id, ["shell", "input", "keyevent", key]) }
+            } else {
+                guard AXIsProcessTrusted(), let window else { throw WispError("Keyboard input requires Accessibility") }
+                focus(window)
+                let map: [String: CGKeyCode] = ["backspace": 51, "delete": 51, "return": 36, "enter": 36, "tab": 48, "escape": 53, "arrowleft": 123, "arrowright": 124, "arrowdown": 125, "arrowup": 126, "home": 115, "end": 119, "pageup": 116, "pagedown": 121]
+                if let code = map[name] { key(code) }
+            }
+        case "text":
+            let text = m["text"] as? String ?? ""
+            guard text.utf8.count <= 16_384 else { throw WispError("Text is too long") }
+            if android {
+                // Quote one remote shell argument rather than interpolating user input as a command.
+                let encoded = text.replacingOccurrences(of: " ", with: "%s").replacingOccurrences(of: "'", with: "'\\''")
+                _ = try adb(id, ["shell", "input text '\(encoded)'"])
+            } else {
+                guard AXIsProcessTrusted(), let window else { throw WispError("Typing requires Accessibility") }
+                focus(window)
+                // Simulator forwards paste reliably; Unicode CGEvent injection is not
+                // equivalent to UIKit text input. Preserve the user's clipboard if
+                // nobody else changes it before the Simulator consumes the paste.
+                let board = NSPasteboard.general
+                let previous = (board.pasteboardItems ?? []).map { item -> NSPasteboardItem in
+                    let copy = NSPasteboardItem()
+                    for type in item.types { if let data = item.data(forType: type) { copy.setData(data, forType: type) } }
+                    return copy
+                }
+                board.clearContents(); board.setString(text, forType: .string)
+                let count = board.changeCount
+                key(9, flags: .maskCommand)
+                Thread.sleep(forTimeInterval: 0.25)
+                if board.changeCount == count { board.clearContents(); if !previous.isEmpty { board.writeObjects(previous) } }
+            }
+        case "home":
+            if android { _ = try adb(id, ["shell", "input", "keyevent", "KEYCODE_HOME"]) }
+            else {
+                let result = try command("/usr/bin/xcrun", ["simctl", "launch", id, "com.apple.springboard"], timeout: 8)
+                if result.status != 0, let window { focus(window); key(4, flags: [.maskCommand, .maskShift]) }
+            }
+        case "appearance":
+            let mode = m["mode"] as? String == "light" ? "light" : "dark"
+            if android { _ = try adb(id, ["shell", "cmd", "uimode", "night", mode == "dark" ? "yes" : "no"]) }
+            else { _ = try command("/usr/bin/xcrun", ["simctl", "ui", id, "appearance", mode]) }
+        case "rotate":
+            guard let window else { return ["type": "rotate_failed"] }
+            if android {
+                // Rotate the emulator window/skin as well as Android's orientation.
+                // Merely setting user_rotation leaves a sideways picture inside a
+                // portrait host window. Console rotate advances the skin 90 degrees.
+                _ = try adb(id, ["shell", "settings", "put", "system", "accelerometer_rotation", "1"])
+                for _ in 0..<(window.landscape ? 3 : 1) {
+                    _ = try adb(id, ["emu", "rotate"])
+                    Thread.sleep(forTimeInterval: 0.12)
+                }
+            } else {
+                guard AXIsProcessTrusted() else { return ["type": "rotate_failed"] }
+                focus(window)
+                // Simulator's public keyboard shortcuts avoid AppleScript Automation and an XCTest harness.
+                key(window.landscape ? 124 : 123, flags: .maskCommand)
+            }
+            devices.invalidate()
+            let deadline = monotonic() + 4
+            while monotonic() < deadline {
+                if let updated = devices.window(id), updated.landscape != window.landscape { return ["type": "rotated", "landscape": updated.landscape] }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            return ["type": "rotate_failed"]
+        default: break
+        }
+        return nil
+    }
+}

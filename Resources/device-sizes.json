@@ -1,0 +1,206 @@
+{
+  "iphone se (1st": [
+    320,
+    568
+  ],
+  "iphone se": [
+    375,
+    667
+  ],
+  "iphone 6s plus": [
+    414,
+    736
+  ],
+  "iphone 7 plus": [
+    414,
+    736
+  ],
+  "iphone 8 plus": [
+    414,
+    736
+  ],
+  "iphone 6": [
+    375,
+    667
+  ],
+  "iphone 7": [
+    375,
+    667
+  ],
+  "iphone 8": [
+    375,
+    667
+  ],
+  "iphone x": [
+    375,
+    812
+  ],
+  "iphone xr": [
+    414,
+    896
+  ],
+  "iphone xs max": [
+    414,
+    896
+  ],
+  "iphone xs": [
+    375,
+    812
+  ],
+  "iphone 11 pro max": [
+    414,
+    896
+  ],
+  "iphone 11 pro": [
+    375,
+    812
+  ],
+  "iphone 11": [
+    414,
+    896
+  ],
+  "iphone 12 mini": [
+    360,
+    780
+  ],
+  "iphone 12 pro max": [
+    428,
+    926
+  ],
+  "iphone 12 pro": [
+    390,
+    844
+  ],
+  "iphone 12": [
+    390,
+    844
+  ],
+  "iphone 13 mini": [
+    375,
+    812
+  ],
+  "iphone 13 pro max": [
+    428,
+    926
+  ],
+  "iphone 13 pro": [
+    390,
+    844
+  ],
+  "iphone 13": [
+    390,
+    844
+  ],
+  "iphone 14 pro max": [
+    430,
+    932
+  ],
+  "iphone 14 pro": [
+    393,
+    852
+  ],
+  "iphone 14 plus": [
+    428,
+    926
+  ],
+  "iphone 14": [
+    390,
+    844
+  ],
+  "iphone 15 pro max": [
+    430,
+    932
+  ],
+  "iphone 15 pro": [
+    393,
+    852
+  ],
+  "iphone 15 plus": [
+    430,
+    932
+  ],
+  "iphone 15": [
+    393,
+    852
+  ],
+  "iphone 16 pro max": [
+    440,
+    956
+  ],
+  "iphone 16 pro": [
+    402,
+    874
+  ],
+  "iphone 16 plus": [
+    430,
+    932
+  ],
+  "iphone 16e": [
+    393,
+    852
+  ],
+  "iphone 16": [
+    393,
+    852
+  ],
+  "iphone 17 pro max": [
+    440,
+    956
+  ],
+  "iphone 17 pro": [
+    402,
+    874
+  ],
+  "iphone 17 air": [
+    393,
+    852
+  ],
+  "iphone air": [
+    393,
+    852
+  ],
+  "iphone 17e": [
+    393,
+    852
+  ],
+  "iphone 17": [
+    393,
+    852
+  ],
+  "ipad mini (6": [
+    744,
+    1133
+  ],
+  "ipad mini": [
+    768,
+    1024
+  ],
+  "ipad air (5": [
+    820,
+    1180
+  ],
+  "ipad air (4": [
+    820,
+    1180
+  ],
+  "ipad air": [
+    768,
+    1024
+  ],
+  "ipad pro (12.9": [
+    1024,
+    1366
+  ],
+  "ipad pro (11": [
+    834,
+    1194
+  ],
+  "ipad (10": [
+    820,
+    1180
+  ],
+  "ipad": [
+    768,
+    1024
+  ]
+}

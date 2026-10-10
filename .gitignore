@@ -1,0 +1,29 @@
+# Compiled apps and development caches
+/build/
+/.build/
+/.swiftpm/
+/DerivedData/
+*.dSYM/
+.DS_Store
+
+# Local configuration and credentials
+.env
+.env.*
+settings.json
+*.key
+*.pem
+
+# Generated logs, diagnostics, profiles, and review artifacts
+*.log
+*.log.*
+/diagnostic*
+/*-sample.txt
+/*-review.*
+/diagnostics/
+/profiles/
+/reports/
+/exports/
+/tmp/
+
+# One-off browser migration helper, not part of the application build
+/scripts/prepare-web.ts
