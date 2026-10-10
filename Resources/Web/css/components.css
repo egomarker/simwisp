@@ -729,3 +729,7 @@
 .pairing-screen { margin: auto; max-width: 440px; padding: 32px; line-height: 1.6; }
 .pairing-screen form { display: flex; gap: 8px; }
 .pairing-screen input { flex: 1; min-width: 0; }
+
+.terminal-toggle { display: inline-flex; align-items: center; gap: 7px; margin-left: 12px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elevated); color: var(--text-secondary); font: inherit; font-size: 11px; cursor: pointer; }
+.terminal-toggle:hover, .terminal-toggle.active { background: var(--accent-bg); color: var(--accent); border-color: var(--accent-border); }
+.terminal-toggle:disabled, #btn-terminal:disabled { opacity: .5; cursor: not-allowed; }

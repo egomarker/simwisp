@@ -75,6 +75,9 @@ final class ClientConnection {
     private var fragmented = Data()
     private var fragmentOpcode: UInt8 = 0
     private var timeout: DispatchWorkItem?
+    private var terminalKeepalive: DispatchSourceTimer?
+    private var lastTerminalReceive = monotonic()
+    var onBinary: ((Data) -> Void)?
     var onMessage: ((String) -> Void)?
     var onClose: (() -> Void)?
     var peer: String { connection.peer }
@@ -94,7 +97,10 @@ final class ClientConnection {
         guard !closing else { return }
         buffer.append(data)
         guard buffer.count <= 131_072 else { close(); return }
-        if websocket { armTimeout(45); parseFrames() }
+        if websocket {
+            if terminalKeepalive != nil { lastTerminalReceive = monotonic() } else { armTimeout(45) }
+            parseFrames()
+        }
         else if !handledHTTP { parseHTTP() }
     }
     private func parseHTTP() {
@@ -120,7 +126,7 @@ final class ClientConnection {
             guard request.method == "GET", request.sameOrigin, server?.authorize?(request) == true,
                   headers["connection"]?.lowercased().split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }).contains("upgrade") == true,
                   headers["sec-websocket-version"] == "13", let key = headers["sec-websocket-key"], Data(base64Encoded: key)?.count == 16,
-                  request.path.hasPrefix("/ws/"), request.path != "/ws/pty" else { respond(.json(["error": "WebSocket denied"], status: 403)); return }
+                  request.path.hasPrefix("/ws/") else { respond(.json(["error": "WebSocket denied"], status: 403)); return }
             let accept = Data(Insecure.SHA1.hash(data: Data((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").utf8))).base64EncodedString()
             sendRaw(Data("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(accept)\r\n\r\n".utf8))
             websocket = true; armTimeout(45)
@@ -172,18 +178,33 @@ final class ClientConnection {
             case 8: sendFrame(payload, opcode: 8) { [weak self] in self?.close() }; return
             case 9: sendFrame(payload, opcode: 10)
             case 10: break
-            case 1:
+            case 1, 2:
                 guard fragmentOpcode == 0 else { close(); return }
-                if fin { deliverText(payload) } else { fragmentOpcode = 1; fragmented = payload }
+                if fin { deliver(payload, opcode: opcode) } else { fragmentOpcode = opcode; fragmented = payload }
             case 0:
-                guard fragmentOpcode == 1, fragmented.count + payload.count <= 65_536 else { close(); return }
+                guard (fragmentOpcode == 1 || fragmentOpcode == 2), fragmented.count + payload.count <= 65_536 else { close(); return }
                 fragmented.append(payload)
-                if fin { let message = fragmented; fragmented.removeAll(keepingCapacity: false); fragmentOpcode = 0; deliverText(message) }
+                if fin { let message = fragmented, kind = fragmentOpcode; fragmented.removeAll(keepingCapacity: false); fragmentOpcode = 0; deliver(message, opcode: kind) }
             default: close(); return
             }
         }
     }
-    private func deliverText(_ data: Data) { guard let text = String(data: data, encoding: .utf8) else { close(); return }; onMessage?(text) }
+    private func deliver(_ data: Data, opcode: UInt8) {
+        if opcode == 2 { guard let onBinary else { close(); return }; onBinary(data) }
+        else { guard let text = String(data: data, encoding: .utf8) else { close(); return }; onMessage?(text) }
+    }
+    func startTerminalKeepalive() {
+        timeout?.cancel(); timeout = nil; lastTerminalReceive = monotonic()
+        let timer = DispatchSource.makeTimerSource(queue: server!.queue)
+        timer.schedule(deadline: .now() + 20, repeating: 20, leeway: .seconds(2))
+        timer.setEventHandler { [weak self] in
+            guard let self, !self.closing else { return }
+            let idle = monotonic() - self.lastTerminalReceive
+            if idle > 60 { self.close() } else if idle > 15 { self.ping() }
+        }
+        terminalKeepalive = timer; timer.resume()
+    }
+    func closeAfterSending() { sendFrame(Data(), opcode: 8) { [weak self] in self?.close() } }
     func sendJSON(_ value: [String: Any]) { sendFrame(jsonData(value), opcode: 1) }
     func sendBinary(_ value: Data, completion: (() -> Void)? = nil) { sendFrame(value, opcode: 2, completion: completion) }
     func ping() { sendFrame(Data(), opcode: 9) }
@@ -205,7 +226,8 @@ final class ClientConnection {
     }
     func close() {
         guard !closing else { return }; closing = true
-        timeout?.cancel(); timeout = nil; onClose?(); onMessage = nil; onClose = nil
+        timeout?.cancel(); timeout = nil; terminalKeepalive?.cancel(); terminalKeepalive = nil
+        onClose?(); onMessage = nil; onBinary = nil; onClose = nil
         connection.cancel(); server?.removed(id); buffer.removeAll(); fragmented.removeAll()
     }
 }

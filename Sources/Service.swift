@@ -8,6 +8,7 @@ final class Service {
     let devices: Devices
     let input: DeviceInput
     let server = HTTPServer()
+    private let terminals: TerminalManager
     private let workers = DispatchQueue(label: "Simwisp.tools", qos: .userInitiated, attributes: .concurrent)
     private var streams: [String: StreamSession] = [:] // network queue owns registry
     private let lifecycle = DispatchGroup()
@@ -17,8 +18,12 @@ final class Service {
     var stateChanged: ((String) -> Void)?
     init(settings: Settings) {
         self.settings = settings; devices = Devices(settings: settings); input = DeviceInput(devices: devices)
+        terminals = TerminalManager(settings: settings, network: server.queue)
         cookie = SHA256.hash(data: Data(("simwisp-session-v1:" + settings.pairingToken).utf8)).map { String(format: "%02x", $0) }.joined()
-        server.authorize = { [weak self] request in self?.authenticated(request) == true }
+        server.authorize = { [weak self] request in
+            guard let self, self.authenticated(request) else { return false }
+            return request.path != "/ws/pty" || self.settings.terminalEnabled == true
+        }
         server.route = { [weak self] request, complete in self?.route(request, complete: complete) }
         server.upgrade = { [weak self] request, client in self?.upgrade(request, client: client) }
         server.stateChanged = { [weak self] state in self?.stateChanged?(state) }
@@ -29,6 +34,8 @@ final class Service {
     }
     func stop(completion: @escaping () -> Void = {}) {
         devices.stop(); lifecycle.enter()
+        terminals.stop { self.lifecycle.leave() }
+        lifecycle.enter()
         server.stop { self.input.queue.async { self.lifecycle.leave() } }
         lifecycle.notify(queue: .main, execute: completion)
     }
@@ -42,6 +49,7 @@ final class Service {
         return cookies.contains { let parts = $0.trimmingCharacters(in: .whitespaces).split(separator: "=", maxSplits: 1); return parts.count == 2 && parts[0] == "simwisp_session" && equal(String(parts[1]), cookie) }
     }
     private func upgrade(_ request: HTTPRequest, client: ClientConnection) {
+        if request.path == "/ws/pty" { terminals.attach(request, client: client); return }
         devices.requestRefresh { [weak self, weak client] in
             guard let self, let client else { return }
             self.server.queue.async {
@@ -85,7 +93,8 @@ final class Service {
         if request.method != "GET" && !request.sameOrigin { complete(.json(["error": "Origin denied"], status: 403)); return }
         switch (request.method, request.path) {
         case ("GET", "/api/info"):
-            var info: [String: Any] = ["mode": "fast2 (Native ScreenCaptureKit + Quartz input)", "app": "Simwisp", "version": "0.1.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": false]]
+            var info: [String: Any] = ["mode": "fast2 (Native ScreenCaptureKit + Quartz input)", "app": "Simwisp", "version": "0.1.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true]]
+            if settings.terminalEnabled == true { info["project_dir"] = settings.projectDirectory }
             if let bundle = devices.projectBundleID { info["bundle_id"] = bundle }
             complete(.json(info))
         case ("GET", "/api/sims"):
@@ -93,9 +102,10 @@ final class Service {
         case ("GET", "/api/devices"):
             devices.requestRefresh { complete(.json(self.devices.library())) }
         case ("GET", "/api/sessions"): complete(.json(streams.values.map(\.snapshot)))
+        case ("GET", "/api/terminals"): terminals.snapshots { complete(.json($0)) }
         case ("GET", "/api/status"):
             usage.sample()
-            complete(.json(["cpu_one_core_percent": usage.cpu, "physical_footprint_bytes": usage.memory, "sessions": streams.count, "capture": CaptureHealth.shared.snapshot, "discovery": devices.diagnostics, "panel": panelState, "lan_sharing": settings.shareLAN]))
+            complete(.json(["cpu_one_core_percent": usage.cpu, "physical_footprint_bytes": usage.memory, "sessions": streams.count, "capture": CaptureHealth.shared.snapshot, "discovery": devices.diagnostics, "panel": panelState, "terminal": terminals.diagnostics, "lan_sharing": settings.shareLAN]))
         case ("POST", "/api/request-permissions"):
             let permission = dictionary(request.body)["permission"] as? String
             DispatchQueue.main.async {

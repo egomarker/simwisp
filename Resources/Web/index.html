@@ -114,6 +114,8 @@
         Refresh devices
       </button>
 
+      <button id="btn-terminal" class="sidebar-btn" disabled aria-controls="terminal-panel" aria-expanded="false" title="Enable Mac terminal access in Simwisp’s menu">Mac terminal</button>
+
       <div class="theme-section">
         <span class="settings-heading">Appearance</span>
         <div class="theme-picker" role="group" aria-label="Workspace appearance">
@@ -160,6 +162,32 @@
       <div id="sim-panels"></div>
     </div>
 
+    <!-- Terminal assets load only when opened. -->
+    <div id="terminal-panel" class="closed" inert hidden>
+      <div class="term-resize-handle" id="term-resize-handle"></div>
+      <div class="term-body">
+        <div class="drawer-handle">
+          <div id="term-tabs-bar" class="term-tabs-bar"></div>
+          <div class="drawer-actions">
+            <div id="term-status-dot" class="status-dot" style="margin-right:4px;"></div>
+            <div class="font-size-ctrl">
+              <button class="drawer-btn" id="btn-font-dec" title="Decrease font size">A−</button>
+              <span id="font-size-val">13</span>
+              <button class="drawer-btn" id="btn-font-inc" title="Increase font size">A+</button>
+            </div>
+            <button class="drawer-btn" id="btn-pin-term" title="Pin to side">
+              <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="16" height="16" rx="2"/><path d="M13 2v16"/></svg>
+            </button>
+            <button class="drawer-btn" id="btn-add-term" title="New terminal" style="font-size:16px;font-weight:300;">+</button>
+            <button class="drawer-btn" id="btn-close-term" title="Collapse terminal">
+              <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 7 10 13 16 7"/></svg>
+            </button>
+          </div>
+        </div>
+        <div id="term-panes"></div>
+      </div>
+    </div>
+
     <!-- Keyboard bar (shared, applies to focused panel) -->
     <div id="kbd-bar">
       <input id="kbd-input" class="kbd-input" type="text"
@@ -173,7 +201,7 @@
     <!-- Bottom tab bar — persistent terminal toggle -->
     <div id="bottom-tab-bar">
       <span id="focus-summary" class="workspace-hint">Select a device to start</span>
-      <span class="workspace-footnote">Made for the details.</span>
+      <button id="tab-terminal" class="terminal-toggle" disabled aria-controls="terminal-panel" aria-expanded="false" title="Enable Mac terminal access in Simwisp’s menu"><span aria-hidden="true">&gt;_</span> Terminal</button>
     </div>
 
   </main><!-- /content -->

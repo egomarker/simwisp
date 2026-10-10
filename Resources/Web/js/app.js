@@ -274,6 +274,7 @@ async function loadSims() {
     _writeSimsCache(sims, info);
     updateModeBadge(info);
     renderPermsWidget(info);
+    terminalCapability(info.features?.terminal);
 
     if (info.bundle_id) {
       projFilterWrap.classList.add('visible');
@@ -903,6 +904,140 @@ $('kbd-send').addEventListener('click', sendKbdText);
 $('kbd-bs').addEventListener('click',  () => simPanels.get(focusedUdid)?.stream?.send({ type: 'key', key: 'backspace' }));
 $('kbd-ret').addEventListener('click', () => simPanels.get(focusedUdid)?.stream?.send({ type: 'key', key: 'return' }));
 
+// ── Terminal workspace (loaded on explicit open, never during streaming) ──
+const tabTerminal = $('tab-terminal');
+const btnTerminal = $('btn-terminal');
+const termPanelEl = $('terminal-panel');
+const termPanesEl = $('term-panes');
+const termTabsBar = $('term-tabs-bar');
+const termStatusDot = $('term-status-dot');
+const termResizeHandle = $('term-resize-handle');
+let terminalEnabled = false;
+let terminalLoading = null;
+let SimTerminal = null;
+let terminalResizeObserver = null;
+let termSerial = 0;
+const TERM_TABS_KEY = 'simwispTerminalTabs';
+let termFontSize = 13;
+try { termFontSize = Math.min(24, Math.max(9, parseInt(localStorage.getItem('termFontSize')) || 13)); } catch {}
+$('font-size-val').textContent = termFontSize;
+
+function terminalCapability(enabled) {
+  terminalEnabled = !!enabled;
+  [tabTerminal, btnTerminal].forEach(button => {
+    button.disabled = !terminalEnabled;
+    button.title = terminalEnabled ? 'Open a Mac terminal' : 'Enable Mac terminal access in Simwisp’s menu';
+  });
+  if (!terminalEnabled && termTabs.length) {
+    termTabs.forEach(tab => { tab.terminal.destroy(); tab.el.remove(); });
+    termTabs = []; activeTermTabId = null; closeTerminal(); persistTerminalTabs();
+  }
+}
+function persistTerminalTabs() {
+  try { sessionStorage.setItem(TERM_TABS_KEY, JSON.stringify(termTabs.map(tab => ({ sessionId: tab.terminal.sessionId, label: tab.label })))); } catch {}
+}
+function activeTerminal() { return termTabs.find(tab => tab.id === activeTermTabId); }
+function updateTerminalStatus() {
+  const status = activeTerminal()?.status || 'connecting';
+  termStatusDot.className = 'status-dot';
+  if (status === 'connected') termStatusDot.classList.add('connected');
+  else if (status === 'reconnecting') termStatusDot.classList.add('reconnecting');
+  termStatusDot.title = status; termStatusDot.setAttribute('aria-label', 'Terminal ' + status);
+}
+function renderTermTabs() {
+  termTabsBar.innerHTML = termTabs.map(tab => `<div class="term-tab${tab.id === activeTermTabId ? ' active' : ''}" data-id="${tab.id}" role="tab" tabindex="0" aria-selected="${tab.id === activeTermTabId}"><span class="term-tab-label">${esc(tab.label)}</span><button class="term-tab-close" aria-label="Close ${esc(tab.label)}">✕</button></div>`).join('');
+  termTabsBar.querySelectorAll('.term-tab').forEach(el => {
+    el.addEventListener('click', event => { if (!event.target.closest('.term-tab-close')) activateTermTab(el.dataset.id); });
+    el.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activateTermTab(el.dataset.id); } });
+    el.querySelector('.term-tab-close').addEventListener('click', () => closeTermTab(el.dataset.id));
+  });
+  $('btn-add-term').disabled = termTabs.length >= 8;
+}
+function addTermTab(saved = {}) {
+  if (termTabs.length >= 8) return;
+  const id = 'term-' + (++termSerial);
+  const el = document.createElement('div'); el.className = 'term-pane'; el.id = id; termPanesEl.append(el);
+  const tab = { id, label: saved.label || 'Terminal ' + termSerial, terminal: null, el, status: 'connecting' };
+  termTabs.push(tab);
+  tab.terminal = new SimTerminal(el, {
+    sessionId: saved.sessionId || null,
+    onStatus: status => { tab.status = status; if (activeTermTabId === id) updateTerminalStatus(); },
+    onSession: () => persistTerminalTabs(),
+  });
+  tab.terminal.setFontSize(termFontSize);
+  activateTermTab(id); persistTerminalTabs();
+}
+function activateTermTab(id) {
+  activeTermTabId = id;
+  termTabs.forEach(tab => { tab.el.classList.toggle('active', tab.id === id); tab.el.inert = tab.id !== id; });
+  renderTermTabs(); updateTerminalStatus();
+  if (termOpen) { activeTerminal()?.terminal.fit(); activeTerminal()?.terminal.focus(); }
+}
+function closeTermTab(id) {
+  const index = termTabs.findIndex(tab => tab.id === id); if (index < 0) return;
+  const [tab] = termTabs.splice(index, 1); tab.terminal.destroy(); tab.el.remove();
+  if (!termTabs.length) { activeTermTabId = null; termPinned = false; content.classList.remove('pinned-right'); closeTerminal(); }
+  else if (activeTermTabId === id) activateTermTab(termTabs[Math.max(0, index - 1)].id);
+  renderTermTabs(); persistTerminalTabs(); saveSession();
+}
+async function openTerminal() {
+  if (!terminalEnabled) return;
+  if (!SimTerminal) {
+    if (!terminalLoading) terminalLoading = import('./terminal.js').then(async module => {
+      await module.loadTerminalAssets(); SimTerminal = module.SimTerminal;
+      terminalResizeObserver = new ResizeObserver(() => { if (termOpen) activeTerminal()?.terminal.fit(); });
+      terminalResizeObserver.observe(termPanesEl);
+    }).catch(error => { terminalLoading = null; console.warn('Simwisp terminal:', error.message); tabTerminal.title = 'Terminal could not load; click to retry'; throw error; });
+    try { await terminalLoading; } catch { return; }
+  }
+  if (!terminalEnabled) return;
+  termOpen = true; termPanelEl.hidden = false; termPanelEl.inert = false; termPanelEl.classList.remove('closed');
+  content.classList.add('terminal-open'); content.classList.toggle('pinned-right', termPinned);
+  [tabTerminal, btnTerminal].forEach(button => { button.classList.add('active'); button.setAttribute('aria-expanded', 'true'); });
+  if (!termTabs.length) {
+    let saved = [];
+    try { saved = JSON.parse(sessionStorage.getItem(TERM_TABS_KEY)) || []; } catch {}
+    if (saved.length) saved.slice(0, 8).forEach(addTermTab); else addTermTab();
+  }
+  activeTerminal()?.terminal.reconnect();
+  updateViewportVars(); updateStreamVisibility(); closeMobileSidebar();
+  activeTerminal()?.terminal.fit(); activeTerminal()?.terminal.focus(); saveSession();
+}
+function closeTerminal() {
+  termOpen = false; termPanelEl.classList.add('closed'); termPanelEl.hidden = true; termPanelEl.inert = true;
+  content.classList.remove('terminal-open'); content.classList.remove('pinned-right');
+  [tabTerminal, btnTerminal].forEach(button => { button.classList.remove('active'); button.setAttribute('aria-expanded', 'false'); });
+  updateViewportVars(); updateStreamVisibility(); saveSession();
+}
+[tabTerminal, btnTerminal].forEach(button => button.addEventListener('click', () => { if (termOpen) closeTerminal(); else openTerminal(); }));
+$('btn-close-term').addEventListener('click', closeTerminal);
+$('btn-add-term').addEventListener('click', () => addTermTab());
+$('btn-pin-term').addEventListener('click', () => {
+  termPinned = !termPinned; content.classList.toggle('pinned-right', termPinned);
+  $('btn-pin-term').classList.toggle('active', termPinned); $('btn-pin-term').setAttribute('aria-pressed', String(termPinned));
+  termPanelEl.style.height = ''; termPanelEl.style.width = ''; updateViewportVars(); saveSession();
+});
+function changeTerminalFont(delta) {
+  termFontSize = Math.min(24, Math.max(9, termFontSize + delta)); $('font-size-val').textContent = termFontSize;
+  termTabs.forEach(tab => tab.terminal.setFontSize(termFontSize));
+  try { localStorage.setItem('termFontSize', termFontSize); } catch {}
+}
+$('btn-font-dec').addEventListener('click', () => changeTerminalFont(-1));
+$('btn-font-inc').addEventListener('click', () => changeTerminalFont(1));
+let termDrag = null;
+termResizeHandle.addEventListener('pointerdown', event => {
+  event.preventDefault(); termResizeHandle.setPointerCapture(event.pointerId);
+  termDrag = { x: event.clientX, y: event.clientY, width: termPanelEl.offsetWidth, height: termPanelEl.offsetHeight };
+});
+termResizeHandle.addEventListener('pointermove', event => {
+  if (!termDrag) return;
+  if (termPinned) termPanelEl.style.width = Math.max(240, Math.min(content.clientWidth - 220, termDrag.width + termDrag.x - event.clientX)) + 'px';
+  else termPanelEl.style.height = Math.max(120, Math.min(content.clientHeight - 140, termDrag.height + termDrag.y - event.clientY)) + 'px';
+  updateViewportVars();
+});
+['pointerup', 'pointercancel', 'lostpointercapture'].forEach(name => termResizeHandle.addEventListener(name, () => { termDrag = null; }));
+window.addEventListener('pagehide', () => { persistTerminalTabs(); termTabs.forEach(tab => tab.terminal.destroy({ terminate: false })); });
+
 // ── Session persistence ───────────────────────────────────────────────────────
 const _SESSION_KEY = 'simwispSession';
 
@@ -910,7 +1045,7 @@ function saveSession() {
   try {
     localStorage.setItem(_SESSION_KEY, JSON.stringify({
       openUdids:   [...simPanels.keys()],
-
+      termOpen, termPinned,
       fps:         parseInt(fpsSlider.value),
       quality:     parseInt(qualSlider.value),
       dataSaver:   dsBtn.classList.contains('active'),
@@ -948,5 +1083,7 @@ loadSims().then(() => {
     const sim = allSims.find(sim => sim.id === udid);
     if (sim) addSimPanel(sim.id, sim.name, sim.width, sim.height, sim.platform);
   }
-
+  termPinned = !!s.termPinned;
+  $('btn-pin-term').classList.toggle('active', termPinned);
+  if (s.termOpen && terminalEnabled) openTerminal();
 });

@@ -192,6 +192,7 @@ html, body {
 #terminal-panel.animating {
   transition: height var(--dur-slow) var(--ease), width var(--dur-slow) var(--ease);
 }
+#terminal-panel[hidden] { display: none; }
 #terminal-panel.closed {
   height: 0 !important;
   border-top-color: transparent;

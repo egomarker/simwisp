@@ -10,7 +10,8 @@ A native macOS menu-bar app that brings live iOS and Android simulators into a l
 - **Multiple devices** — view iOS and Android simulators side by side, with resizable panels and independent connections.
 - **Real controls** — taps, drags, Home, rotation, appearance, keyboard/text input, and Android two-finger gestures.
 - **Menu-bar only** — no normal server window; inspect sessions, permissions, and process usage from the menu.
-- **Quiet when idle** — capture and background discovery stop after the final streaming client disconnects. Popup monitoring stops when the popup closes.
+- **Quiet when idle** — capture and background discovery stop after the final streaming client disconnects. Popup monitoring stops when the popup closes. Terminal I/O uses readiness notifications, not polling.
+- **Optional Mac terminals** — login shells with tabs, resizing, themes, reconnect replay and explicit session cleanup. Renderer assets load only when a terminal is opened.
 - **A lightweight workspace** — light, dark, and system themes; no frontend frameworks, package installation, external fonts, or CDN dependencies.
 - **Paired access** — local-only by default, with optional network sharing and browser pairing.
 
@@ -26,7 +27,7 @@ A native macOS menu-bar app that brings live iOS and Android simulators into a l
 
 Run in a logged-in graphical macOS session. Keep the simulator windows open and unminimized.
 
-No Python environment, Bun/Node runtime, or browser dependencies are required to build or run Simwisp.
+No Python environment, Bun/Node runtime, or dependency installation is required to build or run Simwisp. The optional terminal renderer (xterm and fit addon) is bundled locally with its licenses.
 
 ## Build and run
 
@@ -51,6 +52,20 @@ open build/Simwisp.app --args --lan
 
 You can also change **Share on local network** in the app's server settings. Saved settings are reused on subsequent launches; omitting `--lan` does not override a previously saved sharing preference.
 
+### Enable Mac terminals
+
+Terminal access is **disabled by default**. Enable **Allow Mac terminal access** in the menu-bar server settings (saved), or opt in for a launch:
+
+```bash
+open build/Simwisp.app --args --lan --terminal
+```
+
+Refresh your browser, then choose **Mac terminal** in the sidebar or **Terminal** in the workspace footer. Terminals run on the **host Mac**, not inside a simulator. They start a login shell in `--project-dir` (your home directory by default). You can add up to eight tabs, pin the terminal beside simulators, resize it, and adjust its font size.
+
+**Enabling this grants every paired browser shell access as your Mac user.** Use only trusted browsers and networks. `--no-terminal` disables access for a launch, even if it was saved as enabled.
+
+Collapsing the panel preserves tabs. Closing a tab terminates its shell and foreground job; page reloads reconnect to the existing shell. Disconnected shells expire after 30 minutes. While disconnected, PTY reading is suspended; output-producing commands may block when the kernel buffer fills, rather than wasting CPU draining invisible output.
+
 ### Connect a browser
 
 1. Open Simwisp's menu-bar panel.
@@ -68,7 +83,9 @@ Pass options after `open build/Simwisp.app --args`:
 | --- | --- |
 | `--lan` | Enable sharing on network interfaces |
 | `--port 4242` | Set the listening port; allowed range: 1024–65535 |
-| `--project-dir /path/to/project` | Select an Xcode project directory for project-app detection |
+| `--project-dir /path/to/project` | Select the project-app detection directory and terminal working directory |
+| `--terminal` | Enable Mac shell access for paired browsers (default disabled) |
+| `--no-terminal` | Disable Mac shell access, overriding saved preferences |
 | `--android-sdk /path/to/sdk` | Set the Android SDK location explicitly |
 
 For example:
@@ -85,7 +102,7 @@ Launch options apply to a newly started instance. Quit the existing app before r
 
 Simwisp serves the workspace and simulator streams directly from your Mac; it does not need a cloud service.
 
-- Pairing links authorize simulator control. Treat them as private credentials.
+- Pairing links authorize simulator control and, when explicitly enabled on the Mac, host shell access. Treat them as private credentials.
 - APIs require authentication, and WebSocket upgrades and mutating requests enforce same-origin checks.
 - Browser authentication uses an HttpOnly, SameSite Strict cookie.
 - LAN transport is **unencrypted HTTP**. Use it only on a trusted network, or through an encrypted tunnel; do not expose the port directly to the internet.
@@ -95,9 +112,13 @@ Simwisp serves the workspace and simulator streams directly from your Mac; it do
 
 Streaming is paced by frame deadlines and browser acknowledgements, with bounded encoding and socket buffers. Slow connections can reduce FPS and JPEG quality automatically; 60 FPS is a target, not a guarantee on every network or device.
 
-When the final client disconnects, capture is torn down and the discovery timer is cancelled. The menu-bar popup's monitoring timer exists only while the popup is visible/key. Browser device-list requests still perform on-demand discovery.
+When the final simulator streaming client disconnects, capture is torn down and the discovery timer is cancelled. The menu-bar popup's monitoring timer exists only while the popup is visible/key. Browser device-list requests still perform on-demand discovery.
 
-Idle lifecycle verification measured approximately **0.01–0.02% of one CPU core** on the development Mac. The panel's CPU display uses **100% = one core**; measurements are app-process usage, not total simulator or system usage.
+Original no-terminal idle lifecycle verification measured approximately **0.01–0.02% of one CPU core** on the development Mac. A later explicitly sampled terminal review measured **0.0423% with one idle terminal** and **0.0444% with two**, with unchanged PTY I/O counters and no capture demand. Sampling itself adds work; these are short observations, not universal CPU guarantees. The panel's CPU display uses **100% = one core**; measurements are app-process usage, not total simulator or system usage.
+
+Terminal connections never count as simulator streaming demand. PTY reads/writes and child exits are dispatch-event driven on a separate queue; idle terminals do not poll. Cursor blinking and smooth scrolling are disabled. Shell output waits for browser parsing acknowledgements, with at most one bounded chunk in flight; input and replay buffers are capped at 64 KiB. Connected terminal sockets use a low-frequency keepalive; disconnected retention and ACK deadlines are one-shot timers. Actual shell commands naturally consume CPU when doing work.
+
+Only one Simwisp app instance may run at a time; duplicate launches exit without starting another server.
 
 ## Troubleshooting
 
@@ -114,7 +135,8 @@ Idle lifecycle verification measured approximately **0.01–0.02% of one CPU cor
 ## Project layout
 
 ```text
-Sources/                 Native app, capture, input, discovery, HTTP and streams
+Sources/                 Native app, capture, input, discovery, HTTP, PTYs and streams
+Sources/TerminalHost.c    Small native controlling-terminal/login-shell helper
 Resources/Web/           Browser workspace: HTML, CSS, and JavaScript
 Resources/Info.plist      App metadata and menu-bar-only configuration
 Resources/device-sizes.json
@@ -133,6 +155,6 @@ make clean   # Remove build output; quit the app first
 
 **Early development build — version 0.1.0.** Live capture, pairing, multi-device streaming, disconnect/reconnect, and idle cleanup have been exercised on Apple Silicon. The host-architecture build recipe also supports compiling on Intel, but Intel runtime behavior has not been verified.
 
-Some native control combinations still need broader verification, particularly Android rotation and iOS text entry. Terminal sessions and legacy capture backends are intentionally excluded.
+Some native control combinations still need broader verification, particularly Android rotation and iOS text entry. Terminal PTY/security/lifecycle and desktop/mobile browser controls have been exercised on Apple Silicon. Terminal access is optional and disabled by default; legacy capture backends remain excluded.
 
 The repository contains production source and browser resources only; generated logs, diagnostics, review reports, and app bundles are not checked in.

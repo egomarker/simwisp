@@ -21,6 +21,8 @@ final class Controller: ObservableObject {
         let args = ProcessInfo.processInfo.arguments
         if let index = args.firstIndex(of: "--port"), index + 1 < args.count, let port = Int(args[index + 1]), (1024...65535).contains(port) { settings.port = port }
         if args.contains("--lan") { settings.shareLAN = true }
+        if args.contains("--terminal") { settings.terminalEnabled = true }
+        if args.contains("--no-terminal") { settings.terminalEnabled = false }
         if let index = args.firstIndex(of: "--project-dir"), index + 1 < args.count { settings.projectDirectory = args[index + 1] }
         if let index = args.firstIndex(of: "--android-sdk"), index + 1 < args.count { settings.androidSDK = args[index + 1] }
     }
@@ -31,7 +33,7 @@ final class Controller: ObservableObject {
         service.stateChanged = { [weak self] state in DispatchQueue.main.async { self?.state = state } }
         do { try service.start() } catch { state = error.localizedDescription; started = false; service.stop() }
         if panelVisible { startPanelRefresh() }
-        log("Listening on \(settings.shareLAN ? "LAN" : "localhost") port \(settings.port); terminal disabled")
+        log("Listening on \(settings.shareLAN ? "LAN" : "localhost") port \(settings.port); terminal \(settings.terminalEnabled == true ? "enabled" : "disabled")")
     }
     func setPanelVisible(_ visible: Bool) {
         guard visible != panelVisible else { return }
@@ -168,6 +170,8 @@ struct StatusPanel: View {
             DisclosureGroup("Server settings", isExpanded: $showSettings) {
                 VStack(alignment: .leading, spacing: 10) {
                     Toggle("Share on local network", isOn: $controller.settings.shareLAN).onChange(of: controller.settings.shareLAN) { controller.restart() }
+                    Toggle("Allow Mac terminal access", isOn: Binding(get: { controller.settings.terminalEnabled == true }, set: { controller.settings.terminalEnabled = $0; controller.restart() }))
+                    Text("Terminal access lets paired browsers run commands as your Mac user. Enable only for trusted browsers.").font(.caption2).foregroundStyle(.secondary)
                     Text("Links authorize control. LAN HTTP is unencrypted; use only a trusted network or an encrypted tunnel.").font(.caption2).foregroundStyle(.secondary)
                     HStack { Text("Port"); TextField("4141", text: $portText).frame(width: 70); Button("Apply") { if let port = Int(portText), (1024...65535).contains(port) { controller.settings.port = port; controller.restart() } }.disabled(!(Int(portText).map { (1024...65535).contains($0) } ?? false)) }
                     Button("Choose project directory…") { controller.chooseProject() }
@@ -256,6 +260,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cleaningUp = false
     private var readyToQuit = false
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let identifier = Bundle.main.bundleIdentifier ?? "io.simwisp.app"
+        let pid = ProcessInfo.processInfo.processIdentifier
+        if let existing = NSRunningApplication.runningApplications(withBundleIdentifier: identifier).first(where: { $0.processIdentifier != pid && !$0.isTerminated }) {
+            fputs("Simwisp is already running (PID \(existing.processIdentifier)); refusing a duplicate instance.\n", stderr)
+            readyToQuit = true; NSApplication.shared.terminate(nil); return
+        }
         for number in [SIGINT, SIGTERM] {
             signal(number, SIG_IGN)
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)

@@ -50,6 +50,8 @@ func command(_ path: String, _ arguments: [String], timeout: Double = 10) throws
 struct Settings: Codable {
     var port = 4141
     var shareLAN = false
+    // Optional for backward-compatible decoding of pre-terminal saved settings.
+    var terminalEnabled: Bool? = nil
     var fps = 60
     var quality = 20
     var projectDirectory = FileManager.default.homeDirectoryForCurrentUser.path

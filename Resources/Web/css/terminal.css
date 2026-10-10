@@ -1,0 +1,156 @@
+/* ── Resize handle (drag strip at the leading edge of the panel) ── */
+.term-resize-handle {
+  height: 5px;
+  flex-shrink: 0;
+  cursor: row-resize;
+  background: transparent;
+  transition: background var(--dur-fast);
+  z-index: 1;
+}
+.term-resize-handle:hover { background: var(--accent-border); }
+.term-resize-handle:active { background: var(--accent); }
+/* In pinned-right mode the panel is flex-row, so the handle becomes a
+   vertical strip on the left edge. width:5px + align-self:stretch does it. */
+#content.pinned-right .term-resize-handle {
+  width: 5px;
+  height: auto;
+  align-self: stretch;
+  cursor: col-resize;
+}
+/* ── Term body (wraps drawer-handle + panes) ── */
+.term-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+/* ── Drawer header ── */
+.drawer-handle {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 0 var(--sp-2) 0 var(--sp-3);
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+  min-height: 42px;
+  overflow: hidden;
+}
+/* ── Tab bar ── */
+.term-tabs-bar {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  gap: 2px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 4px 0;
+}
+.term-tabs-bar::-webkit-scrollbar { display: none; }
+.term-tab {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 2px 8px 2px 10px;
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background var(--dur-fast), color var(--dur-fast);
+  user-select: none;
+}
+.term-tab:hover  { background: var(--bg-overlay); color: var(--text-secondary); }
+.term-tab.active { background: var(--accent-bg); color: var(--accent); }
+.term-tab-close {
+  background: none;
+  border: none;
+  color: currentColor;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 1px 2px;
+  border-radius: 3px;
+  opacity: 0.4;
+  flex-shrink: 0;
+  transition: opacity var(--dur-fast), background var(--dur-fast);
+}
+.term-tab-close:hover { opacity: 1; background: var(--bg-active); }
+/* ── Drawer action buttons ── */
+.drawer-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+/* ── Font size control ── */
+.font-size-ctrl {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  margin-right: 4px;
+}
+.font-size-ctrl #font-size-val {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
+}
+#btn-font-dec, #btn-font-inc {
+  font-size: 11px;
+  font-weight: 600;
+  width: 24px;
+}
+.drawer-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: none;
+  border: none;
+  border-radius: var(--r-sm);
+  color: var(--text-tertiary);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background var(--dur-fast), color var(--dur-fast);
+  flex-shrink: 0;
+}
+.drawer-btn:hover  { background: var(--bg-overlay); color: var(--text-primary); }
+.drawer-btn:active { background: var(--bg-active); }
+.drawer-btn.active { color: var(--accent); }
+/* ── Terminal panes container ── */
+#term-panes {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+}
+.term-pane {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  overflow: hidden;
+  padding: var(--sp-2) var(--sp-2) env(safe-area-inset-bottom, 0px);
+}
+.term-pane.active { display: flex; }
+.term-pane .xterm        { flex: 1; min-height: 0; }
+.term-pane .xterm-viewport { background: transparent !important; }
+@media (max-width: 700px), (max-height: 480px) and (max-width: 900px) {
+  #content.pinned-right .term-resize-handle {
+    width: auto;
+    height: 5px;
+    align-self: auto;
+    cursor: row-resize;
+  }
+  #app.keyboard-open .term-pane {
+    padding-bottom: var(--sp-2);
+  }
+}
