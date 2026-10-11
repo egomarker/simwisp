@@ -8,7 +8,7 @@ A native macOS menu-bar app that brings live iOS and Android simulators into a l
 
 - **Native capture** — ScreenCaptureKit, bounded frame buffers, JPEG streaming, and adaptive pacing up to 60 FPS.
 - **Multiple devices** — view iOS and Android simulators side by side, with resizable panels and independent connections.
-- **Real controls** — taps, drags, Home, iOS Shake, rotation, appearance, keyboard/text input, and Android two-finger gestures.
+- **Real controls** — taps, drags, Home, iOS Shake and App switcher, rotation, appearance, keyboard/text input, and Android two-finger gestures.
 - **Menu-bar only** — no normal server window; inspect sessions, permissions, and process usage from the menu.
 - **Quiet when idle** — capture and background discovery stop after the final streaming client disconnects. Popup monitoring stops when the popup closes. Terminal I/O uses readiness notifications, not polling.
 - **Optional Mac terminals** — login shells with tabs, resizing, themes, reconnect replay and explicit session cleanup. Renderer assets load only when a terminal is opened.
@@ -78,6 +78,10 @@ The default port is **4141**. Only one controlling browser connection is support
 ### Shake an iOS simulator
 
 The **Shake** icon next to Home in each iOS simulator's bottom controls sends **Control–Command–Z** to that simulator's Mac window. It requires Accessibility permission and an open, visible simulator window. Simwisp verifies the selected window is focused before sending the shortcut; if focusing fails, no keys are sent. Control and Command are explicitly pressed and then released after Z key-up, with the final modifier flags cleared. Android has no Shake button and the native backend rejects Shake requests for Android.
+
+### Open the iOS app switcher
+
+The **App switcher** icon (overlapping app cards) sits beside Home and Shake in each iOS simulator's bottom controls. It holds **Shift + Command**, presses and releases **H twice** with a **120 ms pause** between the presses, then explicitly releases Command and Shift, ending with cleared modifier flags. Both H presses target the same verified, focused simulator window on the serial input queue. Accessibility permission and a visible simulator window are required; a failed focus sends no keys. Android has no App switcher button and the native backend rejects these requests for Android.
 
 ### Authenticator pairing (optional)
 
@@ -196,7 +200,7 @@ make run     # Build and open using saved settings
 make clean   # Remove build output; quit the app first
 ```
 
-The input suite tests iOS Shake eligibility, focus-before-shortcut ordering, the actual complete keyboard event sequence (modifier down, key down/up, modifier release with neutral final flags), repeated Shake/paste/rotation/Home/plain-key regressions and Android/missing-permission/window/focus rejection with inert host callbacks; it never focuses or controls a real simulator.
+The input suite tests iOS Shake/App switcher eligibility, focus-before-shortcut ordering, the actual complete keyboard event sequences (modifier down, key down/up, modifier release with neutral final flags), App switcher's two H presses and 120 ms held-modifier pause through the production dispatcher, repeated requests/paste/rotation/Home/plain-key regressions and Android/missing-permission/window/focus rejection with inert host callbacks; it never focuses or controls a real simulator.
 
 The optional browser target requires existing Google Chrome and Node.js 22+ on macOS, and a free loopback port 45151. It serves synthetic simulator frames and TalkBack events with the real native HTTP/reader/coordinator code; it does not launch an app bundle or control a device. Override the executable with `make NODE=/path/to/node test-browser-accessibility`. To separately check an existing Android ADB connection, run `NODE=/path/to/node Tests/Browser/run.sh --real-adb`; logcat then runs only while the test pane and fixture stream are open, without changing device settings or injecting navigation. A fresh real speech event still needs manual confirmation. Set `TEST_OUTPUT=/path/outside-the-repository` to retain screenshots/JSON; otherwise temporary fixtures and profiles are removed. Tests do not certify live capture FPS.
 

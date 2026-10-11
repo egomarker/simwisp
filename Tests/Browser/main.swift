@@ -48,7 +48,7 @@ for (index,label) in ["Shake simulator", "Rotate screen", "Change appearance"].e
     NSColor.white.setFill(); NSBezierPath(roundedRect:NSRect(x:24,y:y,width:366,height:78),xRadius:12,yRadius:12).fill()
     text(label,44,y+32,19)
 }
-text("Use Shake next to Home below.",28,224,17)
+text("Home · Shake · App switcher below",28,224,17)
 text("Test image — not a live device capture",28,194,12,.gray)
 NSColor.darkGray.setFill(); NSBezierPath(roundedRect:NSRect(x:142,y:14,width:130,height:5),xRadius:2.5,yRadius:2.5).fill()
 NSGraphicsContext.restoreGraphicsState()

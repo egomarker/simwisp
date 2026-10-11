@@ -5,7 +5,7 @@ import ApplicationServices
 // Global HID mouse input must be serialized across devices. A new gesture
 // releases any prior pointer instead of leaving the host mouse pressed.
 final class DeviceInput {
-    static let supportedTypes: Set<String> = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "shake", "rotate", "appearance", "accessibility_swipe"]
+    static let supportedTypes: Set<String> = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "shake", "app_switcher", "rotate", "appearance", "accessibility_swipe"]
 
     // Isolate the shortcut policy from host effects so tests never focus or control a real device.
     static func performShake(platform: String, trusted: Bool, window: DeviceWindow?, focus: (DeviceWindow) -> Bool, key: (CGKeyCode, CGEventFlags) throws -> Void) throws {
@@ -13,6 +13,13 @@ final class DeviceInput {
         guard trusted, let window else { throw WispError("Shake requires Accessibility permission and a visible iOS Simulator window") }
         guard focus(window) else { throw WispError("Cannot focus the selected iOS Simulator window for Shake") }
         try key(6, [.maskControl, .maskCommand]) // ANSI Z: Simulator's Control–Command–Z shortcut.
+    }
+
+    static func performAppSwitcher(platform: String, trusted: Bool, window: DeviceWindow?, focus: (DeviceWindow) -> Bool, key: (CGKeyCode, CGEventFlags, Int) throws -> Void) throws {
+        guard platform == "ios" else { throw WispError("App switcher is iOS-only") }
+        guard trusted, let window else { throw WispError("App switcher requires Accessibility permission and a visible iOS Simulator window") }
+        guard focus(window) else { throw WispError("Cannot focus the selected iOS Simulator window for App switcher") }
+        try key(4, [.maskShift, .maskCommand], 2) // ANSI H twice, holding both modifiers throughout.
     }
 
     let devices: Devices
@@ -37,7 +44,8 @@ final class DeviceInput {
     // Construct the entire chord before posting anything: modifier releases must
     // not depend on whether a later CGEvent allocation succeeds. A private source
     // avoids inheriting stale synthetic modifier flags from the host session.
-    static func keyboardEvents(_ code: CGKeyCode, flags: CGEventFlags = []) throws -> [CGEvent] {
+    static func keyboardEvents(_ code: CGKeyCode, flags: CGEventFlags = [], presses: Int = 1) throws -> [CGEvent] {
+        guard (1...2).contains(presses) else { throw WispError("Keyboard shortcut requires one or two presses") }
         guard let source = CGEventSource(stateID: .privateState) else { throw WispError("Cannot create keyboard event source") }
         let modifiers: [(CGKeyCode, CGEventFlags)] = [(59, .maskControl), (58, .maskAlternate), (56, .maskShift), (55, .maskCommand)]
         let pressed = modifiers.filter { flags.contains($0.1) }
@@ -52,9 +60,11 @@ final class DeviceInput {
             held.insert(modifier)
             try append(key, down: true, flags: held)
         }
-        try append(code, down: true, flags: flags)
-        try append(code, down: false, flags: flags)
-        // Releasing Z alone does not release Control/Command. Send their actual
+        for _ in 0..<presses {
+            try append(code, down: true, flags: flags)
+            try append(code, down: false, flags: flags)
+        }
+        // Keep modifiers held across both presses, then send their actual
         // flagsChanged key-up events in reverse order, clearing the final flags.
         for (key, modifier) in pressed.reversed() {
             held.remove(modifier)
@@ -62,12 +72,21 @@ final class DeviceInput {
         }
         return events
     }
-    private func key(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
-        let events = try Self.keyboardEvents(code, flags: flags)
-        for event in events {
-            event.post(tap: .cghidEventTap)
-            Thread.sleep(forTimeInterval: 0.01)
+    // Inject posting/sleep only for inert tests; production uses this same dispatcher.
+    // Allocate all events before the first post, so releases cannot be skipped by
+    // a later allocation failure. This runs exclusively on the serial input queue.
+    static func sendKeyboard(_ code: CGKeyCode, flags: CGEventFlags = [], presses: Int = 1, post: (CGEvent) -> Void, sleep: (TimeInterval) -> Void) throws {
+        let events = try keyboardEvents(code, flags: flags, presses: presses)
+        for (index, event) in events.enumerated() {
+            post(event)
+            // The only extended gap is between the first key-up and second key-down.
+            let betweenPresses = event.type == .keyUp && index + 1 < events.count && events[index + 1].type == .keyDown
+            sleep(betweenPresses ? 0.12 : 0.01)
         }
+    }
+    private func key(_ code: CGKeyCode, flags: CGEventFlags = [], presses: Int = 1) throws {
+        try Self.sendKeyboard(code, flags: flags, presses: presses,
+                              post: { $0.post(tap: .cghidEventTap) }, sleep: { Thread.sleep(forTimeInterval: $0) })
     }
     @discardableResult private func focus(_ window: DeviceWindow, verify: Bool = false) -> Bool {
         NSRunningApplication(processIdentifier: window.pid)?.activate()
@@ -242,6 +261,9 @@ final class DeviceInput {
         case "shake":
             try Self.performShake(platform: device.platform, trusted: AXIsProcessTrusted(), window: window,
                                   focus: { self.focus($0, verify: true) }, key: { try self.key($0, flags: $1) })
+        case "app_switcher":
+            try Self.performAppSwitcher(platform: device.platform, trusted: AXIsProcessTrusted(), window: window,
+                                        focus: { self.focus($0, verify: true) }, key: { try self.key($0, flags: $1, presses: $2) })
         case "appearance":
             let mode = m["mode"] as? String == "light" ? "light" : "dark"
             if android { _ = try adb(id, ["shell", "cmd", "uimode", "night", mode == "dark" ? "yes" : "no"]) }

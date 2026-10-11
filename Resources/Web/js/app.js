@@ -834,6 +834,12 @@ function createPill(udid, name, platform) {
         <g transform="rotate(-12 10 10)"><rect x="6.5" y="3" width="7" height="14" rx="1.8"/><path d="M9 14h2"/></g>
         <path d="m3.5 5.5-1.5 2.5 1.5 2.5L2 13m14.5-6L18 9.5 16.5 12l1.5 2.5"/>
       </svg>
+    </button>
+    <button class="pill-btn" data-action="app-switcher" title="App switcher (Shift–Command–H–H)">
+      <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M13 6V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/>
+        <rect x="7" y="6" width="10" height="11" rx="2"/><path d="M10 14h4"/>
+      </svg>
     </button>` : ''}
     <button class="pill-btn" data-action="appear" title="Switch simulator to light appearance">
       <svg width="18" height="18" viewBox="0 0 20 20" fill="currentColor">
@@ -873,6 +879,9 @@ function createPill(udid, name, platform) {
       case 'home':   panel?.stream?.send({ type: 'home' });   break;
       case 'shake':
         if (panel?.platform === 'ios') panel.stream?.send({ type: 'shake' });
+        break;
+      case 'app-switcher':
+        if (panel?.platform === 'ios') panel.stream?.send({ type: 'app_switcher' });
         break;
       case 'appear': {
         if (!panel) break;

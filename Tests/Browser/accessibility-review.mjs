@@ -66,7 +66,7 @@ try{
   await check(size.name+' Data saver unchanged without extra separator',"document.querySelector('#ds-btn').textContent.trim()==='Data saver'&&document.querySelector('#ds-btn').closest('.sidebar-settings').nextElementSibling.id==='btn-refresh'&&!document.querySelector('.sidebar-separator')");
   await nativeCheck(size.name+' Appearance bottom and left margins match',async()=>{const m=await appearanceSpacing();return Math.abs(m.left-m.bottom)<.1&&Math.abs(m.measuredLeft-m.measuredBottom)<1.1&&m.pickerVisible});
   await check(size.name+' focused keyboard placeholder preserved',"document.querySelector('#kbd-input').placeholder==='Send text to Pixel 6 API 36…'");
-  await check(size.name+' Android has no Shake control',"!document.querySelector('[data-action=shake]')");
+  await check(size.name+' Android has no Shake or App switcher controls',"!document.querySelector('[data-action=shake]')&&!document.querySelector('[data-action=app-switcher]')");
   await check(size.name+' Android button only',`document.querySelectorAll('[data-action="accessibility"]').length===1`);
   await nativeCheck(size.name+' video without pane never creates reader',async()=>Object.keys((await androidInfo()).reader).length===0);
   await check(size.name+' unopened pane has no JS/CSS load', `!document.querySelector('.accessibility-pane')&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/accessibility.js')||r.name.endsWith('/css/accessibility.css'))`);
@@ -170,14 +170,16 @@ try{
  await nativeCheck('Recovered video frame restores open inspector on same socket',async()=>(await androidInfo()).reader.running===true);
  await closeStreams();
  await navigate(1440,1000,false,'ios-fixture');await check('No iOS button or pane',`!document.querySelector('[data-action="accessibility"]')&&!document.querySelector('.accessibility-pane')`);await closeStreams();
- // Shake uses the selected iOS stream, never browser keyboard forwarding or Android.
+ // iOS shortcuts use their selected stream, never browser keyboard forwarding or Android.
  const iosInfo=async()=> (await status()).sessions.find(s=>s.id==='ios-fixture');
  for(const size of [...sizes,{name:'tablet',w:768,h:1024,m:true}]){
   await navigate(size.w,size.h,size.m,'ios-fixture');
-  await check(size.name+' Shake immediately follows Home only on iOS',"(()=>{const b=document.querySelector('[data-action=shake]');return document.querySelectorAll('[data-action=shake]').length===1&&b.previousElementSibling.dataset.action==='home'&&b.nextElementSibling.dataset.action==='appear'&&!document.querySelector('[data-action=accessibility]')})()");
+  await click('[data-theme-choice="light"]');await wait("document.documentElement.dataset.theme==='light'");
+  await check(size.name+' iOS controls are reviewed in actual light workspace',"document.querySelector('[data-theme-choice=light]').getAttribute('aria-pressed')==='true'&&getComputedStyle(document.body).backgroundColor.match(/[0-9]+/g).slice(0,3).reduce((a,v)=>a+Number(v),0)>600");
+  await check(size.name+' Shake immediately follows Home only on iOS',"(()=>{const b=document.querySelector('[data-action=shake]');return document.querySelectorAll('[data-action=shake]').length===1&&b.previousElementSibling.dataset.action==='home'&&b.nextElementSibling.dataset.action==='app-switcher'&&!document.querySelector('[data-action=accessibility]')})()");
   await check(size.name+' Shake icon is bounded, decorative and named',"(()=>{const b=document.querySelector('[data-action=shake]'),s=b.querySelector('svg'),r=s.getBBox();return b.title==='Shake (Control–Command–Z)'&&b.getAttribute('aria-label')===b.title&&s.getAttribute('aria-hidden')==='true'&&s.getAttribute('viewBox')==='0 0 20 20'&&r.x>=.8&&r.y>=.8&&r.x+r.width<=19.2&&r.y+r.height<=19.2})()");
   await check(size.name+' all bottom buttons fit and accept pointer input',"(()=>{const p=document.querySelector('.sim-panel').getBoundingClientRect(),a=document.querySelector('.panel-actions').getBoundingClientRect();return a.left>=p.left&&a.right<=p.right&&a.bottom<=innerHeight&&[...document.querySelectorAll('.pill-btn')].every(b=>{const r=b.getBoundingClientRect();return r.width>=32&&r.height>=32&&r.left>=a.left&&r.right<=a.right&&b.contains(document.elementFromPoint(r.left+r.width/2,r.top+r.height/2))})&&document.documentElement.scrollWidth<=innerWidth+1})()");
-  await check(size.name+' existing iOS controls retain their order',"[...document.querySelectorAll('.panel-actions button')].map(b=>b.dataset.action).join(',')==='rotate,home,shake,appear,kbd,close'");
+  await check(size.name+' existing iOS controls retain their order',"[...document.querySelectorAll('.panel-actions button')].map(b=>b.dataset.action).join(',')==='rotate,home,shake,app-switcher,appear,kbd,close'");
   await nativeCheck(size.name+' Shake is never sent on startup',async()=>(await iosInfo()).inputs===0);
   const before=await iosInfo();await pointerClick('[data-action=shake]');
   await nativeCheck(size.name+' pointer sends exactly one Shake on the iOS socket',async()=>{const s=await iosInfo();return s.inputs===before.inputs+1&&JSON.stringify(s.last_inputs.at(-1))==='{"type":"shake"}'});
@@ -191,8 +193,28 @@ try{
   await cdp('Input.dispatchKeyEvent',{type:'keyUp',key:' ',code:'Space',windowsVirtualKeyCode:32});await delay(100);
   await nativeCheck(size.name+' keyboard Space activates Shake once',async()=>(await iosInfo()).inputs===before.inputs+3&&(await iosInfo()).last_inputs.at(-1).type==='shake');
   await evaluate('document.activeElement.blur()');
-  if(['desktop','phone','small-phone','landscape-phone'].includes(size.name))await shot(size.name+'-ios-shake');
-  if(size.name==='desktop'){await evaluate("document.documentElement.dataset.theme='dark'");await shot('desktop-dark-ios-shake');await evaluate("document.documentElement.dataset.theme='light'")}
+  await check(size.name+' App switcher immediately follows Shake only on iOS',"(()=>{const b=document.querySelector('[data-action=app-switcher]');return document.querySelectorAll('[data-action=app-switcher]').length===1&&b.previousElementSibling.dataset.action==='shake'&&b.nextElementSibling.dataset.action==='appear'&&!document.querySelector('[data-action=accessibility]')})()");
+  await check(size.name+' custom App switcher icon is bounded, decorative and named',"(()=>{const b=document.querySelector('[data-action=app-switcher]'),s=b.querySelector('svg'),r=s.getBBox();return b.title==='App switcher (Shift–Command–H–H)'&&b.getAttribute('aria-label')===b.title&&s.getAttribute('aria-hidden')==='true'&&s.getAttribute('viewBox')==='0 0 20 20'&&s.querySelectorAll('rect').length===1&&s.querySelectorAll('path').length===2&&r.x>=.8&&r.y>=.8&&r.x+r.width<=19.2&&r.y+r.height<=19.2})()");
+  const switcherBefore=await iosInfo();await pointerClick('[data-action=app-switcher]');
+  await nativeCheck(size.name+' pointer sends exactly one App switcher request on the iOS socket',async()=>{const s=await iosInfo();return s.inputs===switcherBefore.inputs+1&&JSON.stringify(s.last_inputs.at(-1))==='{"type":"app_switcher"}'});
+  await check(size.name+' App switcher keeps selected panel without opening keyboard or inspector',"document.querySelector('.sim-panel').classList.contains('focused')&&document.querySelector('#kbd-input').placeholder==='Send text to iPhone 11…'&&!document.querySelector('#kbd-bar').classList.contains('visible')&&!document.querySelector('.accessibility-pane')");
+  await nativeCheck(size.name+' App switcher leaves capture and inspector demand unchanged',async()=>{const s=await iosInfo();return !s.paused&&s.frames>switcherBefore.frames&&Object.keys(s.accessibility.reader).length===0&&s.accessibility.requested===false});
+  await evaluate("document.querySelector('[data-action=app-switcher]').focus()");
+  await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,text:'\r'});
+  await cdp('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13});await delay(100);
+  await nativeCheck(size.name+' keyboard Enter activates App switcher once',async()=>(await iosInfo()).inputs===switcherBefore.inputs+2&&(await iosInfo()).last_inputs.at(-1).type==='app_switcher');
+  await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:' ',code:'Space',windowsVirtualKeyCode:32,text:' '});
+  await cdp('Input.dispatchKeyEvent',{type:'keyUp',key:' ',code:'Space',windowsVirtualKeyCode:32});await delay(100);
+  await nativeCheck(size.name+' keyboard Space activates App switcher once',async()=>(await iosInfo()).inputs===switcherBefore.inputs+3&&(await iosInfo()).last_inputs.at(-1).type==='app_switcher');
+  await evaluate('document.activeElement.blur()');
+  if(['desktop','phone','small-phone','landscape-phone'].includes(size.name))await shot(size.name+'-ios-app-switcher');
+  if(['desktop','phone'].includes(size.name)){
+   await click('[data-theme-choice="dark"]');await wait("document.documentElement.dataset.theme==='dark'");
+   await check(size.name+' App switcher dark icon inherits toolbar color in actual dark workspace',"(()=>{const b=document.querySelector('[data-action=app-switcher]');return getComputedStyle(b).color===getComputedStyle(b.querySelector('svg')).color&&document.querySelector('[data-theme-choice=dark]').getAttribute('aria-pressed')==='true'&&getComputedStyle(document.body).backgroundColor.match(/[0-9]+/g).slice(0,3).reduce((a,v)=>a+Number(v),0)<300})()");
+   await shot(size.name+'-dark-ios-app-switcher');await click('[data-theme-choice="light"]');await wait("document.documentElement.dataset.theme==='light'");
+   await check(size.name+' App switcher light icon inherits toolbar color in actual light workspace',"(()=>{const b=document.querySelector('[data-action=app-switcher]');return getComputedStyle(b).color===getComputedStyle(b.querySelector('svg')).color&&document.querySelector('[data-theme-choice=light]').getAttribute('aria-pressed')==='true'&&getComputedStyle(document.body).backgroundColor.match(/[0-9]+/g).slice(0,3).reduce((a,v)=>a+Number(v),0)>600})()");
+   await shot(size.name+'-light-ios-app-switcher');
+  }
   await pointerClick('[data-action=home]');await nativeCheck(size.name+' Home still sends its original message',async()=>(await iosInfo()).last_inputs.at(-1).type==='home');
   await pointerClick('[data-action=appear]');await nativeCheck(size.name+' appearance still sends its original mode',async()=>{const m=(await iosInfo()).last_inputs.at(-1);return m.type==='appearance'&&m.mode==='light'});
   await pointerClick('[data-action=kbd]');await check(size.name+' keyboard toggle still opens and focuses text input',"document.querySelector('#kbd-bar').classList.contains('visible')&&document.activeElement.id==='kbd-input'");
@@ -212,7 +234,14 @@ try{
  // Even a forged frontend button cannot bypass the per-panel iOS gate.
  await evaluate("(()=>{const b=document.createElement('button');b.dataset.action='shake';document.querySelector('.sim-panel[data-udid=\"emulator-5554\"] .panel-actions').append(b);b.click();b.remove()})()");
  await nativeCheck('Forged Android Shake button sends nothing',async()=>(await status()).sessions.find(s=>s.id==='emulator-5554').inputs===androidBefore.inputs);
- await shot('desktop-mixed-ios-shake');await closeStreams();
+ await pointerClick('.sim-panel[data-udid="emulator-5554"] [data-action=home]');
+ const switcherMixedBefore=await status(),switcherAndroidBefore=switcherMixedBefore.sessions.find(s=>s.id==='emulator-5554'),switcherIOSBefore=switcherMixedBefore.sessions.find(s=>s.id==='ios-fixture');
+ await pointerClick('.sim-panel[data-udid="ios-fixture"] [data-action=app-switcher]');
+ await nativeCheck('Mixed panels send App switcher only to iOS despite prior Android focus',async()=>{const s=await status(),a=s.sessions.find(p=>p.id==='emulator-5554'),i=s.sessions.find(p=>p.id==='ios-fixture');return a.inputs===switcherAndroidBefore.inputs&&i.inputs===switcherIOSBefore.inputs+1&&i.last_inputs.at(-1).type==='app_switcher'});
+ await check('Mixed panels keep App switcher absent on Android and focus the selected iOS panel',"!document.querySelector('.sim-panel[data-udid=\"emulator-5554\"] [data-action=app-switcher]')&&document.querySelector('.sim-panel[data-udid=ios-fixture]').classList.contains('focused')");
+ await evaluate("(()=>{const b=document.createElement('button');b.dataset.action='app-switcher';document.querySelector('.sim-panel[data-udid=\"emulator-5554\"] .panel-actions').append(b);b.click();b.remove()})()");
+ await nativeCheck('Forged Android App switcher button sends nothing',async()=>(await status()).sessions.find(s=>s.id==='emulator-5554').inputs===switcherAndroidBefore.inputs);
+ await shot('desktop-mixed-ios-app-switcher');await closeStreams();
  if(process.argv.includes('--real-adb')) {
  // Real ADB compatibility check: only after the actual frontend pane opens.
  await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({real:true})});

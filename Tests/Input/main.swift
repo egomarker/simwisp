@@ -8,8 +8,8 @@ var checks: [[String: Any]] = []
 func check(_ name: String, _ pass: @autoclosure () -> Bool) {
     let ok = pass(); checks.append(["name": name, "passed": ok]); if !ok { fputs("FAIL: \(name)\n", stderr) }
 }
-let expected: Set<String> = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "shake", "rotate", "appearance", "accessibility_swipe"]
-check("Stream allowlist includes Shake and preserves all prior controls", DeviceInput.supportedTypes == expected)
+let expected: Set<String> = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "shake", "app_switcher", "rotate", "appearance", "accessibility_swipe"]
+check("Stream allowlist includes Shake/App switcher and preserves all prior controls", DeviceInput.supportedTypes == expected)
 check("Unknown, shell and settings messages are not input commands", ["unknown", "terminal", "exec", "settings"].allSatisfy { !DeviceInput.supportedTypes.contains($0) })
 let first = DeviceWindow(id: 101, pid: 901, title: "First iPhone", bounds: CGRect(x: 30, y: 60, width: 414, height: 896), crop: CGRect(x: 0, y: 30, width: 414, height: 866))
 let second = DeviceWindow(id: 102, pid: 901, title: "Second iPhone", bounds: CGRect(x: 500, y: 60, width: 390, height: 844), crop: CGRect(x: 0, y: 30, width: 390, height: 814))
@@ -92,6 +92,70 @@ do {
     })
 } catch { keyboardErrorReported = error.localizedDescription == "fixture keyboard allocation failure" }
 check("Keyboard construction errors propagate instead of claiming successful input", keyboardErrorReported)
+
+// App switcher exercises the production eligibility, event generator AND timing,
+// substituting only host posting/sleep. No real key events or waits occur.
+var pressCounts: [Int] = []
+func attemptSwitcher(_ platform: String, trusted: Bool = true, window: DeviceWindow? = first, focusOK: Bool = true) -> String? {
+    calls = []; focused = nil; codes = []; flags = []; pressCounts = []
+    do {
+        try DeviceInput.performAppSwitcher(platform: platform, trusted: trusted, window: window, focus: { target in
+            calls.append("focus"); focused = target; return focusOK
+        }, key: { code, modifiers, presses in
+            calls.append("key"); codes.append(code); flags.append(modifiers); pressCounts.append(presses)
+        })
+        return nil
+    } catch { return error.localizedDescription }
+}
+check("iOS App switcher is accepted", attemptSwitcher("ios") == nil)
+check("App switcher focuses the selected window once before its chord", calls == ["focus", "key"] && focused == first)
+check("App switcher requests exactly two ANSI H presses", codes == [4] && pressCounts == [2])
+check("App switcher uses exactly Shift and Command, never Control/Option", flags == [[.maskShift,.maskCommand]])
+check("App switcher targets a second window in the same Simulator process", attemptSwitcher("ios", window: second) == nil && focused == second && calls == ["focus","key"])
+check("Android App switcher is explicitly rejected without host effects", attemptSwitcher("android") == "App switcher is iOS-only" && calls.isEmpty && codes.isEmpty)
+check("Unknown App switcher platforms fail closed", attemptSwitcher("unknown") == "App switcher is iOS-only" && calls.isEmpty)
+check("App switcher platform matching remains exact", attemptSwitcher("iOS") == "App switcher is iOS-only" && calls.isEmpty)
+check("App switcher requires Accessibility before focus/post", attemptSwitcher("ios", trusted: false)?.contains("Accessibility permission") == true && calls.isEmpty)
+check("App switcher requires a visible window before focus/post", attemptSwitcher("ios", window: nil)?.contains("visible iOS Simulator window") == true && calls.isEmpty)
+check("App switcher refuses keys if verified focus fails", attemptSwitcher("ios", focusOK: false)?.contains("Cannot focus the selected") == true && calls == ["focus"] && codes.isEmpty)
+check("App switcher recovers after focus failure", attemptSwitcher("ios", window: second) == nil && focused == second && pressCounts == [2])
+let switcherFlags: CGEventFlags = [.maskShift,.maskCommand]
+let switcher = try DeviceInput.keyboardEvents(4, flags: switcherFlags, presses: 2)
+check("App switcher emits eight balanced events", switcher.count == 8)
+check("App switcher holds modifiers across H down/up, H down/up, then releases Command/Shift", keyCodes(switcher) == [56,55,4,4,4,4,55,56])
+check("App switcher has exactly two distinct H down/up pairs", switcher.map(\.type) == [.flagsChanged,.flagsChanged,.keyDown,.keyUp,.keyDown,.keyUp,.flagsChanged,.flagsChanged])
+check("App switcher preserves both flags across BOTH H presses", switcher.map(\.flags) == [.maskShift,switcherFlags,switcherFlags,switcherFlags,switcherFlags,switcherFlags,.maskShift,[]])
+check("App switcher releases Command after the second H up, then Shift with neutral flags", switcher[5].type == .keyUp && switcher[6].getIntegerValueField(.keyboardEventKeycode) == 55 && switcher[6].flags == .maskShift && switcher[7].getIntegerValueField(.keyboardEventKeycode) == 56 && switcher[7].flags == [])
+check("App switcher never uses autorepeat", switcher.allSatisfy { $0.getIntegerValueField(.keyboardEventAutorepeat) == 0 })
+var posted: [CGEvent] = [], waits: [TimeInterval] = [], times: [TimeInterval] = [], elapsed: TimeInterval = 0
+try DeviceInput.sendKeyboard(4, flags: switcherFlags, presses: 2, post: { posted.append($0); times.append(elapsed) }, sleep: { waits.append($0); elapsed += $0 })
+check("Production dispatcher posts the complete eight-event sequence", keyCodes(posted) == keyCodes(switcher) && posted.map(\.flags) == switcher.map(\.flags))
+check("Production dispatcher inserts exactly one 120ms gap between H pairs", waits.count == 8 && waits.enumerated().allSatisfy { abs($0.element - ($0.offset == 3 ? 0.12 : 0.01)) < 0.000001 })
+check("Second H down follows first H up by 120ms while modifiers remain held", abs(times[4]-times[3]-0.12) < 0.000001 && posted[3].flags == switcherFlags && posted[4].flags == switcherFlags)
+check("Production dispatcher completes with all modifiers released", posted.last?.flags == [] && posted.last?.getIntegerValueField(.keyboardEventKeycode) == 56)
+var repeatedSwitcherOK = true
+for _ in 0..<200 {
+    let next = try DeviceInput.keyboardEvents(4, flags: switcherFlags, presses: 2)
+    repeatedSwitcherOK = repeatedSwitcherOK && keyCodes(next) == [56,55,4,4,4,4,55,56] && next.last?.flags == []
+}
+check("Repeated App switcher requests cannot inherit held modifier flags", repeatedSwitcherOK)
+var switcherErrorReported = false
+do {
+    try DeviceInput.performAppSwitcher(platform: "ios", trusted: true, window: first, focus: { _ in true }, key: { _,_,_ in throw WispError("fixture App switcher allocation failure") })
+} catch { switcherErrorReported = error.localizedDescription == "fixture App switcher allocation failure" }
+check("App switcher keyboard failures reach input_error handling", switcherErrorReported)
+for invalid in [-1,0,3] {
+    var rejected = false, effects = 0
+    do { try DeviceInput.sendKeyboard(4, flags: switcherFlags, presses: invalid, post: { _ in effects += 1 }, sleep: { _ in effects += 1 }) }
+    catch { rejected = true }
+    check("Invalid keyboard press count \(invalid) fails before any posting/sleep", rejected && effects == 0)
+}
+for (name,code,chord) in [("Shake",CGKeyCode(6),both),("Paste",CGKeyCode(9),CGEventFlags.maskCommand),("Home",CGKeyCode(4),CGEventFlags([.maskShift,.maskCommand])),("Rotation",CGKeyCode(123),CGEventFlags.maskCommand),("Plain",CGKeyCode(36),CGEventFlags())] {
+    posted = []; waits = []
+    try DeviceInput.sendKeyboard(code, flags: chord, post: { posted.append($0) }, sleep: { waits.append($0) })
+    let original = try DeviceInput.keyboardEvents(code, flags: chord)
+    check("\(name) retains its original single-press events, releases and 10ms timing", keyCodes(posted) == keyCodes(original) && posted.map(\.flags) == original.map(\.flags) && waits.count == original.count && waits.allSatisfy { $0 == 0.01 })
+}
 
 let passed = checks.allSatisfy { $0["passed"] as? Bool == true }
 print(String(decoding: try JSONSerialization.data(withJSONObject: ["passed": passed, "checks": checks, "hostEffects": false], options: [.prettyPrinted, .sortedKeys]), as: UTF8.self))
