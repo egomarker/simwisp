@@ -16,6 +16,18 @@ async function nativeCheck(name,condition){const value=await condition();report.
 async function click(selector){await evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);await delay(80)}
 async function shot(name){await evaluate('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');await delay(400);const result=await cdp('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});fs.writeFileSync(path.join(root,name+'.png'),Buffer.from(result.data,'base64'));report.screenshots.push(name+'.png');}
 async function closeStreams(){await evaluate(`document.querySelectorAll('[data-action="close"]').forEach(b=>b.click())`);await delay(350)}
+
+const sizeKey='simwispAccessibilitySize.v1.emulator-5554';
+async function geometry(){return evaluate("(()=>{const p=document.querySelector('.accessibility-pane'),b=document.querySelector('.a11y-body'),e=document.querySelector('.a11y-eyebrow'),f=document.querySelector('.device-frame'),c=document.querySelector('canvas'),bs=getComputedStyle(b);return {pane:p.getBoundingClientRect().height,frame:f.getBoundingClientRect().height,frameW:f.getBoundingClientRect().width,lines:(b.clientHeight-parseFloat(bs.paddingTop)-parseFloat(bs.paddingBottom)-e.getBoundingClientRect().height-parseFloat(getComputedStyle(e).marginBottom))/parseFloat(getComputedStyle(document.querySelector('.a11y-speech')).lineHeight),cw:c.width,ch:c.height,inputs:window.__wire.inputs.length,subscription:window.__wire.settings.at(-1).accessibility_subscription}})()")}
+async function speech(value,source='speak'){
+ const node={speech:value,speech_source:source,observed_at:new Date().toISOString(),label:'ADHD. Attention-Deficit/Hyperactivity Disorder',role:'ROLE_BUTTON',tooltip:'Opens this decision support tool',package:'guidelines.childrensmercy.com.iguidelines',class:'android.widget.Button',bounds:{left:37,top:451,right:1043,bottom:819,width:1006,height:368},properties:{enabled:'true'},actions:['ACTION_SHOW_ON_SCREEN']};
+ await evaluate("(()=>{const socket=window.__wire.sockets.find(s=>s.readyState===1),subscription=window.__wire.settings.at(-1).accessibility_subscription;socket.dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'accessibility_event',subscription,node:"+JSON.stringify(node)+"})}))})()");await delay(50);
+}
+async function resizeKey(key,shift=false){await cdp('Input.dispatchKeyEvent',{type:'keyDown',key,code:key,modifiers:shift?8:0});await cdp('Input.dispatchKeyEvent',{type:'keyUp',key,code:key,modifiers:shift?8:0});await delay(80)}
+async function gripPoint(){return evaluate("(()=>{const r=document.querySelector('.a11y-resize-handle').getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+9}})()")}
+async function mouseResize(delta){const p=await gripPoint();await cdp('Input.dispatchMouseEvent',{type:'mousePressed',x:p.x,y:p.y,button:'left',buttons:1,clickCount:1});await cdp('Input.dispatchMouseEvent',{type:'mouseMoved',x:p.x,y:p.y-delta,button:'left',buttons:1});await cdp('Input.dispatchMouseEvent',{type:'mouseReleased',x:p.x,y:p.y-delta,button:'left',clickCount:1});await delay(100)}
+async function touchResize(delta,cancel=false){const p=await gripPoint(),point={x:p.x,y:p.y,id:11,radiusX:4,radiusY:4};await cdp('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[point]});await cdp('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{...point,y:p.y-delta}]});await cdp('Input.dispatchTouchEvent',{type:cancel?'touchCancel':'touchEnd',touchPoints:[]});await delay(100)}
+
 const androidInfo=async()=> (await status()).sessions.find(s=>s.id==='emulator-5554')?.accessibility;
 async function navigate(width,height,mobile,device='emulator-5554'){
  await cdp('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile});
@@ -43,6 +55,18 @@ try{
   await check(size.name+' speech only by default',`document.querySelector('.a11y-details').hidden && document.querySelector('.a11y-more').textContent==='More…' && document.querySelector('.a11y-speech').textContent==='ADHD. Attention-Deficit/Hyperactivity Disorder, Button, Opens this decision support tool'`);
   await check(size.name+' compact fits viewport and footer',`(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect(),b=document.querySelector('#bottom-tab-bar').getBoundingClientRect();return p.top>=f.bottom-1&&p.bottom<=b.top+1&&document.documentElement.scrollWidth<=innerWidth+1&&document.documentElement.scrollHeight<=innerHeight+1})()`);
   await check(size.name+' inspector controls and selectable text', `document.querySelector('[data-action="accessibility"]').getAttribute('aria-controls')===document.querySelector('.accessibility-pane').id&&document.querySelector('.a11y-more').getAttribute('aria-controls')===document.querySelector('.a11y-details').id&&getComputedStyle(document.querySelector('.a11y-details')).userSelect==='text'`);
+
+  await check(size.name+' default speech viewport is three lines',"(()=>{const b=document.querySelector('.a11y-body'),e=document.querySelector('.a11y-eyebrow'),s=getComputedStyle(b),h=b.clientHeight-parseFloat(s.paddingTop)-parseFloat(s.paddingBottom)-e.getBoundingClientRect().height-parseFloat(getComputedStyle(e).marginBottom),line=parseFloat(getComputedStyle(document.querySelector('.a11y-speech')).lineHeight);return Math.abs(h-3*line)<1.1})()");
+  await check(size.name+' resize handle is inside top with no layout space',"(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),h=document.querySelector('.a11y-resize-handle'),r=h.getBoundingClientRect();return getComputedStyle(h).position==='absolute'&&r.top>=p.top&&r.top<=p.top+2&&r.bottom<p.bottom&&r.left>=p.left&&r.right<=p.right&&h.getAttribute('role')==='separator'&&h.getAttribute('aria-controls')===document.querySelector('.accessibility-pane').id})()");
+  const stable=await geometry();let remainsStable=true;
+  for(const text of ['Short.','One\nTwo\nThree','Long speech wraps without resizing. '.repeat(35)]){await speech(text);const g=await geometry();remainsStable&&=Math.abs(g.pane-stable.pane)<1&&Math.abs(g.frame-stable.frame)<1&&Math.abs(g.frameW-stable.frameW)<1&&g.cw===stable.cw&&g.ch===stable.ch}
+  await nativeCheck(size.name+' one/three/many lines never resize pane or simulator',async()=>remainsStable);
+  await check(size.name+' long speech scrolls without truncation',"(()=>{const b=document.querySelector('.a11y-body');b.scrollTop=b.scrollHeight;return b.scrollHeight>b.clientHeight+10&&b.scrollTop>0&&document.querySelector('.a11y-speech').textContent.length>1000})()");
+  await speech('Composed fallback that continues across several lines. '.repeat(8),'composed');
+  await nativeCheck(size.name+' variable note does not alter pane size',async()=>Math.abs((await geometry()).pane-stable.pane)<1);
+  await check(size.name+' new utterance starts at top',"document.querySelector('.a11y-body').scrollTop===0");
+  if(size.name==='phone')await shot('phone-fixed-three-lines-long-speech');
+  await speech('ADHD. Attention-Deficit/Hyperactivity Disorder, Button, Opens this decision support tool');
   await evaluate(`window.__compact=document.querySelector('.device-frame').getBoundingClientRect().height;window.__resolution=[document.querySelector('canvas').width,document.querySelector('canvas').height]`);
   if(['desktop','phone'].includes(size.name))await shot(size.name+'-speech-compact');
   await click('.a11y-more');
@@ -60,6 +84,49 @@ try{
   await check(size.name+' close clears diagnostic/speech content',`document.querySelector('.accessibility-pane').hidden&&document.querySelector('.a11y-details').childElementCount===0`);
   await closeStreams();
  }
+
+ // User sizing preferences are local to this private test browser/device.
+ await navigate(1440,1000,false);await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ const original=await geometry(),readerBefore=await androidInfo();
+ await mouseResize(70);const resized=await geometry();
+ await nativeCheck('Mouse grip grows pane and proportionally refits simulator',async()=>Math.abs(resized.pane-original.pane-70)<=2&&resized.frame<original.frame-2&&resized.cw===original.cw&&resized.ch===original.ch&&Math.abs(resized.frameW-resized.frame*resized.cw/resized.ch)<1.5);
+ await nativeCheck('Grip never sends simulator input or changes subscription',async()=>resized.inputs===original.inputs&&resized.subscription===original.subscription);
+ await nativeCheck('Resizing does not restart or interrupt reader',async()=>{const a=await androidInfo();return a.reader.running===true&&a.reader.starts===readerBefore.reader.starts});
+ await resizeKey('ArrowUp');await nativeCheck('Keyboard ArrowUp grows pane',async()=>Math.abs((await geometry()).pane-resized.pane-16)<2);
+ await resizeKey('ArrowDown');await nativeCheck('Keyboard ArrowDown restores size',async()=>Math.abs((await geometry()).pane-resized.pane)<2);
+ await resizeKey('Home');await check('Keyboard Home safely reaches minimum',"document.querySelector('.a11y-resize-handle').getAttribute('aria-valuenow')===document.querySelector('.a11y-resize-handle').getAttribute('aria-valuemin')");
+ await resizeKey('End');await check('Keyboard End keeps simulator and workspace footer visible',"(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect(),stage=document.querySelector('.sim-stage');return stage.clientHeight>=47&&f.height>0&&f.bottom<=p.top+1&&p.bottom<=document.querySelector('#bottom-tab-bar').getBoundingClientRect().top+1})()");
+ await resizeKey('Enter');await nativeCheck('Keyboard reset restores exact three-line default',async()=>Math.abs((await geometry()).pane-original.pane)<2);
+ await mouseResize(70);
+ await click('.a11y-more');const expanded=await geometry();await mouseResize(40);const customExpanded=await geometry();
+ await nativeCheck('Expanded mode supports manual resizing',async()=>Math.abs(customExpanded.pane-expanded.pane-40)<2);
+ await click('.a11y-more');await nativeCheck('Less restores chosen compact height',async()=>Math.abs((await geometry()).pane-resized.pane)<2);
+ await click('.a11y-close');await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ await nativeCheck('Close/reopen remembers compact preference',async()=>Math.abs((await geometry()).pane-resized.pane)<2);
+ await closeStreams();await navigate(1440,1000,false);await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ await nativeCheck('Reload restores saved compact height per device',async()=>Math.abs((await geometry()).pane-resized.pane)<2);
+ await click('.a11y-more');await nativeCheck('Reload restores independent expanded height',async()=>Math.abs((await geometry()).pane-customExpanded.pane)<2);
+ await cdp('Emulation.setDeviceMetricsOverride',{width:375,height:420,deviceScaleFactor:1,mobile:true});await delay(200);
+ await check('Short viewport clamps remembered size without covering stream/footer',"(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect();return f.height>0&&f.bottom<=p.top+1&&p.bottom<=document.querySelector('#bottom-tab-bar').getBoundingClientRect().top+1})()");
+ await cdp('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});await delay(200);
+ await nativeCheck('Viewport clamp never overwrites saved preferred height',async()=>Math.abs((await geometry()).pane-customExpanded.pane)<2);
+ await click('.a11y-more');await shot('desktop-user-resized-pane');
+ await closeStreams();await evaluate('localStorage.removeItem('+JSON.stringify(sizeKey)+')');
+ await navigate(390,844,true);await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ const phoneDefault=await geometry();await touchResize(55);const phoneCustom=await geometry();
+ await nativeCheck('Touch grip resizes without scrolling workspace or sending input',async()=>Math.abs(phoneCustom.pane-phoneDefault.pane-55)<3&&phoneCustom.inputs===phoneDefault.inputs);
+ await touchResize(35,true);await nativeCheck('Cancelled touch restores size and releases drag',async()=>Math.abs((await geometry()).pane-phoneCustom.pane)<2);
+ await touchResize(10);await nativeCheck('New touch works after cancellation',async()=>Math.abs((await geometry()).pane-phoneCustom.pane-10)<3);
+ const grip=await gripPoint();await cdp('Input.dispatchMouseEvent',{type:'mousePressed',x:grip.x,y:grip.y,button:'left',clickCount:2});await cdp('Input.dispatchMouseEvent',{type:'mouseReleased',x:grip.x,y:grip.y,button:'left',clickCount:2});await delay(100);
+ await nativeCheck('Double-click grip resets chosen compact size',async()=>Math.abs((await geometry()).pane-phoneDefault.pane)<2);
+ await shot('phone-fixed-three-lines-grip');
+ await closeStreams();await evaluate('localStorage.setItem('+JSON.stringify(sizeKey)+','+JSON.stringify('{"compact":-1,"expanded":999999}')+')');
+ await navigate(390,844,true);await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ await nativeCheck('Invalid stored sizes fall back to default',async()=>Math.abs((await geometry()).pane-phoneDefault.pane)<2);
+ await evaluate('(()=>{const original=Storage.prototype.setItem;Storage.prototype.setItem=function(k,v){if(k==='+JSON.stringify(sizeKey)+')throw new Error("fixture blocked storage");return original.call(this,k,v)}})()');
+ await touchResize(30);await nativeCheck('Blocked storage does not break resizing',async()=>Math.abs((await geometry()).pane-phoneDefault.pane-30)<3);
+ await closeStreams();await evaluate('localStorage.removeItem('+JSON.stringify(sizeKey)+')');
+
  // Pause, visibility, stale delivery and pointer mapping on a normal phone.
  await navigate(390,844,true);await click('[data-action="accessibility"]');await wait(`document.querySelector('.a11y-speech').textContent.includes('Opens this')`);
  await evaluate(`Object.defineProperty(document,'hidden',{configurable:true,value:true});document.dispatchEvent(new Event('visibilitychange'))`);await delay(400);
