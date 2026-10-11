@@ -178,13 +178,8 @@ export class SimStream {
       }
       this.#frameInFlight = true;
 
-    const started = performance.now();
-
     createImageBitmap(e.data)
       .then(bitmap => {
-        const decodeMs = performance.now() - started;
-        const drawStart = performance.now();
-
         try {
           const landscape = bitmap.width > bitmap.height;
           const pw = Math.min(bitmap.width, bitmap.height);
@@ -206,13 +201,6 @@ export class SimStream {
             this.#canvas.height
           );
           this.#stats.frames += 1;
-
-          if (this.#stats.frames % 30 === 0) {
-            console.log(
-              `Decode: ${decodeMs.toFixed(1)} ms, ` +
-              `Draw: ${(performance.now() - drawStart).toFixed(1)} ms`
-            );
-          }
 
           //this.send({ type: 'frame_ack' });
         } catch (err) {
