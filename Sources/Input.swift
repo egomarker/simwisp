@@ -7,7 +7,13 @@ import ApplicationServices
 final class DeviceInput {
     let devices: Devices
     let queue = DispatchQueue(label: "Simwisp.input", qos: .userInteractive)
-    private var gesture: (id: String, window: DeviceWindow, point: CGPoint, started: Double)?
+    private var gesture: (
+        id: String,
+        window: DeviceWindow,
+        point: CGPoint,
+        started: Double,
+        yOffset: CGFloat
+    )?
     private var adbInputSizes: [String: (checked: Double, width: Int, height: Int)] = [:]
     init(devices: Devices) { self.devices = devices }
     func cancel(_ id: String) {
@@ -71,21 +77,63 @@ final class DeviceInput {
         func number(_ key: String) -> Double { clamp((m[key] as? NSNumber)?.doubleValue ?? 0) }
         switch type {
         case "touch_down":
-            guard AXIsProcessTrusted(), let window else { throw WispError("Live input requires Accessibility and a visible device window") }
-            if let state = gesture { mouse(.leftMouseUp, state.point); gesture = nil }
-            let point = window.point(number("x"), number("y"))
-            // Matching the existing live-touch path: do not incur a focus delay per move.
-            mouse(.leftMouseDown, point); gesture = (id, window, point, monotonic())
+            guard AXIsProcessTrusted(), let window else {
+                throw WispError("Live input requires Accessibility and a visible device window")
+            }
+
+            if let state = gesture {
+                mouse(.leftMouseUp, state.point)
+                gesture = nil
+            }
+
+            var point = window.point(number("x"), number("y"))
+
+            // For iOS only: if the gesture begins within 10pt of the
+            // bottom of the iOS content, shift the entire gesture 20pt down.
+            let contentBottom = window.bounds.minY + window.crop.maxY
+            let yOffset: CGFloat =
+                !android && point.y >= contentBottom - 10 ? 20 : 0
+
+            point.y += yOffset
+
+            mouse(.leftMouseDown, point)
+
+            gesture = (
+                id: id,
+                window: window,
+                point: point,
+                started: monotonic(),
+                yOffset: yOffset
+            )
         case "touch_move":
             if var state = gesture, state.id == id {
-                let point = state.window.point(number("x"), number("y")); if point != state.point { mouse(.leftMouseDragged, point); state.point = point; gesture = state }
+                var point = state.window.point(number("x"), number("y"))
+                point.y += state.yOffset
+
+                if point != state.point {
+                    mouse(.leftMouseDragged, point)
+                    state.point = point
+                    gesture = state
+                }
             }
         case "touch_up":
             if let state = gesture, state.id == id {
-                let point = state.window.point(number("x"), number("y"))
-                if point != state.point { mouse(.leftMouseDragged, point) }
-                Thread.sleep(forTimeInterval: max(0, 0.02 - (monotonic() - state.started)))
-                mouse(.leftMouseUp, point); gesture = nil
+                var point = state.window.point(number("x"), number("y"))
+                point.y += state.yOffset
+
+                if point != state.point {
+                    mouse(.leftMouseDragged, point)
+                }
+
+                Thread.sleep(
+                    forTimeInterval: max(
+                        0,
+                        0.02 - (monotonic() - state.started)
+                    )
+                )
+
+                mouse(.leftMouseUp, point)
+                gesture = nil
             }
         case "tap", "drag":
             guard let window, AXIsProcessTrusted() else { throw WispError("Input requires a visible window and Accessibility permission") }
