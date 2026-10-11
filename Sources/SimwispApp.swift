@@ -150,6 +150,11 @@ struct StatusPanel: View {
                                 Text(row["name"] as? String ?? "Device").font(.callout.weight(.medium))
                                 Text(row["state"] as? String ?? "Streaming").font(.caption).foregroundStyle(.secondary).lineLimit(2)
                                 Text(row["peer"] as? String ?? "").font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                                if row["platform"] as? String == "android", let info = row["accessibility"] as? [String: Any], info["requested"] as? Bool == true {
+                                    let state = info["state"] as? String ?? "off"
+                                    Label("Accessibility · " + (info["sending"] as? Bool == true ? "sending" : (state == "listening" ? "listening" : (state == "off" ? "paused" : state))), systemImage: "accessibility")
+                                        .font(.caption2).foregroundStyle(.secondary)
+                                }
                             }
                             Spacer()
                             Text("\(row["fps"] as? Int ?? 0) fps").font(.caption).foregroundStyle(.secondary)

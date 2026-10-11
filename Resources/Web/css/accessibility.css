@@ -1,0 +1,30 @@
+/* In-flow only: expansion reduces .sim-stage, whose ResizeObserver refits the
+   streamed canvas without touching resolution, aspect ratio or input mapping. */
+.accessibility-pane { display: flex; flex-direction: column; flex: 0 1 auto; min-height: 0; max-height: 34%; border-top: 1px solid var(--border); background: var(--bg-elevated); }
+.accessibility-pane[hidden], .a11y-details[hidden] { display: none; }
+.accessibility-pane.expanded { flex: 0 1 48%; height: 48%; max-height: 48%; }
+.a11y-heading { display: flex; flex-shrink: 0; align-items: center; gap: 10px; padding: 8px 14px 4px; font-size: 11px; }
+.a11y-title { flex: 1; font-weight: 600; color: var(--text-secondary); }
+.a11y-status { color: var(--text-tertiary); font-size: 10px; }
+.a11y-close { display: grid; place-items: center; width: 28px; height: 28px; border: 0; border-radius: 5px; background: transparent; color: var(--text-secondary); font-size: 20px; cursor: pointer; }
+.a11y-close:hover { background: var(--bg-active); }
+.a11y-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 4px 16px 6px; scrollbar-width: thin; -webkit-user-select: text; user-select: text; }
+.a11y-eyebrow { color: var(--accent); font-size: 10px; font-weight: 600; letter-spacing: 1.1px; margin-bottom: 6px; }
+.a11y-speech { color: var(--text-primary); font-size: 20px; line-height: 1.45; font-weight: 500; overflow-wrap: anywhere; white-space: pre-wrap; }
+.a11y-note { color: var(--text-tertiary); font-size: 10px; line-height: 1.5; margin-top: 6px; overflow-wrap: anywhere; }
+.a11y-note:empty { display: none; }
+.a11y-footer { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 10px; padding: 3px 16px 8px; }
+.a11y-more { border: 0; background: transparent; color: var(--accent); font-size: 12px; font-weight: 500; cursor: pointer; padding: 5px 0; }
+.a11y-observed { font-size: 9px; color: var(--text-tertiary); text-align: right; }
+.a11y-details { margin-top: 14px; padding-top: 8px; border-top: 1px solid var(--border-subtle); }
+.a11y-details dl > div { padding: 7px 0; }
+.a11y-details dt { color: var(--text-tertiary); font-size: 10px; margin-bottom: 3px; }
+.a11y-details dd { color: var(--text-secondary); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; }
+@media (max-width: 700px), (max-height: 480px) and (max-width: 900px) {
+  .a11y-speech { font-size: 17px; }
+  .a11y-heading { padding: 6px 12px 2px; }
+  .a11y-body { padding: 4px 13px 6px; }
+  .a11y-footer { padding: 3px 13px 6px; }
+}
+
+.a11y-body, .a11y-body * { -webkit-user-select: text; user-select: text; }

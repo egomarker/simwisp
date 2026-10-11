@@ -522,7 +522,7 @@ function addSimPanel(udid, name, w, h, platform) {
 
   frameEl.append(canvasEl, overlayEl);
 
-  const pillEl = createPill(udid, name);
+  const pillEl = createPill(udid, name, platform);
   stageEl.appendChild(frameEl);
   panelEl.append(stageEl, pillEl);
 
@@ -537,9 +537,30 @@ function addSimPanel(udid, name, w, h, platform) {
     overlayEl, pillEl, dotEl, statsEl,
     statusEl: pillEl.querySelector('.panel-status'),
     platform,
+    accessibility: null,
     ro: null, appearMode: 'dark', twoFingerMode: false,
   };
   simPanels.set(udid, panel);
+  if (platform === 'android') {
+    const button = pillEl.querySelector('[data-action="accessibility"]');
+    // Optional assets and pane are created only on an explicit first open.
+    const firstOpen = async () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      try {
+        const { AccessibilityPane, loadAccessibilityStyles } = await import('./accessibility.js');
+        await loadAccessibilityStyles();
+        if (simPanels.get(udid) !== panel) return;
+        panel.accessibility = new AccessibilityPane(panelEl, button, () => updateStreamVisibility());
+        button.removeEventListener('click', firstOpen);
+        panel.accessibility.setOpen(true);
+      } catch (error) {
+        button.title = 'Accessibility inspector failed to load — retry or reload';
+        console.warn('Simwisp accessibility:', error);
+      } finally { button.disabled = false; }
+    };
+    button.addEventListener('click', firstOpen);
+  }
 
   rebuildDividers();
 
@@ -558,6 +579,7 @@ function addSimPanel(udid, name, w, h, platform) {
     onRotateStart:       () => setPanelProgress(udid, 'Rotating…'),
     onRotateEnd:         ok => clearPanelProgress(udid, ok ? null : 'Rotate failed'),
     onStats:             stats => updatePanelStats(udid, stats),
+    onAccessibility:     message => panel.accessibility?.receive(message),
   });
   //panel.stream.updateSettings({ data_saver: dsBtn.classList.contains('active') });
   updateStreamVisibility();
@@ -571,6 +593,7 @@ function removeSimPanel(udid, { silent = false } = {}) {
   const panel = simPanels.get(udid);
   if (!panel) return;
 
+  panel.accessibility?.setOpen(false);
   panel.stream?.destroy();
   panel.ro?.disconnect();
   panel.panelEl.remove();
@@ -716,6 +739,9 @@ function updatePanelStatus(udid, status) {
   const panel = simPanels.get(udid);
   if (!panel) return;
   const { dotEl, overlayEl } = panel;
+  const active = !document.hidden && !(isMobileViewport() && termOpen) && ['connected', 'streaming'].includes(status);
+  panel.accessibility?.setActive(active);
+  if (panel.accessibility?.isOpen) panel.stream?.updateSettings({ accessibility_enabled: active, accessibility_subscription: panel.accessibility.subscription });
   panel.statusEl.textContent = ({ streaming: 'Live', connected: 'Ready', reconnecting: 'Reconnecting', 'no-frames': 'No frames' })[status] || 'Connecting';
   dotEl.className = 'status-dot';
   if (status === 'streaming' || status === 'connected') {
@@ -778,11 +804,14 @@ function updatePanelStats(udid, stats) {
 
 function updateStreamVisibility() {
   const paused = document.hidden || (isMobileViewport() && termOpen);
-  simPanels.forEach(p => p.stream?.updateSettings({ stream_paused: paused }));
+  simPanels.forEach(p => {
+    p.accessibility?.setActive(!paused);
+    p.stream?.updateSettings({ stream_paused: paused, accessibility_enabled: !paused && p.accessibility?.isOpen === true, accessibility_subscription: p.accessibility?.subscription ?? 0 });
+  });
 }
 
 // ── Controls pill (per panel) ─────────────────────────────────────────────────
-function createPill(udid, name) {
+function createPill(udid, name, platform) {
   const pill = document.createElement('div');
   pill.className = 'controls-pill';
   pill.innerHTML = `
@@ -809,6 +838,7 @@ function createPill(udid, name) {
     ${udid.startsWith('emulator-')
       ? '<button class="pill-btn" data-action="two-finger" title="TalkBack scroll (ADB swipe)" aria-pressed="false">2F</button>'
       : ''}
+    ${platform === 'android' ? '<button class="pill-btn a11y-toggle" data-action="accessibility" title="TalkBack accessibility inspector" aria-pressed="false" aria-expanded="false"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="7" r="1"/><path d="m7 10 5 1 5-1M12 11v4m0 0-3 3m3-3 3 3"/></svg><span>A11y</span></button>' : ''}
     <button class="pill-btn" data-action="kbd" title="Keyboard">
       <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
         <rect x="1" y="5" width="18" height="11" rx="2"/>
@@ -1036,7 +1066,8 @@ termResizeHandle.addEventListener('pointermove', event => {
   updateViewportVars();
 });
 ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(name => termResizeHandle.addEventListener(name, () => { termDrag = null; }));
-window.addEventListener('pagehide', () => { persistTerminalTabs(); termTabs.forEach(tab => tab.terminal.destroy({ terminate: false })); });
+window.addEventListener('pagehide', () => { simPanels.forEach(p => { p.accessibility?.setOpen(false); p.stream?.destroy(); }); persistTerminalTabs(); termTabs.forEach(tab => tab.terminal.destroy({ terminate: false })); });
+window.addEventListener('pageshow', e => { if (e.persisted) location.reload(); });
 
 // ── Session persistence ───────────────────────────────────────────────────────
 const _SESSION_KEY = 'simwispSession';

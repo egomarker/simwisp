@@ -10,10 +10,10 @@ export class SimStream {
   #twoFinger = false;
   #udid; #canvas; #ctx;
   #ws = null; #connectTimer = null; #reconnectTimer = null; #watchdog = null;
-  #lastFrameAt = 0; #firstFrame = false; #frameInFlight = false;
+  #lastFrameAt = 0; #firstFrame = false; #frameInFlight = false; #captureUnavailable = false;
   #portraitW; #portraitH; #isLandscape = false;
   #onStatus; #onFirstFrame; #onOrientationChange; #onRotateStart; #onRotateEnd;
-  #onStats; #statsTimer = null;
+  #onStats; #onAccessibility; #statsTimer = null;
   #stats = { frames: 0, bytes: 0, dropped: 0, lastFrames: 0, lastBytes: 0, fps: 0, bps: 0, avgFrame: 0 };
   #serverStats = { fps: null, quality: null };
 
@@ -30,6 +30,7 @@ export class SimStream {
       onRotateStart,
       onRotateEnd,
       onStats,
+      onAccessibility,
     } = {}
   ) {
     this.#udid = udid;
@@ -43,6 +44,7 @@ export class SimStream {
     this.#onRotateStart = onRotateStart ?? (() => {});
     this.#onRotateEnd = onRotateEnd ?? (() => {});
     this.#onStats = onStats ?? (() => {});
+    this.#onAccessibility = onAccessibility ?? (() => {});
 
     this.settings = { fps, quality, data_saver, dev_w: canvas.width, dev_h: canvas.height };
 
@@ -87,7 +89,7 @@ export class SimStream {
     clearTimeout(this.#reconnectTimer);
     if (this.#ws) { this.#ws.onclose = null; this.#ws.close(); }
 
-    this.#firstFrame = false;
+    this.#firstFrame = false; this.#captureUnavailable = false;
     this.#liveTouch = false;
     this.#onStatus('connecting');
 
@@ -110,6 +112,8 @@ export class SimStream {
     ws.onopen = () => {
       clearTimeout(this.#connectTimer);
       this.#onStatus('connected');
+      // Reconnect opts in only if this page still has an actually open pane.
+      this.send({ type: 'settings', stream_paused: this.settings.stream_paused === true, accessibility_enabled: this.settings.accessibility_enabled === true, accessibility_subscription: this.settings.accessibility_subscription ?? 0 });
       noFrameTimer = setTimeout(() => {
         if (!this.#firstFrame) this.#onStatus('no-frames');
       }, NO_FRAME_WARN);
@@ -130,11 +134,13 @@ export class SimStream {
       if (typeof e.data === 'string') {
         try {
           const msg = JSON.parse(e.data);
-          if (msg.type === 'input_capabilities') {
+          if (msg.type === 'accessibility_status' || msg.type === 'accessibility_event') {
+            if (this.settings.accessibility_enabled === true && this.settings.stream_paused !== true) this.#onAccessibility(msg);
+          } else if (msg.type === 'input_capabilities') {
             this.#liveTouch = msg.live_touch === true;
           } else if (msg.type === 'capture_error' || msg.type === 'input_error') {
             console.warn('Simwisp:', msg.message);
-            if (msg.type === 'capture_error') this.#onStatus('no-frames');
+            if (msg.type === 'capture_error') { this.#captureUnavailable = true; this.#onStatus('no-frames'); }
           } else if (msg.type === 'frame_heartbeat') {
             this.#lastFrameAt = Date.now();
           } else if (msg.type === 'rotated') {
@@ -158,11 +164,12 @@ export class SimStream {
 
       this.#lastFrameAt = Date.now();
       this.#stats.bytes += e.data.size || 0;
-      if (!this.#firstFrame) {
-        this.#firstFrame = true;
+      if (!this.#firstFrame || this.#captureUnavailable) {
+        const first = !this.#firstFrame;
+        this.#firstFrame = true; this.#captureUnavailable = false;
         clearTimeout(noFrameTimer);
         this.#onStatus('streaming');
-        this.#onFirstFrame();
+        if (first) this.#onFirstFrame();
       }
       if (this.#frameInFlight) {
         this.#stats.dropped += 1;

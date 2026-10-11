@@ -139,6 +139,14 @@ Simwisp serves the workspace and simulator streams directly from your Mac; it do
 - LAN transport is **unencrypted HTTP**. Use it only on a trusted network, or through an encrypted tunnel; do not expose the port directly to the internet.
 - Settings, including the pairing token, are stored outside the repository at `~/Library/Application Support/Simwisp/settings.json`.
 
+## Android TalkBack inspector
+
+On an Android stream, the **A11y** control opens an accessibility pane below the simulator. By default it shows only **TALKBACK SAYS**. **More…** reveals the observed label, role (when available), tooltip, package/class, bounds, properties and actions; the pane expands in layout flow and the displayed simulator shrinks proportionally. It never covers the stream. **Less** restores the compact view. iOS has no inspector control.
+
+This reads TalkBack's diagnostic logs, **not** an authoritative current selection or full accessibility tree. TalkBack must be enabled with verbose diagnostic logging; Simwisp does not enable it, alter device settings, or clear logs automatically. Without matching events the pane explains that it is waiting. Composed TTS fallback is labeled separately from exact `action=SPEAK`. Password-node content is hidden; no raw logs/history are persisted.
+
+Monitoring is native, bounded and readiness-driven: one serial-targeted ADB reader exists only when that pane is open **and its Android stream is active**. Closing the pane while video continues, pausing/hiding the stream, losing its window, disconnecting, replacing the controller or stopping the server cancels reading and terminates the child. No background logcat reader, parser, polling timer or accessibility sending remains when monitoring is off. Inspector JS/CSS loads locally only on first open. Reconnection opts in only for a pane that is still open. The native popup reports listening/recent sending/paused/error in that Android session's existing details.
+
 ## Performance and lifecycle
 
 Streaming is paced by frame deadlines and browser acknowledgements, with bounded encoding and socket buffers. Slow connections can reduce FPS and JPEG quality automatically; 60 FPS is a target, not a guarantee on every network or device.
@@ -178,9 +186,13 @@ Useful targets:
 
 ```bash
 make check   # Build, sign, and verify
+make test    # Native pairing + accessibility regressions; no app launch
+make test-browser-accessibility # Optional isolated browser/transport fixtures
 make run     # Build and open using saved settings
 make clean   # Remove build output; quit the app first
 ```
+
+The optional browser target requires existing Google Chrome and Node.js 22+ on macOS, and a free loopback port 45151. It serves synthetic simulator frames and TalkBack events with the real native HTTP/reader/coordinator code; it does not launch an app bundle or control a device. Override the executable with `make NODE=/path/to/node test-browser-accessibility`. To separately check an existing Android ADB connection, run `NODE=/path/to/node Tests/Browser/run.sh --real-adb`; logcat then runs only while the test pane and fixture stream are open, without changing device settings or injecting navigation. A fresh real speech event still needs manual confirmation. Set `TEST_OUTPUT=/path/outside-the-repository` to retain screenshots/JSON; otherwise temporary fixtures and profiles are removed. Tests do not certify live capture FPS.
 
 ## Development status
 

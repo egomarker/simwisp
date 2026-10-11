@@ -34,6 +34,8 @@ final class StreamSession: @unchecked Sendable {
     private var lastACKMS: Double = 0
     private var pendingInput: [[String: Any]] = []
     private var inputBusy = false
+    private var captureHasFrame = false
+    private let accessibility: AccessibilitySession
     private var started = monotonic()
     var onClose: (() -> Void)?
     init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup) {
@@ -42,6 +44,14 @@ final class StreamSession: @unchecked Sendable {
         quality = min(95, max(1, Int(request.query["quality"] ?? "") ?? settings.quality)); targetQuality = quality
         dataSaver = request.query["data_saver"] == "1"
         worker = DispatchQueue(label: "Simwisp.encode.\(id)", qos: .userInitiated)
+        accessibility = AccessibilitySession(serial: id, platform: devices.device(id)?.platform ?? "ios", executable: devices.adb, queue: queue, lifecycle: lifecycle) { [weak client] value, completion in client?.sendJSON(value, completion: completion) }
+    }
+    private var accessibilityStreamReady: Bool {
+        !closed && !paused && captureHasFrame && lastError == nil && capture != nil && capture?.failure == nil && devices.window(id) != nil
+    }
+    private func reconcileAccessibility() {
+        // Avoid capture/discovery locks when no pane is requested. No new timer.
+        accessibility.update(streamActive: accessibility.requested && accessibilityStreamReady)
     }
     func start() {
         client.onMessage = { [weak self] text in self?.message(dictionary(Data(text.utf8))) }
@@ -53,7 +63,7 @@ final class StreamSession: @unchecked Sendable {
         timer.setEventHandler { [weak self] in self?.tick() }; timer.resume(); self.timer = timer
     }
     var snapshot: [String: Any] {
-        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (capture == nil ? "Starting" : "Streaming")), "uptime": Int(monotonic() - started), "capture_counters": capture?.counters ?? [:], "last_encode_ms": lastEncodeMS, "last_ack_ms": lastACKMS]
+        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (capture == nil ? "Starting" : "Streaming")), "uptime": Int(monotonic() - started), "capture_counters": capture?.counters ?? [:], "last_encode_ms": lastEncodeMS, "last_ack_ms": lastACKMS, "accessibility": accessibility.snapshot]
     }
     // One-shot deadlines avoid quantizing 16.67 ms frames onto 16 ms polling
     // ticks. ACK and encoder/send completions wake the same bounded scheduler.
@@ -69,7 +79,7 @@ final class StreamSession: @unchecked Sendable {
     }
     private func tick() {
         guard !closed else { return }
-        defer { reschedule() }
+        defer { reconcileAccessibility(); reschedule() }
         let now = monotonic()
         if now - lastHeartbeat > 8 { client.sendJSON(["type": "frame_heartbeat"]); client.ping(); lastHeartbeat = now }
         guard let window = devices.window(id) else {
@@ -97,12 +107,12 @@ final class StreamSession: @unchecked Sendable {
             guard let self else { return }
             self.queue.async {
                 self.encoding = false; self.lastEncodeMS = encodeMS
-                defer { self.reschedule() }
+                defer { self.reconcileAccessibility(); self.reschedule() }
                 guard !self.closed, self.capture === capture else { return }
                 if let jpeg {
                     if self.dataSaver, self.lastJPEG == jpeg { return }
                     self.lastJPEG = self.dataSaver ? jpeg : nil
-                    self.sending = true; self.awaitingACK = monotonic(); self.frameCount += 1; self.lastError = nil
+                    self.sending = true; self.awaitingACK = monotonic(); self.frameCount += 1; self.lastError = nil; self.captureHasFrame = true
                     self.client.sendBinary(jpeg) { [weak self] in self?.sending = false; self?.reschedule() }
                     if monotonic() - self.lastStats >= 1 {
                         self.lastStats = monotonic(); self.client.sendJSON(["type": "server_stats", "fps": self.fps, "quality": self.quality, "frame_id": self.frameCount])
@@ -113,7 +123,7 @@ final class StreamSession: @unchecked Sendable {
     }
     private func configure(_ window: DeviceWindow) {
         configuring = true
-        let old = capture; capture = nil; geometry = nil
+        let old = capture; capture = nil; geometry = nil; captureHasFrame = false; reconcileAccessibility()
         let new = WindowCapture(target: window), lifecycle = self.lifecycle
         lifecycle.enter()
         Task { @MainActor [weak self] in
@@ -125,7 +135,7 @@ final class StreamSession: @unchecked Sendable {
                     self.configuring = false
                     if self.closed { Task { @MainActor in await new.stop(); lifecycle.leave() }; return }
                     self.capture = new; self.geometry = window; self.lastJPEG = nil; self.lastError = nil
-                    lifecycle.leave(); self.reschedule()
+                    lifecycle.leave(); self.reconcileAccessibility(); self.reschedule()
                 }
             } catch {
                 guard let self else { lifecycle.leave(); return }
@@ -134,7 +144,8 @@ final class StreamSession: @unchecked Sendable {
         }
     }
     private func releaseCapture() {
-        let old = capture; capture = nil; geometry = nil; lastJPEG = nil
+        let old = capture; capture = nil; geometry = nil; lastJPEG = nil; captureHasFrame = false
+        reconcileAccessibility()
         if let old {
             let lifecycle = self.lifecycle; lifecycle.enter()
             Task { @MainActor in await old.stop(); lifecycle.leave() }
@@ -145,7 +156,7 @@ final class StreamSession: @unchecked Sendable {
     }
     private func message(_ data: [String: Any]) {
         guard !closed, let type = data["type"] as? String else { return }
-        defer { reschedule() }
+        defer { reconcileAccessibility(); reschedule() }
         if type == "frame_ack" {
             if let sent = awaitingACK {
                 let elapsed = monotonic() - sent; awaitingACK = nil; lastACKMS = elapsed * 1000
@@ -157,6 +168,7 @@ final class StreamSession: @unchecked Sendable {
             if let n = data["quality"] as? NSNumber { targetQuality = Int(clamp(n.doubleValue, 1, 95)); quality = targetQuality }
             if let value = data["data_saver"] as? Bool { dataSaver = value; lastJPEG = nil }
             if let value = data["stream_paused"] as? Bool { paused = value; if value { awaitingACK = nil } }
+            if let value = data["accessibility_enabled"] as? Bool { accessibility.update(paneOpen: value, streamActive: value && accessibilityStreamReady, subscription: data["accessibility_subscription"] as? Int) }
         } else {
             let allowed = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "rotate", "appearance", "accessibility_swipe"]
             guard allowed.contains(type) else { return }
@@ -180,6 +192,7 @@ final class StreamSession: @unchecked Sendable {
     }
     func stop() {
         guard !closed else { return }; closed = true
+        accessibility.stop()
         timer?.cancel(); timer = nil; pendingInput.removeAll(); input.cancel(id); releaseCapture(); onClose?(); onClose = nil
     }
 }

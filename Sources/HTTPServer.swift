@@ -206,7 +206,7 @@ final class ClientConnection {
         terminalKeepalive = timer; timer.resume()
     }
     func closeAfterSending() { sendFrame(Data(), opcode: 8) { [weak self] in self?.close() } }
-    func sendJSON(_ value: [String: Any]) { sendFrame(jsonData(value), opcode: 1) }
+    func sendJSON(_ value: [String: Any], completion: (() -> Void)? = nil) { sendFrame(jsonData(value), opcode: 1, completion: completion) }
     func sendBinary(_ value: Data, completion: (() -> Void)? = nil) { sendFrame(value, opcode: 2, completion: completion) }
     func ping() { sendFrame(Data(), opcode: 9) }
     private func sendFrame(_ payload: Data, opcode: UInt8, completion: (() -> Void)? = nil) {
