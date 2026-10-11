@@ -13,10 +13,14 @@ final class Service {
     private var streams: [String: StreamSession] = [:] // network queue owns registry
     private let lifecycle = DispatchGroup()
     private let cookie: String
+    private let pairingQueue = DispatchQueue(label: "Simwisp.pairing", qos: .userInitiated)
+    private var pairing: PairingAuthenticator!
+    private let pairingStateURL: URL
     private var usage = Usage() // sampled on the network queue for diagnostics only
     private var panelState: [String: Any] = ["visible": false, "refresh_timer": false, "refreshes": 0]
     var stateChanged: ((String) -> Void)?
-    init(settings: Settings) {
+    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json")) {
+        self.pairingStateURL = pairingStateURL
         self.settings = settings; devices = Devices(settings: settings); input = DeviceInput(devices: devices)
         terminals = TerminalManager(settings: settings, network: server.queue)
         cookie = SHA256.hash(data: Data(("simwisp-session-v1:" + settings.pairingToken).utf8)).map { String(format: "%02x", $0) }.joined()
@@ -28,7 +32,11 @@ final class Service {
         server.upgrade = { [weak self] request, client in self?.upgrade(request, client: client) }
         server.stateChanged = { [weak self] state in self?.stateChanged?(state) }
     }
-    func start() throws { try server.start(port: settings.port, lan: settings.shareLAN) }
+    func start() throws {
+        if let error = settings.loadingError { throw WispError(error) }
+        pairing = try PairingAuthenticator(settings: settings.pairing, token: settings.pairingToken, stateURL: pairingStateURL)
+        try server.start(port: settings.port, lan: settings.shareLAN)
+    }
     func updatePanelState(visible: Bool, refreshing: Bool, count: UInt64) {
         server.queue.async { self.panelState = ["visible": visible, "refresh_timer": refreshing, "refreshes": count] }
     }
@@ -36,7 +44,7 @@ final class Service {
         devices.stop(); lifecycle.enter()
         terminals.stop { self.lifecycle.leave() }
         lifecycle.enter()
-        server.stop { self.input.queue.async { self.lifecycle.leave() } }
+        server.stop { self.pairingQueue.async { self.input.queue.async { self.lifecycle.leave() } } }
         lifecycle.notify(queue: .main, execute: completion)
     }
     func snapshots(_ completion: @escaping ([[String: Any]]) -> Void) { server.queue.async { completion(self.streams.values.map(\.snapshot).sorted { ($0["name"] as? String ?? "") < ($1["name"] as? String ?? "") }) } }
@@ -72,13 +80,28 @@ final class Service {
         streams[id] = session; devices.setStreamingDemand(true); session.start()
     }
     private func route(_ request: HTTPRequest, complete: @escaping (HTTPResponse) -> Void) {
+        if request.path == "/api/pair/options", request.method == "GET" {
+            complete(.json(["totp": pairing.totpEnabled])); return
+        }
         if request.path == "/api/pair" {
             guard request.method == "POST", request.sameOrigin else { complete(.json(["error": "Same-origin POST required"], status: 403)); return }
-            let token = dictionary(request.body)["token"] as? String ?? ""
-            guard equal(token, settings.pairingToken) else { complete(.json(["error": "Invalid pairing code"], status: 401)); return }
-            var response = HTTPResponse.json(["ok": true])
-            response.headers["Set-Cookie"] = "simwisp_session=\(cookie); Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000"
-            complete(response); return
+            guard request.body.count <= 2048 else { complete(.json(["error": "Pairing body too large"], status: 413)); return }
+            pairingQueue.async {
+                let decision = self.pairing.authenticate(dictionary(request.body), sourceAddress: request.sourceAddress)
+                var response: HTTPResponse
+                switch decision {
+                case .accepted:
+                    response = .json(["ok": true])
+                    response.headers["Set-Cookie"] = "simwisp_session=\(self.cookie); Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000"
+                case .denied: response = .json(["error": "Invalid pairing credential"], status: 401)
+                case .unavailable: response = .json(["error": "TOTP unavailable. Use a pairing link or check Simwisp on the Mac."], status: 503)
+                case .throttled(let seconds):
+                    response = .json(["error": "Too many pairing attempts. Try again later."], status: 429)
+                    response.headers["Retry-After"] = String(seconds)
+                }
+                complete(response)
+            }
+            return
         }
         if request.path == "/" || request.path.hasPrefix("/css/") || request.path.hasPrefix("/js/") {
             guard request.method == "GET", !request.path.contains(".."), !request.path.contains("\\") else { complete(.json(["error": "Invalid resource"], status: 400)); return }

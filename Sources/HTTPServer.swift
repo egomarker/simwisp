@@ -7,6 +7,7 @@ struct HTTPRequest {
     let query: [String: String]
     let headers: [String: String]
     let body: Data
+    let sourceAddress: String
     var host: String { headers["host"] ?? "" }
     var sameOrigin: Bool { headers["origin"] == "http://" + host }
 }
@@ -120,7 +121,7 @@ final class ClientConnection {
         let total = end.upperBound + length
         guard buffer.count >= total else { return }
         var query: [String: String] = [:]; for item in url.queryItems ?? [] { query[item.name] = item.value }
-        let request = HTTPRequest(method: first[0], path: url.path, query: query, headers: headers, body: Data(buffer[end.upperBound..<total]))
+        let request = HTTPRequest(method: first[0], path: url.path, query: query, headers: headers, body: Data(buffer[end.upperBound..<total]), sourceAddress: connection.sourceAddress)
         buffer = Data(buffer.dropFirst(total)); handledHTTP = true; timeout?.cancel()
         if headers["upgrade"]?.lowercased() == "websocket" {
             guard request.method == "GET", request.sameOrigin, server?.authorize?(request) == true,
@@ -140,7 +141,7 @@ final class ClientConnection {
     func respond(_ response: HTTPResponse) {
         guard !closing, !responded else { return }
         responded = true; handledHTTP = true; timeout?.cancel()
-        let descriptions = [200: "OK", 204: "No Content", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large", 431: "Request Header Fields Too Large", 500: "Internal Server Error", 503: "Service Unavailable"]
+        let descriptions = [200: "OK", 204: "No Content", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large", 429: "Too Many Requests", 431: "Request Header Fields Too Large", 500: "Internal Server Error", 503: "Service Unavailable"]
         var headers = response.headers
         headers["Content-Type"] = response.type; headers["Content-Length"] = String(response.body.count)
         headers["Connection"] = "close"; headers["Cache-Control"] = "no-store"; headers["X-Content-Type-Options"] = "nosniff"

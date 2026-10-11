@@ -58,26 +58,74 @@ struct Settings: Codable {
     var androidSDK = ""
     var androidTitlebar = 28
     var pairingToken = ""
+    var pairing = PairingSettings()
+    // Transient startup error, deliberately excluded from saved settings.
+    var loadingError: String? = nil
+    init() {}
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case port, shareLAN, terminalEnabled, fps, quality, projectDirectory, androidSDK, androidTitlebar, pairingToken, pairing
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 4141
+        shareLAN = try c.decodeIfPresent(Bool.self, forKey: .shareLAN) ?? false
+        terminalEnabled = try c.decodeIfPresent(Bool.self, forKey: .terminalEnabled)
+        fps = try c.decodeIfPresent(Int.self, forKey: .fps) ?? 60
+        quality = try c.decodeIfPresent(Int.self, forKey: .quality) ?? 20
+        projectDirectory = try c.decodeIfPresent(String.self, forKey: .projectDirectory) ?? FileManager.default.homeDirectoryForCurrentUser.path
+        androidSDK = try c.decodeIfPresent(String.self, forKey: .androidSDK) ?? ""
+        androidTitlebar = try c.decodeIfPresent(Int.self, forKey: .androidTitlebar) ?? 28
+        pairingToken = try c.decodeIfPresent(String.self, forKey: .pairingToken) ?? ""
+        pairing = try c.decodeIfPresent(PairingSettings.self, forKey: .pairing) ?? PairingSettings()
+    }
     static var file: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Simwisp/settings.json")
     }
-    static func load() -> Settings {
-        var s = (try? JSONDecoder().decode(Settings.self, from: Data(contentsOf: file))) ?? Settings()
+    static func load(from file: URL = Settings.file) -> Settings {
+        var s = Settings(), needsSave = false
+        if FileManager.default.fileExists(atPath: file.path) {
+            do {
+                try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.deletingLastPathComponent().path)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                let data = try Data(contentsOf: file)
+                s = try JSONDecoder().decode(Settings.self, from: data)
+                needsSave = dictionary(data)["pairing"] == nil
+            } catch {
+                s.loadingError = "Cannot read settings.json. Repair its JSON/types on the Mac; existing credentials were not overwritten."
+                return s
+            }
+        }
         if s.pairingToken.isEmpty {
             var bytes = [UInt8](repeating: 0, count: 32)
             guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { fatalError("Secure randomness unavailable") }
             s.pairingToken = Data(bytes).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-            s.save()
+            needsSave = true
+        }
+        if needsSave && !s.save(to: file) {
+            s.loadingError = "Cannot save settings.json securely. Check permissions on the Mac before starting the server."
         }
         return s
     }
-    func save() {
+    @discardableResult
+    func save(to file: URL = Settings.file) -> Bool {
+        // Native controls must not replace owner data after a failed load.
+        guard loadingError == nil else { log("Refusing to save settings after a loading error."); return false }
         do {
-            let dir = Self.file.deletingLastPathComponent()
+            // Retain unknown top-level owner settings when adding the new group.
+            var object: [String: Any] = [:]
+            if FileManager.default.fileExists(atPath: file.path) {
+                guard let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any] else { throw WispError("Invalid settings JSON") }
+                object = saved
+            }
+            for key in CodingKeys.allCases { object.removeValue(forKey: key.rawValue) }
+            object.merge(dictionary(try JSONEncoder().encode(self))) { _, new in new }
+            let dir = file.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            try JSONEncoder().encode(self).write(to: Self.file, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.file.path)
-        } catch { log("Cannot save settings: \(error.localizedDescription)") }
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+            try JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]).write(to: file, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+            return true
+        } catch { log("Cannot finish saving settings. Check their JSON and permissions on the Mac."); return false }
     }
 }
 

@@ -11,6 +11,7 @@ final class SocketTransport {
     }
     let fd: Int32
     let peer: String
+    let sourceAddress: String
     private let queue: DispatchQueue
     private var reader: DispatchSourceRead?
     private var writer: DispatchSourceWrite?
@@ -21,8 +22,8 @@ final class SocketTransport {
     private var finishCompletion: ((Error?) -> Void)?
     var onData: ((Data) -> Void)?
     var onEnd: (() -> Void)?
-    init(fd: Int32, peer: String, queue: DispatchQueue) {
-        self.fd = fd; self.peer = peer; self.queue = queue
+    init(fd: Int32, peer: String, sourceAddress: String, queue: DispatchQueue) {
+        self.fd = fd; self.peer = peer; self.sourceAddress = sourceAddress; self.queue = queue
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout<Int32>.size))
@@ -133,7 +134,8 @@ final class SocketListener {
             if descriptor < 0 { if errno == EINTR { continue }; return }
             var host = [CChar](repeating: 0, count: Int(NI_MAXHOST)), port = [CChar](repeating: 0, count: Int(NI_MAXSERV))
             _ = withUnsafePointer(to: &address) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getnameinfo($0, length, &host, socklen_t(host.count), &port, socklen_t(port.count), NI_NUMERICHOST | NI_NUMERICSERV) } }
-            let transport = SocketTransport(fd: descriptor, peer: String(cString: host) + ":" + String(cString: port), queue: queue)
+            let addressString = String(cString: host)
+            let transport = SocketTransport(fd: descriptor, peer: addressString + ":" + String(cString: port), sourceAddress: addressString, queue: queue)
             if let onAccept { onAccept(transport) } else { transport.start(); transport.cancel() }
         }
     }

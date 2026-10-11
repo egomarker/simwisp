@@ -27,11 +27,13 @@ final class Controller: ObservableObject {
         if let index = args.firstIndex(of: "--android-sdk"), index + 1 < args.count { settings.androidSDK = args[index + 1] }
     }
     func start() {
-        guard !started else { return }; started = true
+        guard !started else { return }
+        if let error = settings.loadingError { state = error; return }
+        started = true
         screenPermission = CGPreflightScreenCaptureAccess(); inputPermission = AXIsProcessTrusted()
         let service = Service(settings: settings); self.service = service
         service.stateChanged = { [weak self] state in DispatchQueue.main.async { self?.state = state } }
-        do { try service.start() } catch { state = error.localizedDescription; started = false; service.stop() }
+        do { try service.start() } catch { state = error.localizedDescription; started = false; service.stop(); return }
         if panelVisible { startPanelRefresh() }
         log("Listening on \(settings.shareLAN ? "LAN" : "localhost") port \(settings.port); terminal \(settings.terminalEnabled == true ? "enabled" : "disabled")")
     }

@@ -4,7 +4,7 @@ SOURCES := $(wildcard Sources/*.swift)
 ARCH := $(shell uname -m)
 SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 
-.PHONY: build check run clean install
+.PHONY: build check test run clean install
 build:
 	@mkdir -p '$(APP)/Contents/MacOS' '$(APP)/Contents/Resources'
 	xcrun clang -O2 -Wall -Wextra -Werror -isysroot '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/TerminalHost.c -o '$(APP)/Contents/MacOS/SimwispShell'
@@ -18,6 +18,10 @@ build:
 	codesign --verify --deep --strict '$(APP)'
 check: build
 	@/usr/libexec/PlistBuddy -c 'Print :LSUIElement' '$(APP)/Contents/Info.plist'
+test:
+	@mkdir -p build/tests
+	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Tests/main.swift -o build/tests/pairing-tests
+	@build/tests/pairing-tests
 run: build
 	open '$(APP)'
 install:

@@ -75,6 +75,37 @@ Collapsing the panel preserves tabs. Closing a tab terminates its shell and fore
 
 The default port is **4141**. Only one controlling browser connection is supported per device; a new connection replaces the previous one. Keep one controller per device to avoid competing reconnects.
 
+### Authenticator pairing (optional)
+
+The first launch of this version adds a disabled `pairing` group to `~/Library/Application Support/Simwisp/settings.json`, preserving the existing token, preferences and unknown top-level owner fields. You can also add the following group **alongside the existing fields**. Keep the existing `pairingToken`: it authorizes links and existing browser cookies. Restart Simwisp after editing; settings are not polled or hot-reloaded.
+
+```json
+"pairing": {
+  "totpSecret": null,
+  "rateLimits": {
+    "postsPerIPPerMinute": 2,
+    "totpFailuresPerIPPerMinute": 2,
+    "ipCooldownSeconds": [600, 1800, 3600],
+    "repeatWindowSeconds": 1800,
+    "globalTotpFailuresPerHour": 2,
+    "globalTotpLockoutSeconds": 3600
+  }
+}
+```
+
+Replace `null` with a **unique, private Base32 secret containing 20–64 bytes**, generated with a trusted local tool/password manager; enroll the same seed in your authenticator using **SHA-1, six digits, 30 seconds**. Do not use public test/example seeds or online key generators. Missing, null or blank seeds disable TOTP and hide its browser choice. Settings are owner-only (`0600`); neither the seed nor accepted codes are returned by the server or written to logs. Saved settings are pretty-printed, keeping seed and limits together. Old settings remain compatible and their pairing token is preserved. Invalid JSON/types are not silently replaced with new credentials; invalid seeds/limits prevent server startup until corrected.
+
+The unauthenticated screen offers **Pairing link** or **Authenticator code** when configured. The server accepts the current step ±1 for clock skew and exchanges either credential for the same HttpOnly/SameSite Strict browser cookie. A successfully accepted step cannot be reused, including after restart; wait for a fresh step when pairing another browser. This is an **alternative credential, not two-factor authentication**. With terminals enabled, either method grants Mac-user shell access. TOTP does not encrypt HTTP or prevent real-time phishing; use only a trusted LAN or an encrypted tunnel.
+
+Limits apply only to `POST /api/pair`, never simulator/terminal traffic or already-paired requests:
+
+- **Two POSTs in a rolling 60 seconds per socket IP**, including valid/invalid link and TOTP requests. Forwarded headers and changing source ports do not change identity; IPv6 identities group by /64 if used by the transport.
+- **Two failed TOTP verifications in 60 seconds/IP** start a 10-minute cooldown, escalating to 30 then 60 minutes. The repeat window starts **when the previous cooldown ends**; after 30 quiet post-expiry minutes the tier resets. Successful TOTP clears that IP's failure streak/tier, not global failure history.
+- **Two failed TOTP verifications across all IPs in a rolling hour** block new TOTP pairing for **one hour from the triggering failure**. Two typos or another LAN client can intentionally cause this lockout. At these defaults it normally dominates the shorter IP cooldowns. Link pairing retains its normal POST budget, and existing browser sessions remain usable.
+- Reject throttled attempts immediately with `429` and `Retry-After`; blocked requests never extend cooldown/global deadlines or count as additional credential failures. The second incorrect credential returns generic `401`, with subsequent TOTP attempts throttled. All counts/durations above are editable; counts must be 1–1000, durations 1–604800 seconds, and the three IP cooldowns ordered.
+
+Replay protection, global failed-attempt history and the global lock deadline persist in owner-only `pairing-state.json` next to settings, scoped to the decoded seed. Per-IP state is a bounded in-memory cache, expiring only on pairing requests; restarting resets IP budgets but not the persisted global/replay protection. Authentication and atomic state writes run on a separate serial queue, with **no timer, background polling or network/capture-queue sleep**. An unreadable/unwritable state file fails TOTP closed (`503`), while link pairing still works. Do not delete/edit state to bypass limits; repair permissions on the Mac if needed, or wait for lock expiry. `make test` runs deterministic pairing tests (RFC TOTP vectors, migration, boundaries, cooldowns, restart persistence, replay and fail-closed behavior) without launching the app.
+
 ## Launch options
 
 Pass options after `open build/Simwisp.app --args`:

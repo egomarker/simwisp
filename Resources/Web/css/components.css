@@ -726,9 +726,27 @@
 .panel-actions .pill-sep { height: 16px; margin: 0 3px; }
 @media (pointer: coarse) { .pill-btn { min-height: 38px; } .add-boot-btn, .add-close-btn { min-width: 36px; min-height: 36px; } }
 
-.pairing-screen { margin: auto; max-width: 440px; padding: 32px; line-height: 1.6; }
-.pairing-screen form { display: flex; gap: 8px; }
+.pairing-screen { margin: auto; width: 100%; max-width: 440px; max-height: 100%; overflow-y: auto; padding: 32px; line-height: 1.6; }
+.pairing-screen h1 { font-size: 26px; letter-spacing: -.6px; }
+.pairing-screen p { color: var(--text-secondary); margin: 10px 0; }
+.pairing-screen form { display: flex; gap: 8px; margin-top: 18px; }
+.pairing-screen input, .pairing-screen button { min-height: 44px; padding: 10px 12px; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--bg-elevated); color: var(--text-primary); font: inherit; }
 .pairing-screen input { flex: 1; min-width: 0; }
+.pairing-screen input::placeholder { color: var(--text-tertiary); }
+.pairing-screen button { cursor: pointer; }
+.pairing-screen button:disabled { opacity: .6; cursor: default; }
+.pairing-screen button:focus-visible, .pairing-screen input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pairing-screen button[type="submit"] { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.pairing-methods { display: flex; gap: 10px; margin: 18px 0; }
+.pairing-methods[hidden] { display: none; }
+.pairing-methods button { flex: 1; }
+.pairing-methods button[aria-pressed="true"] { background: var(--accent-bg); color: var(--accent); border-color: var(--accent); }
+.pairing-screen [role="status"] { overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+  .pairing-screen { padding: 24px; }
+  .pairing-screen form { flex-direction: column; }
+  .pairing-screen input { width: 100%; }
+}
 
 .terminal-toggle { display: inline-flex; align-items: center; gap: 7px; margin-left: 12px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elevated); color: var(--text-secondary); font: inherit; font-size: 11px; cursor: pointer; }
 .terminal-toggle:hover, .terminal-toggle.active { background: var(--accent-bg); color: var(--accent); border-color: var(--accent-border); }
