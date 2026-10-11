@@ -59,7 +59,7 @@ final class HTTPServer {
     func validHost(_ value: String) -> Bool {
         guard value.count < 256, let components = URLComponents(string: "http://" + value), let host = components.host,
               components.user == nil, components.password == nil, components.path.isEmpty else { return false }
-        return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == localAddress() || host == ProcessInfo.processInfo.hostName
+        return host == "localhost" || host == "127.0.0.1" || host == "::1" || localAddresses().contains(host) || host == ProcessInfo.processInfo.hostName
     }
 }
 

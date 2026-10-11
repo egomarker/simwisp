@@ -133,19 +133,83 @@ func localAddress() -> String? {
     var pointer: UnsafeMutablePointer<ifaddrs>?
     guard getifaddrs(&pointer) == 0, let first = pointer else { return nil }
     defer { freeifaddrs(pointer) }
+
     var cursor: UnsafeMutablePointer<ifaddrs>? = first
     var candidates: [(String, String)] = []
+
     while let item = cursor {
         defer { cursor = item.pointee.ifa_next }
-        guard let addr = item.pointee.ifa_addr, addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+        guard let addr = item.pointee.ifa_addr,
+              addr.pointee.sa_family == UInt8(AF_INET)
+        else { continue }
+
         let name = String(cString: item.pointee.ifa_name)
-        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-        if getnameinfo(addr, socklen_t(addr.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+
+        var host = [CChar](
+            repeating: 0,
+            count: Int(NI_MAXHOST)
+        )
+
+        if getnameinfo(
+            addr,
+            socklen_t(addr.pointee.sa_len),
+            &host,
+            socklen_t(host.count),
+            nil,
+            0,
+            NI_NUMERICHOST
+        ) == 0 {
             let ip = String(cString: host)
-            if ip != "127.0.0.1" { candidates.append((name, ip)) }
+
+            if ip != "127.0.0.1" {
+                candidates.append((name, ip))
+            }
         }
     }
-    return candidates.first(where: { $0.0.hasPrefix("en") })?.1 ?? candidates.first?.1
+
+    return candidates.first(where: {
+        $0.0.hasPrefix("en")
+    })?.1 ?? candidates.first?.1
+}
+
+func localAddresses() -> Set<String> {
+    var pointer: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&pointer) == 0, let first = pointer else {
+        return []
+    }
+
+    defer { freeifaddrs(pointer) }
+
+    var cursor: UnsafeMutablePointer<ifaddrs>? = first
+    var addresses = Set<String>()
+
+    while let item = cursor {
+        defer { cursor = item.pointee.ifa_next }
+
+        guard let addr = item.pointee.ifa_addr,
+              addr.pointee.sa_family == UInt8(AF_INET)
+        else { continue }
+
+        var host = [CChar](
+            repeating: 0,
+            count: Int(NI_MAXHOST)
+        )
+
+        if getnameinfo(
+            addr,
+            socklen_t(addr.pointee.sa_len),
+            &host,
+            socklen_t(host.count),
+            nil,
+            0,
+            NI_NUMERICHOST
+        ) == 0 {
+            addresses.insert(String(cString: host))
+        }
+    }
+
+    return addresses
 }
 
 struct Usage {
