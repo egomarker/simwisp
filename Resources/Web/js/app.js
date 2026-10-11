@@ -934,7 +934,7 @@ $('kbd-bs').addEventListener('click',  () => simPanels.get(focusedUdid)?.stream?
 $('kbd-ret').addEventListener('click', () => simPanels.get(focusedUdid)?.stream?.send({ type: 'key', key: 'return' }));
 
 // ── Terminal workspace (loaded on explicit open, never during streaming) ──
-const tabTerminal = $('tab-terminal');
+const terminalButton = $('btn-terminal');
 const termPanelEl = $('terminal-panel');
 const termPanesEl = $('term-panes');
 const termTabsBar = $('term-tabs-bar');
@@ -952,8 +952,8 @@ $('font-size-val').textContent = termFontSize;
 
 function terminalCapability(enabled) {
   terminalEnabled = !!enabled;
-  tabTerminal.disabled = !terminalEnabled;
-  tabTerminal.title = terminalEnabled ? 'Open a Mac terminal' : 'Enable Mac terminal access in Simwisp’s menu';
+  terminalButton.disabled = !terminalEnabled;
+  terminalButton.title = terminalEnabled ? 'Open a Mac terminal' : 'Enable Mac terminal access in Simwisp’s menu';
   if (!terminalEnabled && termTabs.length) {
     termTabs.forEach(tab => { tab.terminal.destroy(); tab.el.remove(); });
     termTabs = []; activeTermTabId = null; closeTerminal(); persistTerminalTabs();
@@ -1013,13 +1013,13 @@ async function openTerminal() {
       await module.loadTerminalAssets(); SimTerminal = module.SimTerminal;
       terminalResizeObserver = new ResizeObserver(() => { if (termOpen) activeTerminal()?.terminal.fit(); });
       terminalResizeObserver.observe(termPanesEl);
-    }).catch(error => { terminalLoading = null; console.warn('Simwisp terminal:', error.message); tabTerminal.title = 'Terminal could not load; click to retry'; throw error; });
+    }).catch(error => { terminalLoading = null; console.warn('Simwisp terminal:', error.message); terminalButton.title = 'Terminal could not load; click to retry'; throw error; });
     try { await terminalLoading; } catch { return; }
   }
   if (!terminalEnabled) return;
   termOpen = true; termPanelEl.hidden = false; termPanelEl.inert = false; termPanelEl.classList.remove('closed');
   content.classList.add('terminal-open'); content.classList.toggle('pinned-right', termPinned);
-  tabTerminal.classList.add('active'); tabTerminal.setAttribute('aria-expanded', 'true');
+  terminalButton.classList.add('active'); terminalButton.setAttribute('aria-expanded', 'true');
   if (!termTabs.length) {
     let saved = [];
     try { saved = JSON.parse(sessionStorage.getItem(TERM_TABS_KEY)) || []; } catch {}
@@ -1032,10 +1032,10 @@ async function openTerminal() {
 function closeTerminal() {
   termOpen = false; termPanelEl.classList.add('closed'); termPanelEl.hidden = true; termPanelEl.inert = true;
   content.classList.remove('terminal-open'); content.classList.remove('pinned-right');
-  tabTerminal.classList.remove('active'); tabTerminal.setAttribute('aria-expanded', 'false');
+  terminalButton.classList.remove('active'); terminalButton.setAttribute('aria-expanded', 'false');
   updateViewportVars(); updateStreamVisibility(); saveSession();
 }
-tabTerminal.addEventListener('click', () => { if (termOpen) closeTerminal(); else openTerminal(); });
+terminalButton.addEventListener('click', () => { if (termOpen) closeTerminal(); else openTerminal(); });
 $('btn-close-term').addEventListener('click', closeTerminal);
 $('btn-add-term').addEventListener('click', () => addTermTab());
 $('btn-pin-term').addEventListener('click', () => {

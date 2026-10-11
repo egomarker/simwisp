@@ -60,7 +60,7 @@ Terminal access is **disabled by default**. Enable **Allow Mac terminal access**
 open build/Simwisp.app --args --lan --terminal
 ```
 
-Refresh your browser, then choose **Terminal** in the workspace footer. Terminals run on the **host Mac**, not inside a simulator. They start a login shell in `--project-dir` (your home directory by default). You can add up to eight tabs, pin the terminal beside simulators, resize it, and adjust its font size.
+Refresh your browser, then choose the icon-and-**Terminal** button in the sidebar. There is no bottom terminal bar. Terminals run on the **host Mac**, not inside a simulator. They start a login shell in `--project-dir` (your home directory by default). You can add up to eight tabs, pin the terminal beside simulators, resize it, and adjust its font size.
 
 **Enabling this grants every paired browser shell access as your Mac user.** Use only trusted browsers and networks. `--no-terminal` disables access for a launch, even if it was saved as enabled.
 

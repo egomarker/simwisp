@@ -393,6 +393,7 @@
 .sidebar-btn.active { background: var(--accent-bg); color: var(--accent); border-color: var(--accent-border); }
 .sidebar-btn svg { flex-shrink: 0; opacity: 0.7; }
 .sidebar-btn.active svg { opacity: 1; }
+.sidebar-btn:disabled { opacity: .5; cursor: not-allowed; }
 
 /* ── Slider controls ── */
 .ctrl-row {
@@ -747,10 +748,6 @@
   .pairing-screen form { flex-direction: column; }
   .pairing-screen input { width: 100%; }
 }
-
-.terminal-toggle { display: inline-flex; align-items: center; gap: 7px; margin-left: 12px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elevated); color: var(--text-secondary); font: inherit; font-size: 11px; cursor: pointer; }
-.terminal-toggle:hover, .terminal-toggle.active { background: var(--accent-bg); color: var(--accent); border-color: var(--accent-border); }
-.terminal-toggle:disabled { opacity: .5; cursor: not-allowed; }
 
 /* Android inspector control; the pane styles/module load only on first open. */
 .pill-btn.a11y-toggle { width: auto; padding: 0 8px; gap: 5px; font-size: 10px; }

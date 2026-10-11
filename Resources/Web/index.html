@@ -63,7 +63,7 @@
   <!-- ── Sidebar ──────────────────────────────────────────────────────────── -->
   <aside id="sidebar" aria-label="Devices and workspace settings">
     <div class="sidebar-logo">
-      <span class="brand-mark" aria-hidden="true"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 15c-5-4 5-6 0-11M12 15c-5-4 5-6 0-11M18 15c-5-4 5-6 0-11M4 20h16"/></svg></span>
+      <span class="brand-mark" aria-hidden="true"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.5 3.5H7a3 3 0 0 0-3 3v11a3 3 0 0 0 3 3h7a3 3 0 0 0 3-3V14"/><path d="M8.5 13c0-3.5 11-1.5 11-5a3 3 0 0 0-3-3M9 17.5h3"/></svg></span>
       <div><div class="sidebar-brand-line"><span class="sidebar-logo-name">Simwisp<span class="brand-period">.</span></span>
         <span id="mode-badge" class="mode-badge">…</span></div></div>
     </div>
@@ -112,6 +112,8 @@
         <svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 10a6.5 6.5 0 1 0 6.5-6.5H7"/><path d="M7 1.5v4H3"/></svg>
         Refresh devices
       </button>
+
+      <button id="btn-terminal" class="sidebar-btn" disabled aria-controls="terminal-panel" aria-expanded="false" title="Enable Mac terminal access in Simwisp’s menu"><svg width="14" height="14" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m4 5 5 5-5 5m8 0h4"/></svg><span>Terminal</span></button>
 
       <div class="theme-section">
         <span class="settings-heading">Appearance</span>
@@ -193,11 +195,6 @@
       <button id="kbd-bs"   class="kbd-key" title="Backspace">⌫</button>
       <button id="kbd-ret"  class="kbd-key" title="Return">↵</button>
       <button id="kbd-send" class="kbd-send">Send</button>
-    </div>
-
-    <!-- Bottom tab bar — persistent terminal toggle -->
-    <div id="bottom-tab-bar">
-      <button id="tab-terminal" class="terminal-toggle" disabled aria-controls="terminal-panel" aria-expanded="false" title="Enable Mac terminal access in Simwisp’s menu"><span aria-hidden="true">&gt;_</span> Terminal</button>
     </div>
 
   </main><!-- /content -->

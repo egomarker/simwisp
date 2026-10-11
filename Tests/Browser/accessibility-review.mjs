@@ -14,6 +14,14 @@ async function wait(expression,ms=4000){const end=Date.now()+ms;while(Date.now()
 async function check(name,expression){const value=await evaluate(expression);report.checks.push({name,passed:value===true});if(value!==true)throw Error('FAIL '+name+': '+JSON.stringify(value));}
 async function nativeCheck(name,condition){const value=await condition();report.checks.push({name,passed:value===true});if(value!==true)throw Error('FAIL '+name);}
 async function click(selector){await evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);await delay(80)}
+async function pointerClick(selector){
+ const p=await evaluate("(()=>{const e=document.querySelector("+JSON.stringify(selector)+"),r=e.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;return {x,y,hit:x>=0&&x<innerWidth&&y>=0&&y<innerHeight&&e.contains(document.elementFromPoint(x,y))&&!e.disabled}})()");
+ if(!p.hit)throw Error('Button is not interactable: '+selector);
+ await cdp('Input.dispatchMouseEvent',{type:'mousePressed',x:p.x,y:p.y,button:'left',buttons:1,clickCount:1});
+ await cdp('Input.dispatchMouseEvent',{type:'mouseReleased',x:p.x,y:p.y,button:'left',clickCount:1});await delay(100);
+}
+async function showSidebar(){if(await evaluate("document.querySelector('#sidebar').inert"))await pointerClick('#mobile-menu-btn');await delay(350)}
+async function sidebarTerminal(){await showSidebar();await evaluate("document.querySelector('#btn-terminal').scrollIntoView({block:'nearest'})");await pointerClick('#btn-terminal')}
 async function shot(name){await evaluate('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))');await delay(400);const result=await cdp('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});fs.writeFileSync(path.join(root,name+'.png'),Buffer.from(result.data,'base64'));report.screenshots.push(name+'.png');}
 async function closeStreams(){await evaluate(`document.querySelectorAll('[data-action="close"]').forEach(b=>b.click())`);await delay(350)}
 
@@ -29,6 +37,7 @@ async function mouseResize(delta){const p=await gripPoint();await cdp('Input.dis
 async function touchResize(delta,cancel=false){const p=await gripPoint(),point={x:p.x,y:p.y,id:11,radiusX:4,radiusY:4};await cdp('Input.dispatchTouchEvent',{type:'touchStart',touchPoints:[point]});await cdp('Input.dispatchTouchEvent',{type:'touchMove',touchPoints:[{...point,y:p.y-delta}]});await cdp('Input.dispatchTouchEvent',{type:cancel?'touchCancel':'touchEnd',touchPoints:[]});await delay(100)}
 
 const androidInfo=async()=> (await status()).sessions.find(s=>s.id==='emulator-5554')?.accessibility;
+async function appearanceSpacing(){return evaluate("(()=>{const footer=document.querySelector('.sidebar-footer'),picker=document.querySelector('.theme-picker'),sidebar=document.querySelector('#sidebar'),prior=footer.scrollTop,probe=document.createElement('div');probe.style.cssText='position:fixed;visibility:hidden;pointer-events:none;padding-bottom:env(safe-area-inset-bottom,0px)';document.body.append(probe);const safe=parseFloat(getComputedStyle(probe).paddingBottom)||0;probe.remove();footer.scrollTop=footer.scrollHeight;const f=footer.getBoundingClientRect(),p=picker.getBoundingClientRect(),s=sidebar.getBoundingClientRect(),c=getComputedStyle(footer);const m={left:parseFloat(c.paddingLeft),bottom:parseFloat(c.paddingBottom)-safe,measuredLeft:p.left-s.left-parseFloat(getComputedStyle(sidebar).paddingLeft),measuredBottom:f.bottom-p.bottom-safe,pickerVisible:p.top>=f.top&&p.bottom<=f.bottom-safe+1};footer.scrollTop=prior;return m})()")}
 async function navigate(width,height,mobile,device='emulator-5554'){
  await cdp('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile});
  await cdp('Emulation.setTouchEmulationEnabled',{enabled:mobile});
@@ -49,9 +58,13 @@ try{
   await navigate(size.w,size.h,size.m);
 
   await check(size.name+' logo tagline removed',"!document.querySelector('.brand-caption')&&!document.querySelector('.sidebar-logo').textContent.includes('A little closer to your app')");
-  await check(size.name+' no Controlling label; footer keeps only Terminal',"!document.querySelector('#focus-summary')&&document.querySelector('#bottom-tab-bar').children.length===1&&document.querySelector('#bottom-tab-bar').firstElementChild.id==='tab-terminal'&&!document.querySelector('#bottom-tab-bar').textContent.includes('Controlling')");
-  await check(size.name+' sidebar Mac terminal button removed',"!document.querySelector('#btn-terminal')&&![...document.querySelectorAll('#sidebar button')].some(b=>b.textContent.trim()==='Mac terminal')");
-  await check(size.name+' footer respects disabled terminal capability',"document.querySelector('#tab-terminal').disabled&&document.querySelector('#tab-terminal').getAttribute('aria-controls')==='terminal-panel'&&document.querySelector('#tab-terminal').getAttribute('aria-expanded')==='false'&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/terminal.js'))");
+  await check(size.name+' no bottom bar or Controlling label',"!document.querySelector('#focus-summary')&&!document.querySelector('#bottom-tab-bar')&&!document.querySelector('#tab-terminal')");
+  await check(size.name+' sole styled terminal button is below Refresh in sidebar',"document.querySelectorAll('#btn-terminal').length===1&&document.querySelector('#sidebar #btn-terminal').classList.contains('sidebar-btn')&&document.querySelector('#btn-terminal').previousElementSibling.id==='btn-refresh'&&document.querySelector('#btn-terminal').textContent.trim()==='Terminal'&&!!document.querySelector('#btn-terminal svg[aria-hidden=true]')");
+  await check(size.name+' Terminal shares Refresh button style and width',"(()=>{const a=document.querySelector('#btn-terminal'),b=document.querySelector('#btn-refresh'),x=getComputedStyle(a),y=getComputedStyle(b);return ['display','padding','borderRadius','fontSize','fontFamily','fontWeight','minHeight'].every(p=>x[p]===y[p])&&Math.abs(a.getBoundingClientRect().width-b.getBoundingClientRect().width)<1})()");
+  await check(size.name+' sidebar respects disabled terminal capability',"document.querySelector('#btn-terminal').disabled&&document.querySelector('#btn-terminal').getAttribute('aria-controls')==='terminal-panel'&&document.querySelector('#btn-terminal').getAttribute('aria-expanded')==='false'&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/terminal.js'))");
+  await check(size.name+' crisp device-wisp logo, not steam',"(()=>{const s=document.querySelector('.brand-mark svg'),b=s.getBBox();return s.getAttribute('viewBox')==='0 0 24 24'&&s.querySelectorAll('path').length===2&&b.x>=0&&b.y>=0&&b.x+b.width<=24&&b.y+b.height<=24&&!s.innerHTML.includes('M6 15c-5-4')&&document.querySelector('.brand-mark').getAttribute('aria-hidden')==='true'})()");
+  await check(size.name+' Data saver unchanged without extra separator',"document.querySelector('#ds-btn').textContent.trim()==='Data saver'&&document.querySelector('#ds-btn').closest('.sidebar-settings').nextElementSibling.id==='btn-refresh'&&!document.querySelector('.sidebar-separator')");
+  await nativeCheck(size.name+' Appearance bottom and left margins match',async()=>{const m=await appearanceSpacing();return Math.abs(m.left-m.bottom)<.1&&Math.abs(m.measuredLeft-m.measuredBottom)<1.1&&m.pickerVisible});
   await check(size.name+' focused keyboard placeholder preserved',"document.querySelector('#kbd-input').placeholder==='Send text to Pixel 6 API 36…'");
   await check(size.name+' Android button only',`document.querySelectorAll('[data-action="accessibility"]').length===1`);
   await nativeCheck(size.name+' video without pane never creates reader',async()=>Object.keys((await androidInfo()).reader).length===0);
@@ -59,7 +72,7 @@ try{
   await click('[data-action="accessibility"]');
   await wait(`document.querySelector('.a11y-speech').textContent.includes('Opens this decision support tool')`);
   await check(size.name+' speech only by default',`document.querySelector('.a11y-details').hidden && document.querySelector('.a11y-more').textContent==='More…' && document.querySelector('.a11y-speech').textContent==='ADHD. Attention-Deficit/Hyperactivity Disorder, Button, Opens this decision support tool'`);
-  await check(size.name+' compact fits viewport and footer',`(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect(),b=document.querySelector('#bottom-tab-bar').getBoundingClientRect();return p.top>=f.bottom-1&&p.bottom<=b.top+1&&document.documentElement.scrollWidth<=innerWidth+1&&document.documentElement.scrollHeight<=innerHeight+1})()`);
+  await check(size.name+' compact fits full viewport without footer',`(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect(),b=document.querySelector('#viewport-area').getBoundingClientRect();return p.top>=f.bottom-1&&p.bottom<=b.bottom+1&&document.documentElement.scrollWidth<=innerWidth+1&&document.documentElement.scrollHeight<=innerHeight+1})()`);
   await check(size.name+' inspector controls and selectable text', `document.querySelector('[data-action="accessibility"]').getAttribute('aria-controls')===document.querySelector('.accessibility-pane').id&&document.querySelector('.a11y-more').getAttribute('aria-controls')===document.querySelector('.a11y-details').id&&getComputedStyle(document.querySelector('.a11y-details')).userSelect==='text'`);
 
   await check(size.name+' default speech viewport is three lines',"(()=>{const b=document.querySelector('.a11y-body'),e=document.querySelector('.a11y-eyebrow'),s=getComputedStyle(b),h=b.clientHeight-parseFloat(s.paddingTop)-parseFloat(s.paddingBottom)-e.getBoundingClientRect().height-parseFloat(getComputedStyle(e).marginBottom),line=parseFloat(getComputedStyle(document.querySelector('.a11y-speech')).lineHeight);return Math.abs(h-3*line)<1.1})()");
@@ -79,7 +92,7 @@ try{
   await check(size.name+' More expands BELOW and shrinks sim',`(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect();return p.top>=f.bottom-1&&f.height<window.__compact-2&&!document.querySelector('.a11y-details').hidden})()`);
   await check(size.name+' proportional refit keeps canvas resolution',`(()=>{const c=document.querySelector('canvas'),r=document.querySelector('.device-frame').getBoundingClientRect();return c.width===__resolution[0]&&c.height===__resolution[1]&&Math.abs(r.width-r.height*c.width/c.height)<=1.5})()`);
   await check(size.name+' all sample fields and no Center',`(()=>{const t=document.querySelector('.a11y-details').textContent;return t.includes('ROLE_BUTTON')&&t.includes('Screen bounds')&&t.includes('1006 × 368 px')&&t.includes('guidelines.childrensmercy.com.iguidelines')&&t.includes('ACTION_SHOW_ON_SCREEN')&&!t.includes('Center')})()`);
-  await check(size.name+' expanded pane is bounded internal scroll',`(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),b=document.querySelector('#bottom-tab-bar').getBoundingClientRect(),body=document.querySelector('.a11y-body');return p.bottom<=b.top+1&&getComputedStyle(body).overflowY==='auto'&&document.documentElement.scrollWidth<=innerWidth+1})()`);
+  await check(size.name+' expanded pane is bounded internal scroll',`(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),b=document.querySelector('#viewport-area').getBoundingClientRect(),body=document.querySelector('.a11y-body');return p.bottom<=b.bottom+1&&getComputedStyle(body).overflowY==='auto'&&document.documentElement.scrollWidth<=innerWidth+1})()`);
   if(['desktop','phone'].includes(size.name))await shot(size.name+'-speech-expanded');
   await click('.a11y-more');
   await check(size.name+' Less restores original sim size',`Math.abs(document.querySelector('.device-frame').getBoundingClientRect().height-__compact)<=2`);
@@ -101,7 +114,7 @@ try{
  await resizeKey('ArrowUp');await nativeCheck('Keyboard ArrowUp grows pane',async()=>Math.abs((await geometry()).pane-resized.pane-16)<2);
  await resizeKey('ArrowDown');await nativeCheck('Keyboard ArrowDown restores size',async()=>Math.abs((await geometry()).pane-resized.pane)<2);
  await resizeKey('Home');await check('Keyboard Home safely reaches minimum',"document.querySelector('.a11y-resize-handle').getAttribute('aria-valuenow')===document.querySelector('.a11y-resize-handle').getAttribute('aria-valuemin')");
- await resizeKey('End');await check('Keyboard End keeps simulator and workspace footer visible',"(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect(),stage=document.querySelector('.sim-stage');return stage.clientHeight>=47&&f.height>0&&f.bottom<=p.top+1&&p.bottom<=document.querySelector('#bottom-tab-bar').getBoundingClientRect().top+1})()");
+ await resizeKey('End');await check('Keyboard End keeps simulator and workspace bottom visible',"(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect(),stage=document.querySelector('.sim-stage');return stage.clientHeight>=47&&f.height>0&&f.bottom<=p.top+1&&p.bottom<=document.querySelector('#viewport-area').getBoundingClientRect().bottom+1})()");
  await resizeKey('Enter');await nativeCheck('Keyboard reset restores exact three-line default',async()=>Math.abs((await geometry()).pane-original.pane)<2);
  await mouseResize(70);
  await click('.a11y-more');const expanded=await geometry();await mouseResize(40);const customExpanded=await geometry();
@@ -113,7 +126,7 @@ try{
  await nativeCheck('Reload restores saved compact height per device',async()=>Math.abs((await geometry()).pane-resized.pane)<2);
  await click('.a11y-more');await nativeCheck('Reload restores independent expanded height',async()=>Math.abs((await geometry()).pane-customExpanded.pane)<2);
  await cdp('Emulation.setDeviceMetricsOverride',{width:375,height:420,deviceScaleFactor:1,mobile:true});await delay(200);
- await check('Short viewport clamps remembered size without covering stream/footer',"(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect();return f.height>0&&f.bottom<=p.top+1&&p.bottom<=document.querySelector('#bottom-tab-bar').getBoundingClientRect().top+1})()");
+ await check('Short viewport clamps remembered size without covering stream/workspace',"(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect();return f.height>0&&f.bottom<=p.top+1&&p.bottom<=document.querySelector('#viewport-area').getBoundingClientRect().bottom+1})()");
  await cdp('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});await delay(200);
  await nativeCheck('Viewport clamp never overwrites saved preferred height',async()=>Math.abs((await geometry()).pane-customExpanded.pane)<2);
  await click('.a11y-more');await shot('desktop-user-resized-pane');
@@ -203,28 +216,43 @@ try{
  await check('Android pane does not resize or cover iOS neighbor',"(()=>{const a=document.querySelector('.accessibility-pane').getBoundingClientRect(),i=document.querySelector('.sim-panel[data-udid=\"ios-fixture\"] .device-frame').getBoundingClientRect();return a.right<=i.left||a.left>=i.right})()");
  await closeStreams();
 
- // Exercise the remaining footer entry point with real bundled xterm assets,
- // against a synthetic terminal socket. Never create or touch a Mac shell.
+ // Exercise sidebar-only entry and unchanged automatic reload restoration,
+ // with bundled xterm and synthetic sockets. Never create or touch a Mac shell.
  const modeResponse=await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({terminal:true})});
  if(!modeResponse.ok)throw Error('Could not enable fixture terminal');
  for(const size of [{name:'desktop',w:1440,h:1000,m:false},{name:'phone',w:390,h:844,m:true}]){
-  await navigate(size.w,size.h,size.m);await wait("!document.querySelector('#tab-terminal').disabled");
+  await navigate(size.w,size.h,size.m);await wait("!document.querySelector('#btn-terminal').disabled");
   const terminalBefore=(await status()).terminal;
-  await check(size.name+' sole footer terminal enabled without eager assets',"document.querySelector('#tab-terminal').title==='Open a Mac terminal'&&!document.querySelector('#btn-terminal')&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/terminal.js'))");
-  if(size.m)await click('#mobile-menu-btn');
-  await shot(size.name+'-cleaned-sidebar');
-  if(size.m)await click('#mobile-menu-btn');
-  await click('#tab-terminal');
+  await check(size.name+' sidebar enabled without eager terminal assets',"document.querySelector('#btn-terminal').title==='Open a Mac terminal'&&!document.querySelector('#tab-terminal')&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/terminal.js'))");
+  await check(size.name+' full workspace has no reserved footer strip',"!document.querySelector('#bottom-tab-bar')&&parseFloat(getComputedStyle(document.querySelector('#viewport-area')).paddingBottom)===0&&Math.abs(document.querySelector('#viewport-area').getBoundingClientRect().bottom-document.querySelector('#content').getBoundingClientRect().bottom)<=1");
+  await showSidebar();await shot(size.name+'-sidebar-terminal');
+  if(!size.m){await click('[data-theme-choice="dark"]');await shot('desktop-dark-sidebar-terminal');await click('[data-theme-choice="light"]')}
+  await sidebarTerminal();
   await wait("!document.querySelector('#terminal-panel').hidden&&document.querySelector('#term-status-dot').title==='connected'&&document.querySelector('.xterm-rows').textContent.includes('Fixture terminal output')");
-  await check(size.name+' footer opens terminal with correct ARIA',"document.querySelector('#tab-terminal').classList.contains('active')&&document.querySelector('#tab-terminal').getAttribute('aria-expanded')==='true'&&document.querySelectorAll('.term-tab').length===1");
+  await check(size.name+' sidebar pointer opens terminal with correct ARIA',"document.querySelector('#btn-terminal').classList.contains('active')&&document.querySelector('#btn-terminal').getAttribute('aria-expanded')==='true'&&document.querySelectorAll('.term-tab').length===1");
   await check(size.name+' local xterm lazily renders synthetic output',"performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/vendor/xterm.js'))&&performance.getEntriesByType('resource').some(r=>r.name.endsWith('/css/terminal.css'))&&[...performance.getEntriesByType('resource')].every(r=>new URL(r.name).origin===location.origin)");
   await nativeCheck(size.name+' terminal socket is ACKed and never starts logcat',async()=>{const s=await status();return s.terminal.active===1&&s.terminal.starts===terminalBefore.starts+1&&s.terminal.output_acks>terminalBefore.output_acks&&Object.keys(s.sessions.find(p=>p.id==='emulator-5554').accessibility.reader).length===0});
   await click('#btn-close-term');
-  await check(size.name+' collapse restores footer with no removed elements',"document.querySelector('#terminal-panel').hidden&&!document.querySelector('#focus-summary')&&!document.querySelector('#btn-terminal')&&document.querySelector('#tab-terminal').getAttribute('aria-expanded')==='false'&&document.querySelector('#tab-terminal').getClientRects().length>0");
-  await click('#tab-terminal');await wait("!document.querySelector('#terminal-panel').hidden");
-  await nativeCheck(size.name+' footer reopens existing tab without extra socket',async()=>{const s=await status();return s.terminal.active===1&&s.terminal.starts===terminalBefore.starts+1});
+  await check(size.name+' collapse restores workspace, not a bottom bar',"document.querySelector('#terminal-panel').hidden&&!document.querySelector('#bottom-tab-bar')&&document.querySelector('#btn-terminal').getAttribute('aria-expanded')==='false'&&!document.querySelector('#content').classList.contains('pinned-right')");
+  await sidebarTerminal();await wait("!document.querySelector('#terminal-panel').hidden");
+  await nativeCheck(size.name+' sidebar reopens existing tab without extra socket',async()=>{const s=await status();return s.terminal.active===1&&s.terminal.starts===terminalBefore.starts+1});
+  if(!size.m)await click('#btn-pin-term');
+  const savedID=await evaluate("JSON.parse(sessionStorage.getItem('simwispTerminalTabs'))[0].sessionId");
+  await cdp('Page.navigate',{url:base+'/'});
+  await wait("!!document.querySelector('.sim-panel')&&!document.querySelector('#terminal-panel').hidden&&document.querySelector('#term-status-dot').title==='connected'&&document.querySelector('.xterm-rows').textContent.includes('Fixture terminal output')");
+  await check(size.name+' reload automatically restores open terminal and saved session',"document.querySelector('#btn-terminal').getAttribute('aria-expanded')==='true'&&document.querySelectorAll('.term-tab').length===1&&window.__wire.sockets.some(s=>s.url.includes('/ws/pty')&&s.url.includes("+JSON.stringify(savedID)+"))");
+  await check(size.name+' reload preserves pin preference',"document.querySelector('#content').classList.contains('pinned-right')==="+(!size.m));
+  await nativeCheck(size.name+' automatic restore remains terminal-only demand',async()=>{const s=await status();return s.terminal.active===1&&s.terminal.starts===terminalBefore.starts+2&&Object.keys(s.sessions[0].accessibility.reader).length===0});
+  await shot(size.name+'-terminal-reloaded');
+  await click('#btn-close-term');
+  const collapsedID=await evaluate("JSON.parse(sessionStorage.getItem('simwispTerminalTabs'))[0].sessionId");
+  await cdp('Page.navigate',{url:base+'/'});await wait("!!document.querySelector('.sim-panel canvas')&&document.querySelector('.panel-status').textContent==='Live'&&!document.querySelector('#btn-terminal').disabled");await delay(200);
+  await check(size.name+' reload of collapsed terminal stays lazy and hidden',"document.querySelector('#terminal-panel').hidden&&document.querySelector('#terminal-panel').inert&&document.querySelector('#btn-terminal').getAttribute('aria-expanded')==='false'&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/terminal.js'))&&!window.__wire.sockets.some(s=>s.url.includes('/ws/pty'))");
+  await nativeCheck(size.name+' collapsed reload creates no terminal socket',async()=>{const s=await status();return s.terminal.active===0&&s.terminal.starts===terminalBefore.starts+2});
+  await sidebarTerminal();await wait("document.querySelector('#term-status-dot').title==='connected'");
+  await check(size.name+' sidebar resumes retained tab after collapsed reload',"window.__wire.sockets.some(s=>s.url.includes('/ws/pty')&&s.url.includes("+JSON.stringify(collapsedID)+"))&&document.querySelectorAll('.term-tab').length===1");
   await click('.term-tab-close');
-  await check(size.name+' tab close restores enabled footer toggle',"document.querySelector('#terminal-panel').hidden&&!document.querySelector('#tab-terminal').disabled&&document.querySelector('#tab-terminal').getAttribute('aria-expanded')==='false'&&document.querySelectorAll('.term-tab').length===0");
+  await check(size.name+' last tab close restores enabled sidebar toggle',"document.querySelector('#terminal-panel').hidden&&!document.querySelector('#btn-terminal').disabled&&document.querySelector('#btn-terminal').getAttribute('aria-expanded')==='false'&&document.querySelectorAll('.term-tab').length===0");
   await nativeCheck(size.name+' test terminal socket closes without shell activity',async()=>(await status()).terminal.active===0);
   await closeStreams();
  }
