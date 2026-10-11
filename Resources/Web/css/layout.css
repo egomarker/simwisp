@@ -497,7 +497,6 @@ svg { flex-shrink: 0; }
 .brand-mark { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; color: var(--accent); background: var(--accent-bg); }
 .brand-period { color: var(--accent); }
 .sidebar-brand-line { display: flex; align-items: center; gap: 8px; }
-.brand-caption { display: block; color: var(--text-tertiary); font-size: 10px; margin-top: 5px; letter-spacing: .1px; }
 .eyebrow { color: var(--text-tertiary); font-size: 10px; font-weight: 600; letter-spacing: 1.3px; text-transform: uppercase; }
 .mobile-menu-btn { position: fixed; z-index: 45; top: calc(12px + env(safe-area-inset-top, 0px)); left: calc(var(--sidebar-width) + 12px); display: grid; place-items: center; width: 34px; height: 34px; flex-shrink: 0; color: var(--text-secondary); background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; cursor: pointer; }
 .mobile-menu-btn:hover { color: var(--text-primary); background: var(--bg-overlay); }
@@ -506,13 +505,11 @@ svg { flex-shrink: 0; }
 .action-btn:hover { background: var(--bg-overlay); border-color: var(--border-strong); }
 .action-btn.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); padding: 10px 16px; }
 .action-btn.primary:hover { background: var(--accent-hover); }
-.workspace-hint { font-size: 11px; color: var(--text-tertiary); margin-left: 14px; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
 .workspace-footnote { margin-left: auto; padding: 0 10px; color: var(--text-tertiary); font-size: 10px; white-space: nowrap; }
-#content.pinned-right .workspace-hint, #content.pinned-right .workspace-footnote { display: none; }
+#content.pinned-right .workspace-footnote { display: none; }
 .sim-panel.focused { border-color: var(--accent-border); }
 .sim-stage { flex: 1; min-height: 0; display: flex; align-items: flex-start; justify-content: center; padding: 20px 24px; overflow: hidden; background: var(--bg-stage); }
 @media (max-width: 700px), (max-height: 480px) and (max-width: 900px) {
   .workspace-footnote { display: none; }
   .sim-stage { padding: 14px 16px; }
-  .workspace-hint { font-size: 10px; }
 }

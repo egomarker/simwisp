@@ -60,7 +60,7 @@ Terminal access is **disabled by default**. Enable **Allow Mac terminal access**
 open build/Simwisp.app --args --lan --terminal
 ```
 
-Refresh your browser, then choose **Mac terminal** in the sidebar or **Terminal** in the workspace footer. Terminals run on the **host Mac**, not inside a simulator. They start a login shell in `--project-dir` (your home directory by default). You can add up to eight tabs, pin the terminal beside simulators, resize it, and adjust its font size.
+Refresh your browser, then choose **Terminal** in the workspace footer. Terminals run on the **host Mac**, not inside a simulator. They start a login shell in `--project-dir` (your home directory by default). You can add up to eight tabs, pin the terminal beside simulators, resize it, and adjust its font size.
 
 **Enabling this grants every paired browser shell access as your Mac user.** Use only trusted browsers and networks. `--no-terminal` disables access for a launch, even if it was saved as enabled.
 
@@ -196,7 +196,7 @@ The optional browser target requires existing Google Chrome and Node.js 22+ on m
 
 ## Development status
 
-**Early development build — version 0.1.0.** Live capture, pairing, multi-device streaming, disconnect/reconnect, and idle cleanup have been exercised on Apple Silicon. The host-architecture build recipe also supports compiling on Intel, but Intel runtime behavior has not been verified.
+**Early development build — version 0.2.0.** Live capture, pairing, multi-device streaming, disconnect/reconnect, and idle cleanup have been exercised on Apple Silicon. The host-architecture build recipe also supports compiling on Intel, but Intel runtime behavior has not been verified.
 
 Some native control combinations still need broader verification, particularly Android rotation and iOS text entry. Terminal PTY/security/lifecycle and desktop/mobile browser controls have been exercised on Apple Silicon. Terminal access is optional and disabled by default; legacy capture backends remain excluded.
 

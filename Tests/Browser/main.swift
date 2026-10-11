@@ -8,7 +8,10 @@ let fakeADB = root + "/fake-adb.sh"
 let env = ProcessInfo.processInfo.environment
 let realADB = [env["ANDROID_HOME"] ?? "", env["ANDROID_SDK_ROOT"] ?? "", NSHomeDirectory()+"/Library/Android/sdk", NSHomeDirectory()+"/.androidsdk"].filter { !$0.isEmpty }.map { $0+"/platform-tools/adb" }.first { FileManager.default.isExecutableFile(atPath:$0) }
 let server = HTTPServer(), lifecycle = DispatchGroup()
-var useRealADB = false
+var useRealADB = false, terminalEnabled = false
+// Synthetic protocol only: no host shell or PTY is created by this fixture.
+var terminalClients: [UUID: ClientConnection] = [:]
+var terminalStarts = 0, terminalACKs = 0
 var registry: [String: FixtureStream] = [:]
 let sampleID = "eventId=type:EVENT_TYPE_ACCESSIBILITY subtype:TYPE_VIEW_ACCESSIBILITY_FOCUSED displayId:0 time:123"
 let sampleFocus = "10-11 11:11:00.123 V/talkback: \(sampleID) interpretation=AccessibilityFocused{ eventSourceNode=contentDescription: ADHD. Attention-Deficit/Hyperactivity Disorder; text: null; tooltipText: Opens this decision support tool; packageName: guidelines.childrensmercy.com.iguidelines; className: android.widget.Button; boundsInScreen: Rect(37, 451 - 1043, 819); selected: false; checked: false; checkable: false; enabled: true; clickable: true; longClickable: false; focusable: true; focused: false; scrollable: false; visible: true; importantForAccessibility: true; password: false; [ACTION_FOCUS, ACTION_SELECT, ACTION_CLEAR_SELECTION, ACTION_CLICK, ACTION_CLEAR_ACCESSIBILITY_FOCUS, ACTION_NEXT_AT_MOVEMENT_GRANULARITY, ACTION_PREVIOUS_AT_MOVEMENT_GRANULARITY, ACTION_SET_SELECTION, ACTION_SHOW_ON_SCREEN]"
@@ -60,18 +63,33 @@ final class FixtureStream {
 let sims:[[String:Any]] = [["id":"emulator-5554","name":"Pixel 6 API 36","platform":"android","width":405,"height":900], ["id":"ios-fixture","name":"iPhone 11","platform":"ios","width":414,"height":896]]
 server.authorize={ request in request.headers["cookie"]?.contains("fixture=paired") == true }
 server.upgrade={ request, client in
+    if request.path == "/ws/pty" {
+        guard terminalEnabled else {client.sendJSON(["type":"terminal_error","message":"Fixture terminals disabled"]);client.closeAfterSending();return}
+        let id=client.id;terminalClients[id]=client;terminalStarts+=1
+        client.onClose={terminalClients.removeValue(forKey:id)}
+        client.onMessage={ [weak client] value in
+            let m=dictionary(Data(value.utf8))
+            if m["type"] as? String == "close" {client?.close()}
+            else if m["type"] as? String == "output_ack" {terminalACKs+=1}
+        }
+        client.sendJSON(["type":"session","id":"fixture-terminal-\(terminalStarts)"])
+        client.sendBinary(Data("Fixture terminal output\r\n".utf8));return
+    }
     let id=String(request.path.dropFirst(4));if let old=registry[id] {old.stop();old.client.close()};registry[id]=FixtureStream(id:id,client:client)
 }
 server.route={ request, complete in
     if request.path == "/api/pair" {var r=HTTPResponse.json(["ok":true]);r.headers["Set-Cookie"]="fixture=paired; Path=/; HttpOnly; SameSite=Strict";complete(r);return}
     if request.path == "/api/pair/options" {complete(.json(["totp":false]));return}
-    if request.path == "/api/info" {complete(.json(["app":"Simwisp","version":"fixture","has_adb":true,"mode":"fast2 (Native test fixture)","permissions":["screen_recording":true,"accessibility":true],"features":["terminal":false]]));return}
+    if request.path == "/api/info" {complete(.json(["app":"Simwisp","version":"fixture","has_adb":true,"mode":"fast2 (Native test fixture)","permissions":["screen_recording":true,"accessibility":true],"features":["terminal":terminalEnabled]]));return}
     if request.path == "/api/sims" {complete(.json(sims));return}
     if request.path == "/api/devices" {complete(.json([]));return}
-    if request.path == "/fixture/status" {complete(.json(["sessions":registry.values.map(\.snapshot),"real_adb":useRealADB]));return}
+    if request.path == "/fixture/status" {complete(.json(["sessions":registry.values.map(\.snapshot),"real_adb":useRealADB,"terminal":["active":terminalClients.count,"starts":terminalStarts,"output_acks":terminalACKs]]));return}
     if request.path == "/fixture/mode", request.method == "POST" {
-        guard registry.isEmpty else {complete(.json(["error":"Close fixture streams first"],status:409));return}
-        useRealADB=dictionary(request.body)["real"] as? Bool == true;complete(.json(["ok":true]));return
+        guard registry.isEmpty, terminalClients.isEmpty else {complete(.json(["error":"Close fixture streams first"],status:409));return}
+        let mode=dictionary(request.body)
+        if let real=mode["real"] as? Bool {useRealADB=real}
+        if let terminal=mode["terminal"] as? Bool {terminalEnabled=terminal}
+        complete(.json(["ok":true]));return
     }
     if request.path == "/" || request.path.hasPrefix("/css/") || request.path.hasPrefix("/js/") {
         let file=request.path == "/" ? "index.html" : String(request.path.dropFirst())

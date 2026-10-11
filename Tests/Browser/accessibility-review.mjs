@@ -47,6 +47,12 @@ try{
  const sizes=[{name:'desktop',w:1440,h:1000,m:false},{name:'phone',w:390,h:844,m:true},{name:'small-phone',w:320,h:568,m:true},{name:'short-phone',w:375,h:500,m:true},{name:'landscape-phone',w:844,h:390,m:true}];
  for(const size of sizes){
   await navigate(size.w,size.h,size.m);
+
+  await check(size.name+' logo tagline removed',"!document.querySelector('.brand-caption')&&!document.querySelector('.sidebar-logo').textContent.includes('A little closer to your app')");
+  await check(size.name+' no Controlling label; footer keeps only Terminal',"!document.querySelector('#focus-summary')&&document.querySelector('#bottom-tab-bar').children.length===1&&document.querySelector('#bottom-tab-bar').firstElementChild.id==='tab-terminal'&&!document.querySelector('#bottom-tab-bar').textContent.includes('Controlling')");
+  await check(size.name+' sidebar Mac terminal button removed',"!document.querySelector('#btn-terminal')&&![...document.querySelectorAll('#sidebar button')].some(b=>b.textContent.trim()==='Mac terminal')");
+  await check(size.name+' footer respects disabled terminal capability',"document.querySelector('#tab-terminal').disabled&&document.querySelector('#tab-terminal').getAttribute('aria-controls')==='terminal-panel'&&document.querySelector('#tab-terminal').getAttribute('aria-expanded')==='false'&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/terminal.js'))");
+  await check(size.name+' focused keyboard placeholder preserved',"document.querySelector('#kbd-input').placeholder==='Send text to Pixel 6 API 36…'");
   await check(size.name+' Android button only',`document.querySelectorAll('[data-action="accessibility"]').length===1`);
   await nativeCheck(size.name+' video without pane never creates reader',async()=>Object.keys((await androidInfo()).reader).length===0);
   await check(size.name+' unopened pane has no JS/CSS load', `!document.querySelector('.accessibility-pane')&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/accessibility.js')||r.name.endsWith('/css/accessibility.css'))`);
@@ -196,6 +202,34 @@ try{
  await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
  await check('Android pane does not resize or cover iOS neighbor',"(()=>{const a=document.querySelector('.accessibility-pane').getBoundingClientRect(),i=document.querySelector('.sim-panel[data-udid=\"ios-fixture\"] .device-frame').getBoundingClientRect();return a.right<=i.left||a.left>=i.right})()");
  await closeStreams();
+
+ // Exercise the remaining footer entry point with real bundled xterm assets,
+ // against a synthetic terminal socket. Never create or touch a Mac shell.
+ const modeResponse=await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({terminal:true})});
+ if(!modeResponse.ok)throw Error('Could not enable fixture terminal');
+ for(const size of [{name:'desktop',w:1440,h:1000,m:false},{name:'phone',w:390,h:844,m:true}]){
+  await navigate(size.w,size.h,size.m);await wait("!document.querySelector('#tab-terminal').disabled");
+  const terminalBefore=(await status()).terminal;
+  await check(size.name+' sole footer terminal enabled without eager assets',"document.querySelector('#tab-terminal').title==='Open a Mac terminal'&&!document.querySelector('#btn-terminal')&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/terminal.js'))");
+  if(size.m)await click('#mobile-menu-btn');
+  await shot(size.name+'-cleaned-sidebar');
+  if(size.m)await click('#mobile-menu-btn');
+  await click('#tab-terminal');
+  await wait("!document.querySelector('#terminal-panel').hidden&&document.querySelector('#term-status-dot').title==='connected'&&document.querySelector('.xterm-rows').textContent.includes('Fixture terminal output')");
+  await check(size.name+' footer opens terminal with correct ARIA',"document.querySelector('#tab-terminal').classList.contains('active')&&document.querySelector('#tab-terminal').getAttribute('aria-expanded')==='true'&&document.querySelectorAll('.term-tab').length===1");
+  await check(size.name+' local xterm lazily renders synthetic output',"performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/vendor/xterm.js'))&&performance.getEntriesByType('resource').some(r=>r.name.endsWith('/css/terminal.css'))&&[...performance.getEntriesByType('resource')].every(r=>new URL(r.name).origin===location.origin)");
+  await nativeCheck(size.name+' terminal socket is ACKed and never starts logcat',async()=>{const s=await status();return s.terminal.active===1&&s.terminal.starts===terminalBefore.starts+1&&s.terminal.output_acks>terminalBefore.output_acks&&Object.keys(s.sessions.find(p=>p.id==='emulator-5554').accessibility.reader).length===0});
+  await click('#btn-close-term');
+  await check(size.name+' collapse restores footer with no removed elements',"document.querySelector('#terminal-panel').hidden&&!document.querySelector('#focus-summary')&&!document.querySelector('#btn-terminal')&&document.querySelector('#tab-terminal').getAttribute('aria-expanded')==='false'&&document.querySelector('#tab-terminal').getClientRects().length>0");
+  await click('#tab-terminal');await wait("!document.querySelector('#terminal-panel').hidden");
+  await nativeCheck(size.name+' footer reopens existing tab without extra socket',async()=>{const s=await status();return s.terminal.active===1&&s.terminal.starts===terminalBefore.starts+1});
+  await click('.term-tab-close');
+  await check(size.name+' tab close restores enabled footer toggle',"document.querySelector('#terminal-panel').hidden&&!document.querySelector('#tab-terminal').disabled&&document.querySelector('#tab-terminal').getAttribute('aria-expanded')==='false'&&document.querySelectorAll('.term-tab').length===0");
+  await nativeCheck(size.name+' test terminal socket closes without shell activity',async()=>(await status()).terminal.active===0);
+  await closeStreams();
+ }
+ await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({terminal:false})});
+
  report.browserExceptions=exceptions.length;report.passed=report.checks.every(c=>c.passed)&&exceptions.length===0;
  if(!report.passed)throw Error('Browser exception or assertion failure');
  fs.writeFileSync(path.join(root,'browser-review.json'),JSON.stringify(report,null,2)+'\n');
