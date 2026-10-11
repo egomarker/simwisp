@@ -5,6 +5,16 @@ import ApplicationServices
 // Global HID mouse input must be serialized across devices. A new gesture
 // releases any prior pointer instead of leaving the host mouse pressed.
 final class DeviceInput {
+    static let supportedTypes: Set<String> = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "shake", "rotate", "appearance", "accessibility_swipe"]
+
+    // Isolate the shortcut policy from host effects so tests never focus or control a real device.
+    static func performShake(platform: String, trusted: Bool, window: DeviceWindow?, focus: (DeviceWindow) -> Bool, key: (CGKeyCode, CGEventFlags) throws -> Void) throws {
+        guard platform == "ios" else { throw WispError("Shake is iOS-only") }
+        guard trusted, let window else { throw WispError("Shake requires Accessibility permission and a visible iOS Simulator window") }
+        guard focus(window) else { throw WispError("Cannot focus the selected iOS Simulator window for Shake") }
+        try key(6, [.maskControl, .maskCommand]) // ANSI Z: Simulator's Control–Command–Z shortcut.
+    }
+
     let devices: Devices
     let queue = DispatchQueue(label: "Simwisp.input", qos: .userInteractive)
     private var gesture: (
@@ -24,23 +34,61 @@ final class DeviceInput {
     private func mouse(_ kind: CGEventType, _ point: CGPoint) {
         CGEvent(mouseEventSource: nil, mouseType: kind, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
     }
-    private func key(_ code: CGKeyCode, flags: CGEventFlags = []) {
-        for down in [true, false] {
-            let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down); event?.flags = flags; event?.post(tap: .cghidEventTap)
+    // Construct the entire chord before posting anything: modifier releases must
+    // not depend on whether a later CGEvent allocation succeeds. A private source
+    // avoids inheriting stale synthetic modifier flags from the host session.
+    static func keyboardEvents(_ code: CGKeyCode, flags: CGEventFlags = []) throws -> [CGEvent] {
+        guard let source = CGEventSource(stateID: .privateState) else { throw WispError("Cannot create keyboard event source") }
+        let modifiers: [(CGKeyCode, CGEventFlags)] = [(59, .maskControl), (58, .maskAlternate), (56, .maskShift), (55, .maskCommand)]
+        let pressed = modifiers.filter { flags.contains($0.1) }
+        var events: [CGEvent] = [], held: CGEventFlags = []
+        func append(_ key: CGKeyCode, down: Bool, flags: CGEventFlags) throws {
+            guard let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down) else { throw WispError("Cannot create keyboard event") }
+            event.flags = flags
+            event.setIntegerValueField(.keyboardEventAutorepeat, value: 0)
+            events.append(event)
+        }
+        for (key, modifier) in pressed {
+            held.insert(modifier)
+            try append(key, down: true, flags: held)
+        }
+        try append(code, down: true, flags: flags)
+        try append(code, down: false, flags: flags)
+        // Releasing Z alone does not release Control/Command. Send their actual
+        // flagsChanged key-up events in reverse order, clearing the final flags.
+        for (key, modifier) in pressed.reversed() {
+            held.remove(modifier)
+            try append(key, down: false, flags: held)
+        }
+        return events
+    }
+    private func key(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
+        let events = try Self.keyboardEvents(code, flags: flags)
+        for event in events {
+            event.post(tap: .cghidEventTap)
             Thread.sleep(forTimeInterval: 0.01)
         }
     }
-    private func focus(_ window: DeviceWindow) {
+    @discardableResult private func focus(_ window: DeviceWindow, verify: Bool = false) -> Bool {
         NSRunningApplication(processIdentifier: window.pid)?.activate()
         let app = AXUIElementCreateApplication(window.pid)
+        if verify { AXUIElementSetMessagingTimeout(app, 0.2) }
+        var target: AXUIElement?
         for root in axAttribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? [] {
-            if let frame = axFrame(root), abs(frame.minX - window.bounds.minX) < 5, abs(frame.minY - window.bounds.minY) < 5 {
+            if let frame = axFrame(root), abs(frame.minX - window.bounds.minX) < 5, abs(frame.minY - window.bounds.minY) < 5,
+               !verify || (abs(frame.width - window.bounds.width) < 5 && abs(frame.height - window.bounds.height) < 5) {
                 AXUIElementPerformAction(root, kAXRaiseAction as CFString)
                 AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, root)
+                target = root
                 break
             }
         }
         Thread.sleep(forTimeInterval: 0.06)
+        guard verify else { return true }
+        // Never send a host shortcut to a different app or simulator window if focusing failed.
+        guard let target, let focused = axAttribute(app, kAXFocusedWindowAttribute), CFEqual(target, focused),
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == window.pid else { return false }
+        return true
     }
     private func adb(_ id: String, _ args: [String]) throws -> CommandResult {
         guard let adb = devices.adb else { throw WispError("Android SDK adb unavailable") }
@@ -158,7 +206,7 @@ final class DeviceInput {
                 guard AXIsProcessTrusted(), let window else { throw WispError("Keyboard input requires Accessibility") }
                 focus(window)
                 let map: [String: CGKeyCode] = ["backspace": 51, "delete": 51, "return": 36, "enter": 36, "tab": 48, "escape": 53, "arrowleft": 123, "arrowright": 124, "arrowdown": 125, "arrowup": 126, "home": 115, "end": 119, "pageup": 116, "pagedown": 121]
-                if let code = map[name] { key(code) }
+                if let code = map[name] { try key(code) }
             }
         case "text":
             let text = m["text"] as? String ?? ""
@@ -181,7 +229,7 @@ final class DeviceInput {
                 }
                 board.clearContents(); board.setString(text, forType: .string)
                 let count = board.changeCount
-                key(9, flags: .maskCommand)
+                try key(9, flags: .maskCommand)
                 Thread.sleep(forTimeInterval: 0.25)
                 if board.changeCount == count { board.clearContents(); if !previous.isEmpty { board.writeObjects(previous) } }
             }
@@ -189,8 +237,11 @@ final class DeviceInput {
             if android { _ = try adb(id, ["shell", "input", "keyevent", "KEYCODE_HOME"]) }
             else {
                 let result = try command("/usr/bin/xcrun", ["simctl", "launch", id, "com.apple.springboard"], timeout: 8)
-                if result.status != 0, let window { focus(window); key(4, flags: [.maskCommand, .maskShift]) }
+                if result.status != 0, let window { focus(window); try key(4, flags: [.maskCommand, .maskShift]) }
             }
+        case "shake":
+            try Self.performShake(platform: device.platform, trusted: AXIsProcessTrusted(), window: window,
+                                  focus: { self.focus($0, verify: true) }, key: { try self.key($0, flags: $1) })
         case "appearance":
             let mode = m["mode"] as? String == "light" ? "light" : "dark"
             if android { _ = try adb(id, ["shell", "cmd", "uimode", "night", mode == "dark" ? "yes" : "no"]) }
@@ -210,7 +261,7 @@ final class DeviceInput {
                 guard AXIsProcessTrusted() else { return ["type": "rotate_failed"] }
                 focus(window)
                 // Simulator's public keyboard shortcuts avoid AppleScript Automation and an XCTest harness.
-                key(window.landscape ? 124 : 123, flags: .maskCommand)
+                try key(window.landscape ? 124 : 123, flags: .maskCommand)
             }
             devices.invalidate()
             let deadline = monotonic() + 4

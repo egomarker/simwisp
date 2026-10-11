@@ -828,6 +828,13 @@ function createPill(udid, name, platform) {
         <path d="M3 9.5L10 3l7 6.5"/><path d="M5 8.5v8h3.5v-4h3v4H15v-8"/>
       </svg>
     </button>
+    ${platform === 'ios' ? `
+    <button class="pill-btn" data-action="shake" title="Shake (Control–Command–Z)">
+      <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <g transform="rotate(-12 10 10)"><rect x="6.5" y="3" width="7" height="14" rx="1.8"/><path d="M9 14h2"/></g>
+        <path d="m3.5 5.5-1.5 2.5 1.5 2.5L2 13m14.5-6L18 9.5 16.5 12l1.5 2.5"/>
+      </svg>
+    </button>` : ''}
     <button class="pill-btn" data-action="appear" title="Switch simulator to light appearance">
       <svg width="18" height="18" viewBox="0 0 20 20" fill="currentColor">
         <path d="M10 3.5a6.5 6.5 0 0 0 0 13A7.5 7.5 0 0 1 10 3.5z"/>
@@ -864,6 +871,9 @@ function createPill(udid, name, platform) {
       case 'close': removeSimPanel(udid); break;
       case 'rotate': panel?.stream?.send({ type: 'rotate' }); break;
       case 'home':   panel?.stream?.send({ type: 'home' });   break;
+      case 'shake':
+        if (panel?.platform === 'ios') panel.stream?.send({ type: 'shake' });
+        break;
       case 'appear': {
         if (!panel) break;
         panel.appearMode = panel.appearMode === 'dark' ? 'light' : 'dark';

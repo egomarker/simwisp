@@ -37,9 +37,26 @@ text("Dehydration",35,215,24);text("Evaluation and treatment",35,178,15,.gray)
 text("HOME          FAVORITES          ABOUT",45,67,12,.gray);text("◁               ◯               □",107,20,18,.gray)
 NSGraphicsContext.restoreGraphicsState()
 let jpeg = rep.representation(using:.jpeg,properties:[.compressionFactor:0.7])!
+// A separate, explicitly synthetic iOS preview keeps toolbar screenshots honest.
+let iosRep = NSBitmapImageRep(bitmapDataPlanes:nil,pixelsWide:414,pixelsHigh:896,bitsPerSample:8,samplesPerPixel:4,hasAlpha:true,isPlanar:false,colorSpaceName:.deviceRGB,bytesPerRow:0,bitsPerPixel:0)!
+NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep:iosRep)
+NSColor(white:0.97,alpha:1).setFill(); NSRect(x:0,y:0,width:414,height:896).fill()
+text("11:45                       SYNTHETIC iOS",24,855,11)
+text("iPhone 11",28,785,32); text("Simulator controls preview",28,751,15,.gray)
+for (index,label) in ["Shake simulator", "Rotate screen", "Change appearance"].enumerated() {
+    let y = CGFloat(590-index*100)
+    NSColor.white.setFill(); NSBezierPath(roundedRect:NSRect(x:24,y:y,width:366,height:78),xRadius:12,yRadius:12).fill()
+    text(label,44,y+32,19)
+}
+text("Use Shake next to Home below.",28,224,17)
+text("Test image — not a live device capture",28,194,12,.gray)
+NSColor.darkGray.setFill(); NSBezierPath(roundedRect:NSRect(x:142,y:14,width:130,height:5),xRadius:2.5,yRadius:2.5).fill()
+NSGraphicsContext.restoreGraphicsState()
+let iosJPEG = iosRep.representation(using:.jpeg,properties:[.compressionFactor:0.7])!
 final class FixtureStream {
     let id: String, client: ClientConnection, monitor: AccessibilitySession
     var timer: DispatchSourceTimer?, frames = 0, inputs = 0, paused = false, pendingFrame = false
+    var lastInputs: [[String:Any]] = []
     init(id: String, client: ClientConnection) {
         self.id=id;self.client=client
         monitor=AccessibilitySession(serial:id,platform:id.hasPrefix("emulator-") ? "android" : "ios",executable:useRealADB ? realADB : fakeADB,queue:server.queue,lifecycle:lifecycle) { [weak client] value, done in client?.sendJSON(value,completion:done) }
@@ -47,7 +64,7 @@ final class FixtureStream {
         client.onClose={ [weak self] in self?.stop() }
         client.sendJSON(["type":"input_capabilities","live_touch":true]);client.sendJSON(["type":"rotated","landscape":false])
         let t=DispatchSource.makeTimerSource(queue:server.queue);t.schedule(deadline:.now(),repeating:1.0/60);t.setEventHandler { [weak self] in
-            guard let self,!self.paused,!self.pendingFrame else{return};self.pendingFrame=true;self.frames+=1;self.client.sendBinary(jpeg)
+            guard let self,!self.paused,!self.pendingFrame else{return};self.pendingFrame=true;self.frames+=1;self.client.sendBinary(self.id.hasPrefix("emulator-") ? jpeg : iosJPEG)
         };t.resume();timer=t
     }
     func message(_ m: [String:Any]) {
@@ -55,10 +72,10 @@ final class FixtureStream {
         else if m["type"] as? String == "settings" {
             if let p=m["stream_paused"] as? Bool {paused=p}
             monitor.update(paneOpen:m["accessibility_enabled"] as? Bool,streamActive:!paused,subscription:m["accessibility_subscription"] as? Int)
-        } else {inputs+=1}
+        } else {inputs+=1;lastInputs.append(m);if lastInputs.count>16 {lastInputs.removeFirst()}}
     }
     func stop() {monitor.stop();timer?.cancel();timer=nil;if registry[id] === self {registry.removeValue(forKey:id)}}
-    var snapshot: [String:Any] {["id":id,"frames":frames,"inputs":inputs,"paused":paused,"accessibility":monitor.snapshot]}
+    var snapshot: [String:Any] {["id":id,"frames":frames,"inputs":inputs,"last_inputs":lastInputs,"paused":paused,"accessibility":monitor.snapshot]}
 }
 let sims:[[String:Any]] = [["id":"emulator-5554","name":"Pixel 6 API 36","platform":"android","width":405,"height":900], ["id":"ios-fixture","name":"iPhone 11","platform":"ios","width":414,"height":896]]
 server.authorize={ request in request.headers["cookie"]?.contains("fixture=paired") == true }

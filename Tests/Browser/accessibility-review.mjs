@@ -66,6 +66,7 @@ try{
   await check(size.name+' Data saver unchanged without extra separator',"document.querySelector('#ds-btn').textContent.trim()==='Data saver'&&document.querySelector('#ds-btn').closest('.sidebar-settings').nextElementSibling.id==='btn-refresh'&&!document.querySelector('.sidebar-separator')");
   await nativeCheck(size.name+' Appearance bottom and left margins match',async()=>{const m=await appearanceSpacing();return Math.abs(m.left-m.bottom)<.1&&Math.abs(m.measuredLeft-m.measuredBottom)<1.1&&m.pickerVisible});
   await check(size.name+' focused keyboard placeholder preserved',"document.querySelector('#kbd-input').placeholder==='Send text to Pixel 6 API 36…'");
+  await check(size.name+' Android has no Shake control',"!document.querySelector('[data-action=shake]')");
   await check(size.name+' Android button only',`document.querySelectorAll('[data-action="accessibility"]').length===1`);
   await nativeCheck(size.name+' video without pane never creates reader',async()=>Object.keys((await androidInfo()).reader).length===0);
   await check(size.name+' unopened pane has no JS/CSS load', `!document.querySelector('.accessibility-pane')&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/accessibility.js')||r.name.endsWith('/css/accessibility.css'))`);
@@ -169,6 +170,49 @@ try{
  await nativeCheck('Recovered video frame restores open inspector on same socket',async()=>(await androidInfo()).reader.running===true);
  await closeStreams();
  await navigate(1440,1000,false,'ios-fixture');await check('No iOS button or pane',`!document.querySelector('[data-action="accessibility"]')&&!document.querySelector('.accessibility-pane')`);await closeStreams();
+ // Shake uses the selected iOS stream, never browser keyboard forwarding or Android.
+ const iosInfo=async()=> (await status()).sessions.find(s=>s.id==='ios-fixture');
+ for(const size of [...sizes,{name:'tablet',w:768,h:1024,m:true}]){
+  await navigate(size.w,size.h,size.m,'ios-fixture');
+  await check(size.name+' Shake immediately follows Home only on iOS',"(()=>{const b=document.querySelector('[data-action=shake]');return document.querySelectorAll('[data-action=shake]').length===1&&b.previousElementSibling.dataset.action==='home'&&b.nextElementSibling.dataset.action==='appear'&&!document.querySelector('[data-action=accessibility]')})()");
+  await check(size.name+' Shake icon is bounded, decorative and named',"(()=>{const b=document.querySelector('[data-action=shake]'),s=b.querySelector('svg'),r=s.getBBox();return b.title==='Shake (Control–Command–Z)'&&b.getAttribute('aria-label')===b.title&&s.getAttribute('aria-hidden')==='true'&&s.getAttribute('viewBox')==='0 0 20 20'&&r.x>=.8&&r.y>=.8&&r.x+r.width<=19.2&&r.y+r.height<=19.2})()");
+  await check(size.name+' all bottom buttons fit and accept pointer input',"(()=>{const p=document.querySelector('.sim-panel').getBoundingClientRect(),a=document.querySelector('.panel-actions').getBoundingClientRect();return a.left>=p.left&&a.right<=p.right&&a.bottom<=innerHeight&&[...document.querySelectorAll('.pill-btn')].every(b=>{const r=b.getBoundingClientRect();return r.width>=32&&r.height>=32&&r.left>=a.left&&r.right<=a.right&&b.contains(document.elementFromPoint(r.left+r.width/2,r.top+r.height/2))})&&document.documentElement.scrollWidth<=innerWidth+1})()");
+  await check(size.name+' existing iOS controls retain their order',"[...document.querySelectorAll('.panel-actions button')].map(b=>b.dataset.action).join(',')==='rotate,home,shake,appear,kbd,close'");
+  await nativeCheck(size.name+' Shake is never sent on startup',async()=>(await iosInfo()).inputs===0);
+  const before=await iosInfo();await pointerClick('[data-action=shake]');
+  await nativeCheck(size.name+' pointer sends exactly one Shake on the iOS socket',async()=>{const s=await iosInfo();return s.inputs===before.inputs+1&&JSON.stringify(s.last_inputs.at(-1))==='{"type":"shake"}'});
+  await check(size.name+' Shake selects the panel without opening keyboard or inspector',"document.querySelector('.sim-panel').classList.contains('focused')&&document.querySelector('#kbd-input').placeholder==='Send text to iPhone 11…'&&!document.querySelector('#kbd-bar').classList.contains('visible')&&!document.querySelector('.accessibility-pane')");
+  await nativeCheck(size.name+' Shake leaves capture and inspector demand unchanged',async()=>{const s=await iosInfo();return !s.paused&&s.frames>before.frames&&Object.keys(s.accessibility.reader).length===0&&s.accessibility.requested===false});
+  await evaluate("document.querySelector('[data-action=shake]').focus()");
+  await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,text:'\r'});
+  await cdp('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13});await delay(100);
+  await nativeCheck(size.name+' keyboard Enter activates Shake once',async()=>(await iosInfo()).inputs===before.inputs+2&&(await iosInfo()).last_inputs.at(-1).type==='shake');
+  await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:' ',code:'Space',windowsVirtualKeyCode:32,text:' '});
+  await cdp('Input.dispatchKeyEvent',{type:'keyUp',key:' ',code:'Space',windowsVirtualKeyCode:32});await delay(100);
+  await nativeCheck(size.name+' keyboard Space activates Shake once',async()=>(await iosInfo()).inputs===before.inputs+3&&(await iosInfo()).last_inputs.at(-1).type==='shake');
+  await evaluate('document.activeElement.blur()');
+  if(['desktop','phone','small-phone','landscape-phone'].includes(size.name))await shot(size.name+'-ios-shake');
+  if(size.name==='desktop'){await evaluate("document.documentElement.dataset.theme='dark'");await shot('desktop-dark-ios-shake');await evaluate("document.documentElement.dataset.theme='light'")}
+  await pointerClick('[data-action=home]');await nativeCheck(size.name+' Home still sends its original message',async()=>(await iosInfo()).last_inputs.at(-1).type==='home');
+  await pointerClick('[data-action=appear]');await nativeCheck(size.name+' appearance still sends its original mode',async()=>{const m=(await iosInfo()).last_inputs.at(-1);return m.type==='appearance'&&m.mode==='light'});
+  await pointerClick('[data-action=kbd]');await check(size.name+' keyboard toggle still opens and focuses text input',"document.querySelector('#kbd-bar').classList.contains('visible')&&document.activeElement.id==='kbd-input'");
+  await evaluate("document.querySelector('#kbd-input').value='Shake regression'");await click('#kbd-send');
+  await nativeCheck(size.name+' keyboard text is still a text command',async()=>{const m=(await iosInfo()).last_inputs.at(-1);return m.type==='text'&&m.text==='Shake regression'});
+  await pointerClick('[data-action=kbd]');
+  await closeStreams();await nativeCheck(size.name+' panel close tears down its stream',async()=>(await status()).sessions.length===0);
+ }
+ // Different desktop panels must not route via the previously focused device.
+ await navigate(1440,1000,false);
+ await click('.device-item[data-udid="ios-fixture"]');await wait("document.querySelectorAll('.sim-panel').length===2&&document.querySelector('.sim-panel[data-udid=ios-fixture] .panel-status').textContent==='Live'");
+ await pointerClick('.sim-panel[data-udid="emulator-5554"] [data-action=home]');
+ const mixedBefore=await status(),androidBefore=mixedBefore.sessions.find(s=>s.id==='emulator-5554');
+ await pointerClick('.sim-panel[data-udid="ios-fixture"] [data-action=shake]');
+ await nativeCheck('Mixed panels send Shake only to iOS despite prior Android focus',async()=>{const s=await status(),a=s.sessions.find(p=>p.id==='emulator-5554'),i=s.sessions.find(p=>p.id==='ios-fixture');return a.inputs===androidBefore.inputs&&i.inputs===1&&i.last_inputs[0].type==='shake'});
+ await check('Mixed panels keep Android controls separate and focus iOS on Shake',"!document.querySelector('.sim-panel[data-udid=\"emulator-5554\"] [data-action=shake]')&&document.querySelector('.sim-panel[data-udid=ios-fixture]').classList.contains('focused')&&!!document.querySelector('.sim-panel[data-udid=\"emulator-5554\"] [data-action=accessibility]')");
+ // Even a forged frontend button cannot bypass the per-panel iOS gate.
+ await evaluate("(()=>{const b=document.createElement('button');b.dataset.action='shake';document.querySelector('.sim-panel[data-udid=\"emulator-5554\"] .panel-actions').append(b);b.click();b.remove()})()");
+ await nativeCheck('Forged Android Shake button sends nothing',async()=>(await status()).sessions.find(s=>s.id==='emulator-5554').inputs===androidBefore.inputs);
+ await shot('desktop-mixed-ios-shake');await closeStreams();
  if(process.argv.includes('--real-adb')) {
  // Real ADB compatibility check: only after the actual frontend pane opens.
  await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({real:true})});

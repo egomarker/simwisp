@@ -170,8 +170,7 @@ final class StreamSession: @unchecked Sendable {
             if let value = data["stream_paused"] as? Bool { paused = value; if value { awaitingACK = nil } }
             if let value = data["accessibility_enabled"] as? Bool { accessibility.update(paneOpen: value, streamActive: value && accessibilityStreamReady, subscription: data["accessibility_subscription"] as? Int) }
         } else {
-            let allowed = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "rotate", "appearance", "accessibility_swipe"]
-            guard allowed.contains(type) else { return }
+            guard DeviceInput.supportedTypes.contains(type) else { return }
             if type == "touch_move", pendingInput.last?["type"] as? String == "touch_move" { pendingInput[pendingInput.count - 1] = data }
             else if pendingInput.count < 128 { pendingInput.append(data) }
             else { client.close(); return }

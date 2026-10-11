@@ -5,7 +5,7 @@ NODE ?= node
 ARCH := $(shell uname -m)
 SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 
-.PHONY: build check test test-pairing test-accessibility test-browser-accessibility run clean install
+.PHONY: build check test test-pairing test-accessibility test-input test-browser-accessibility run clean install
 build:
 	@mkdir -p '$(APP)/Contents/MacOS' '$(APP)/Contents/Resources'
 	xcrun clang -O2 -Wall -Wextra -Werror -isysroot '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/TerminalHost.c -o '$(APP)/Contents/MacOS/SimwispShell'
@@ -19,7 +19,7 @@ build:
 	codesign --verify --deep --strict '$(APP)'
 check: build
 	@/usr/libexec/PlistBuddy -c 'Print :LSUIElement' '$(APP)/Contents/Info.plist'
-test: test-pairing test-accessibility
+test: test-pairing test-accessibility test-input
 test-pairing:
 	@mkdir -p build/tests
 	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Tests/main.swift -o build/tests/pairing-tests
@@ -28,6 +28,10 @@ test-accessibility:
 	@mkdir -p build/tests
 	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/Accessibility.swift Tests/Accessibility/main.swift -o build/tests/accessibility-tests
 	@build/tests/accessibility-tests
+test-input:
+	@mkdir -p build/tests
+	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/Devices.swift Sources/Input.swift Tests/Input/main.swift -o build/tests/input-tests
+	@build/tests/input-tests
 test-browser-accessibility:
 	@NODE='$(NODE)' Tests/Browser/run.sh
 run: build
