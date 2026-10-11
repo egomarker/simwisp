@@ -8,7 +8,7 @@ A native macOS menu-bar app that brings live iOS and Android simulators into a l
 
 - **Native capture** — ScreenCaptureKit, bounded frame buffers, JPEG streaming, and adaptive pacing up to 60 FPS.
 - **Multiple devices** — view iOS and Android simulators side by side, with resizable panels and independent connections.
-- **Real controls** — taps, drags, Home, iOS Shake and App switcher, rotation, appearance, keyboard/text input, and Android two-finger gestures.
+- **Real controls** — taps, drags, Home, iOS Shake and App switcher, rotation, appearance, keyboard/text input, and Android Back/Menu/App switcher/two-finger gestures.
 - **Menu-bar only** — no normal server window; inspect sessions, permissions, and process usage from the menu.
 - **Quiet when idle** — capture and background discovery stop after the final streaming client disconnects. Popup monitoring stops when the popup closes. Terminal I/O uses readiness notifications, not polling.
 - **Optional Mac terminals** — login shells with tabs, resizing, themes, reconnect replay and explicit session cleanup. Renderer assets load only when a terminal is opened.
@@ -81,7 +81,11 @@ The **Shake** icon next to Home in each iOS simulator's bottom controls sends **
 
 ### Open the iOS app switcher
 
-The **App switcher** icon (overlapping app cards) sits beside Home and Shake in each iOS simulator's bottom controls. It holds **Shift + Command**, presses and releases **H twice** with a **120 ms pause** between the presses, then explicitly releases Command and Shift, ending with cleared modifier flags. Both H presses target the same verified, focused simulator window on the serial input queue. Accessibility permission and a visible simulator window are required; a failed focus sends no keys. Android has no App switcher button and the native backend rejects these requests for Android.
+The **App switcher** icon (overlapping app cards) sits beside Home and Shake in each iOS simulator's bottom controls. It holds **Shift + Command**, presses and releases **H twice** with a **120 ms pause** between the presses, then explicitly releases Command and Shift, ending with cleared modifier flags. Both H presses target the same verified, focused simulator window on the serial input queue. Accessibility permission and a visible simulator window are required; a failed focus sends no keys. Android reuses the same App switcher icon but sends an ADB keyevent instead; it never posts this iOS shortcut.
+
+### Android navigation controls
+
+Android controls are ordered **Rotate → Home → Back → App switcher → Menu**, followed by appearance and the existing controls. **Back** and **Menu** have custom icons; **App switcher** reuses the iOS overlapping-app-cards icon. Each sends `adb -s <id> shell input keyevent <code>` through that panel's emulator serial: **Back = 4**, **App switcher = 187**, **Menu = 82**. The previously focused panel does not choose the target. These controls use ADB, without host keyboard shortcuts or Accessibility/focus requirements. iOS has no Back/Menu buttons and keeps its own App switcher shortcut. Whether Menu opens anything depends on the Android app's handling of the legacy KEYCODE_MENU.
 
 ### Authenticator pairing (optional)
 
@@ -200,7 +204,7 @@ make run     # Build and open using saved settings
 make clean   # Remove build output; quit the app first
 ```
 
-The input suite tests iOS Shake/App switcher eligibility, focus-before-shortcut ordering, the actual complete keyboard event sequences (modifier down, key down/up, modifier release with neutral final flags), App switcher's two H presses and 120 ms held-modifier pause through the production dispatcher, repeated requests/paste/rotation/Home/plain-key regressions and Android/missing-permission/window/focus rejection with inert host callbacks; it never focuses or controls a real simulator.
+The input suite tests Android Back/Menu/App switcher eligibility, exact per-serial numeric keyevents and command-error propagation with inert ADB callbacks, plus iOS Shake/App switcher eligibility, focus-before-shortcut ordering, the actual complete keyboard event sequences (modifier down, key down/up, modifier release with neutral final flags), App switcher's two H presses and 120 ms held-modifier pause through the production dispatcher, repeated requests/paste/rotation/Home/plain-key regressions and Android/missing-permission/window/focus rejection with inert host callbacks; it never focuses or controls a real simulator.
 
 The optional browser target requires existing Google Chrome and Node.js 22+ on macOS, and a free loopback port 45151. It serves synthetic simulator frames and TalkBack events with the real native HTTP/reader/coordinator code; it does not launch an app bundle or control a device. Override the executable with `make NODE=/path/to/node test-browser-accessibility`. To separately check an existing Android ADB connection, run `NODE=/path/to/node Tests/Browser/run.sh --real-adb`; logcat then runs only while the test pane and fixture stream are open, without changing device settings or injecting navigation. A fresh real speech event still needs manual confirmation. Set `TEST_OUTPUT=/path/outside-the-repository` to retain screenshots/JSON; otherwise temporary fixtures and profiles are removed. Tests do not certify live capture FPS.
 

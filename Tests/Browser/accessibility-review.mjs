@@ -66,7 +66,35 @@ try{
   await check(size.name+' Data saver unchanged without extra separator',"document.querySelector('#ds-btn').textContent.trim()==='Data saver'&&document.querySelector('#ds-btn').closest('.sidebar-settings').nextElementSibling.id==='btn-refresh'&&!document.querySelector('.sidebar-separator')");
   await nativeCheck(size.name+' Appearance bottom and left margins match',async()=>{const m=await appearanceSpacing();return Math.abs(m.left-m.bottom)<.1&&Math.abs(m.measuredLeft-m.measuredBottom)<1.1&&m.pickerVisible});
   await check(size.name+' focused keyboard placeholder preserved',"document.querySelector('#kbd-input').placeholder==='Send text to Pixel 6 API 36…'");
-  await check(size.name+' Android has no Shake or App switcher controls',"!document.querySelector('[data-action=shake]')&&!document.querySelector('[data-action=app-switcher]')");
+  await check(size.name+' Android has no iOS Shake control',"!document.querySelector('[data-action=shake]')");
+  await check(size.name+' Android controls have the requested order',"[...document.querySelectorAll('.panel-actions button')].map(b=>b.dataset.action).join(',')==='rotate,home,back,app-switcher,menu,appear,two-finger,accessibility,kbd,close'");
+  await check(size.name+' Android controls fit and remain pointer accessible',"(()=>{const p=document.querySelector('.sim-panel').getBoundingClientRect(),a=document.querySelector('.panel-actions').getBoundingClientRect();return a.left>=p.left&&a.right<=p.right&&a.bottom<=innerHeight&&[...document.querySelectorAll('.pill-btn')].every(b=>{const r=b.getBoundingClientRect();return r.width>=32&&r.height>=32&&r.left>=a.left&&r.right<=a.right&&b.contains(document.elementFromPoint(r.left+r.width/2,r.top+r.height/2))})&&document.documentElement.scrollWidth<=innerWidth+1})()");
+  await nativeCheck(size.name+' Android navigation is never sent on startup',async()=>(await status()).sessions.find(s=>s.id==='emulator-5554').inputs===0);
+  for(const [action,type,title] of [['back','back','Back'],['app-switcher','app_switcher','App switcher'],['menu','menu','Menu']]){
+   const selector='[data-action='+action+']',before=(await status()).sessions.find(s=>s.id==='emulator-5554');
+   await check(size.name+' '+action+' icon is bounded, decorative and named',"(()=>{const b=document.querySelector("+JSON.stringify(selector)+"),s=b.querySelector('svg'),r=s.getBBox();return b.title==="+JSON.stringify(title)+"&&b.getAttribute('aria-label')===b.title&&s.getAttribute('aria-hidden')==='true'&&s.getAttribute('viewBox')==='0 0 20 20'&&r.x>=.8&&r.y>=.8&&r.x+r.width<=19.2&&r.y+r.height<=19.2})()");
+   await pointerClick(selector+' svg');
+   await nativeCheck(size.name+' nested '+action+' icon pointer sends exactly one message on Android socket',async()=>{const s=(await status()).sessions.find(s=>s.id==='emulator-5554');return s.inputs===before.inputs+1&&JSON.stringify(s.last_inputs.at(-1))===JSON.stringify({type})});
+   await check(size.name+' '+action+' does not open keyboard or inspector',"document.querySelector('.sim-panel').classList.contains('focused')&&!document.querySelector('#kbd-bar').classList.contains('visible')&&!document.querySelector('.accessibility-pane')&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/accessibility.js'))");
+   await nativeCheck(size.name+' '+action+' leaves capture and inspector demand unchanged',async()=>{const s=(await status()).sessions.find(s=>s.id==='emulator-5554');return !s.paused&&s.frames>before.frames&&Object.keys(s.accessibility.reader).length===0&&s.accessibility.requested===false});
+   await evaluate('document.querySelector('+JSON.stringify(selector)+').focus()');
+   await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:'Enter',code:'Enter',windowsVirtualKeyCode:13,text:'\r'});
+   await cdp('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13});await delay(100);
+   await nativeCheck(size.name+' keyboard Enter activates '+action+' exactly once',async()=>{const s=(await status()).sessions.find(s=>s.id==='emulator-5554');return s.inputs===before.inputs+2&&s.last_inputs.at(-1).type===type});
+   await cdp('Input.dispatchKeyEvent',{type:'keyDown',key:' ',code:'Space',windowsVirtualKeyCode:32,text:' '});
+   await cdp('Input.dispatchKeyEvent',{type:'keyUp',key:' ',code:'Space',windowsVirtualKeyCode:32});await delay(100);
+   await nativeCheck(size.name+' keyboard Space activates '+action+' exactly once',async()=>{const s=(await status()).sessions.find(s=>s.id==='emulator-5554');return s.inputs===before.inputs+3&&s.last_inputs.at(-1).type===type});
+   await evaluate('document.activeElement.blur()');
+  }
+  await click('[data-theme-choice="light"]');await wait("document.documentElement.dataset.theme==='light'");
+  await check(size.name+' Android icons inherit actual light toolbar color',"(()=>{return ['back','app-switcher','menu'].every(a=>{const b=document.querySelector('[data-action='+a+']');return getComputedStyle(b).color===getComputedStyle(b.querySelector('svg')).color})&&document.querySelector('[data-theme-choice=light]').getAttribute('aria-pressed')==='true'&&getComputedStyle(document.body).backgroundColor.match(/[0-9]+/g).slice(0,3).reduce((a,v)=>a+Number(v),0)>600})()");
+  if(['desktop','phone','small-phone','landscape-phone'].includes(size.name))await shot(size.name+'-light-android-controls');
+  if(['desktop','phone'].includes(size.name)){
+   await click('[data-theme-choice="dark"]');await wait("document.documentElement.dataset.theme==='dark'");
+   await check(size.name+' Android icons inherit actual dark toolbar color',"(()=>{return ['back','app-switcher','menu'].every(a=>{const b=document.querySelector('[data-action='+a+']');return getComputedStyle(b).color===getComputedStyle(b.querySelector('svg')).color})&&document.querySelector('[data-theme-choice=dark]').getAttribute('aria-pressed')==='true'&&getComputedStyle(document.body).backgroundColor.match(/[0-9]+/g).slice(0,3).reduce((a,v)=>a+Number(v),0)<300})()");
+   await shot(size.name+'-dark-android-controls');await click('[data-theme-choice="light"]');await wait("document.documentElement.dataset.theme==='light'");
+  }
+
   await check(size.name+' Android button only',`document.querySelectorAll('[data-action="accessibility"]').length===1`);
   await nativeCheck(size.name+' video without pane never creates reader',async()=>Object.keys((await androidInfo()).reader).length===0);
   await check(size.name+' unopened pane has no JS/CSS load', `!document.querySelector('.accessibility-pane')&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/accessibility.js')||r.name.endsWith('/css/accessibility.css'))`);
@@ -176,6 +204,7 @@ try{
   await navigate(size.w,size.h,size.m,'ios-fixture');
   await click('[data-theme-choice="light"]');await wait("document.documentElement.dataset.theme==='light'");
   await check(size.name+' iOS controls are reviewed in actual light workspace',"document.querySelector('[data-theme-choice=light]').getAttribute('aria-pressed')==='true'&&getComputedStyle(document.body).backgroundColor.match(/[0-9]+/g).slice(0,3).reduce((a,v)=>a+Number(v),0)>600");
+  await check(size.name+' Back and Menu stay absent on iOS',"!document.querySelector('[data-action=back]')&&!document.querySelector('[data-action=menu]')");
   await check(size.name+' Shake immediately follows Home only on iOS',"(()=>{const b=document.querySelector('[data-action=shake]');return document.querySelectorAll('[data-action=shake]').length===1&&b.previousElementSibling.dataset.action==='home'&&b.nextElementSibling.dataset.action==='app-switcher'&&!document.querySelector('[data-action=accessibility]')})()");
   await check(size.name+' Shake icon is bounded, decorative and named',"(()=>{const b=document.querySelector('[data-action=shake]'),s=b.querySelector('svg'),r=s.getBBox();return b.title==='Shake (Control–Command–Z)'&&b.getAttribute('aria-label')===b.title&&s.getAttribute('aria-hidden')==='true'&&s.getAttribute('viewBox')==='0 0 20 20'&&r.x>=.8&&r.y>=.8&&r.x+r.width<=19.2&&r.y+r.height<=19.2})()");
   await check(size.name+' all bottom buttons fit and accept pointer input',"(()=>{const p=document.querySelector('.sim-panel').getBoundingClientRect(),a=document.querySelector('.panel-actions').getBoundingClientRect();return a.left>=p.left&&a.right<=p.right&&a.bottom<=innerHeight&&[...document.querySelectorAll('.pill-btn')].every(b=>{const r=b.getBoundingClientRect();return r.width>=32&&r.height>=32&&r.left>=a.left&&r.right<=a.right&&b.contains(document.elementFromPoint(r.left+r.width/2,r.top+r.height/2))})&&document.documentElement.scrollWidth<=innerWidth+1})()");
@@ -238,10 +267,37 @@ try{
  const switcherMixedBefore=await status(),switcherAndroidBefore=switcherMixedBefore.sessions.find(s=>s.id==='emulator-5554'),switcherIOSBefore=switcherMixedBefore.sessions.find(s=>s.id==='ios-fixture');
  await pointerClick('.sim-panel[data-udid="ios-fixture"] [data-action=app-switcher]');
  await nativeCheck('Mixed panels send App switcher only to iOS despite prior Android focus',async()=>{const s=await status(),a=s.sessions.find(p=>p.id==='emulator-5554'),i=s.sessions.find(p=>p.id==='ios-fixture');return a.inputs===switcherAndroidBefore.inputs&&i.inputs===switcherIOSBefore.inputs+1&&i.last_inputs.at(-1).type==='app_switcher'});
- await check('Mixed panels keep App switcher absent on Android and focus the selected iOS panel',"!document.querySelector('.sim-panel[data-udid=\"emulator-5554\"] [data-action=app-switcher]')&&document.querySelector('.sim-panel[data-udid=ios-fixture]').classList.contains('focused')");
- await evaluate("(()=>{const b=document.createElement('button');b.dataset.action='app-switcher';document.querySelector('.sim-panel[data-udid=\"emulator-5554\"] .panel-actions').append(b);b.click();b.remove()})()");
- await nativeCheck('Forged Android App switcher button sends nothing',async()=>(await status()).sessions.find(s=>s.id==='emulator-5554').inputs===switcherAndroidBefore.inputs);
- await shot('desktop-mixed-ios-app-switcher');await closeStreams();
+ await check('Mixed panels keep both App switcher controls and focus selected iOS',"!!document.querySelector('.sim-panel[data-udid=\"emulator-5554\"] [data-action=app-switcher]')&&document.querySelector('.sim-panel[data-udid=ios-fixture]').classList.contains('focused')");
+ // The legitimate Android App switcher uses ADB routing, not the iOS shortcut.
+ await pointerClick('.sim-panel[data-udid="emulator-5554"] [data-action=app-switcher]');
+ await nativeCheck('Mixed panels send Android App switcher only to Android despite prior iOS focus',async()=>{const s=await status(),a=s.sessions.find(p=>p.id==='emulator-5554'),i=s.sessions.find(p=>p.id==='ios-fixture');return a.inputs===switcherAndroidBefore.inputs+1&&i.inputs===switcherIOSBefore.inputs+1&&JSON.stringify(a.last_inputs.at(-1))==='{"type":"app_switcher"}'});
+ await shot('desktop-mixed-ios-app-switcher');
+ // All Android navigation controls use their own panel, never prior focus.
+ for(const [action,type]of [['back','back'],['app-switcher','app_switcher'],['menu','menu']]){
+  await pointerClick('.sim-panel[data-udid="ios-fixture"] [data-action=home]');
+  const before=await status(),aBefore=before.sessions.find(s=>s.id==='emulator-5554'),iBefore=before.sessions.find(s=>s.id==='ios-fixture');
+  await pointerClick('.sim-panel[data-udid="emulator-5554"] [data-action='+action+']');
+  await nativeCheck('Mixed panels '+action+' targets Android despite prior iOS focus',async()=>{const s=await status(),a=s.sessions.find(p=>p.id==='emulator-5554'),i=s.sessions.find(p=>p.id==='ios-fixture');return a.inputs===aBefore.inputs+1&&JSON.stringify(a.last_inputs.at(-1))===JSON.stringify({type})&&i.inputs===iBefore.inputs});
+ }
+ await check('App switcher reuses exactly the iOS icon, with platform-specific titles',"(()=>{const a=document.querySelector('.sim-panel[data-udid=\"emulator-5554\"] [data-action=app-switcher]'),i=document.querySelector('.sim-panel[data-udid=ios-fixture] [data-action=app-switcher]');return a.querySelector('svg').outerHTML===i.querySelector('svg').outerHTML&&a.title==='App switcher'&&i.title==='App switcher (Shift–Command–H–H)'})()");
+ for(const action of ['back','menu']){
+  const before=(await status()).sessions.find(s=>s.id==='ios-fixture').inputs;
+  await evaluate("(()=>{const b=document.createElement('button');b.dataset.action="+JSON.stringify(action)+";document.querySelector('.sim-panel[data-udid=ios-fixture] .panel-actions').append(b);b.click();b.remove()})()");
+  await nativeCheck('Forged iOS '+action+' button sends nothing',async()=>(await status()).sessions.find(s=>s.id==='ios-fixture').inputs===before);
+ }
+ await shot('desktop-mixed-android-controls');await closeStreams();
+ await navigate(1440,1000,false);await click('.device-item[data-udid="emulator-5556"]');
+ await wait("document.querySelectorAll('.sim-panel').length===2&&document.querySelector('.sim-panel[data-udid=\"emulator-5556\"] .panel-status').textContent==='Live'");
+ for(const [target,other]of [['emulator-5556','emulator-5554'],['emulator-5554','emulator-5556']]){
+  for(const [action,type]of [['back','back'],['app-switcher','app_switcher'],['menu','menu']]){
+   await pointerClick('.sim-panel[data-udid="'+other+'"] [data-action=home]');
+   const before=await status(),targetBefore=before.sessions.find(s=>s.id===target),otherBefore=before.sessions.find(s=>s.id===other);
+   await pointerClick('.sim-panel[data-udid="'+target+'"] [data-action='+action+']');
+   await nativeCheck('Two Android panels '+action+' targets '+target+', not focused '+other,async()=>{const s=await status(),a=s.sessions.find(p=>p.id===target),b=s.sessions.find(p=>p.id===other);return a.inputs===targetBefore.inputs+1&&b.inputs===otherBefore.inputs&&JSON.stringify(a.last_inputs.at(-1))===JSON.stringify({type})});
+  }
+ }
+ await nativeCheck('Navigation never opens either Android inspector',async()=>(await status()).sessions.every(s=>!s.paused&&s.accessibility.requested===false&&Object.keys(s.accessibility.reader).length===0));
+ await shot('desktop-two-android-controls');await closeStreams();
  if(process.argv.includes('--real-adb')) {
  // Real ADB compatibility check: only after the actual frontend pane opens.
  await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({real:true})});

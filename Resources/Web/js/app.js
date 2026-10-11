@@ -828,18 +828,27 @@ function createPill(udid, name, platform) {
         <path d="M3 9.5L10 3l7 6.5"/><path d="M5 8.5v8h3.5v-4h3v4H15v-8"/>
       </svg>
     </button>
+    ${platform === 'android' ? `
+    <button class="pill-btn" data-action="back" title="Back">
+      <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m11.5 5-5 5 5 5M6.5 10H16"/></svg>
+    </button>` : ''}
     ${platform === 'ios' ? `
     <button class="pill-btn" data-action="shake" title="Shake (Control–Command–Z)">
       <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <g transform="rotate(-12 10 10)"><rect x="6.5" y="3" width="7" height="14" rx="1.8"/><path d="M9 14h2"/></g>
         <path d="m3.5 5.5-1.5 2.5 1.5 2.5L2 13m14.5-6L18 9.5 16.5 12l1.5 2.5"/>
       </svg>
-    </button>
-    <button class="pill-btn" data-action="app-switcher" title="App switcher (Shift–Command–H–H)">
+    </button>` : ''}
+    ${platform === 'ios' || platform === 'android' ? `
+    <button class="pill-btn" data-action="app-switcher" title="${platform === 'ios' ? 'App switcher (Shift–Command–H–H)' : 'App switcher'}">
       <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M13 6V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/>
         <rect x="7" y="6" width="10" height="11" rx="2"/><path d="M10 14h4"/>
       </svg>
+    </button>` : ''}
+    ${platform === 'android' ? `
+    <button class="pill-btn" data-action="menu" title="Menu">
+      <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="14" height="14" rx="2.5"/><path d="M6 7h8M6 10h8M6 13h5"/></svg>
     </button>` : ''}
     <button class="pill-btn" data-action="appear" title="Switch simulator to light appearance">
       <svg width="18" height="18" viewBox="0 0 20 20" fill="currentColor">
@@ -877,11 +886,15 @@ function createPill(udid, name, platform) {
       case 'close': removeSimPanel(udid); break;
       case 'rotate': panel?.stream?.send({ type: 'rotate' }); break;
       case 'home':   panel?.stream?.send({ type: 'home' });   break;
+      case 'back':
+      case 'menu':
+        if (panel?.platform === 'android') panel.stream?.send({ type: action });
+        break;
       case 'shake':
         if (panel?.platform === 'ios') panel.stream?.send({ type: 'shake' });
         break;
       case 'app-switcher':
-        if (panel?.platform === 'ios') panel.stream?.send({ type: 'app_switcher' });
+        if (panel?.platform === 'ios' || panel?.platform === 'android') panel.stream?.send({ type: 'app_switcher' });
         break;
       case 'appear': {
         if (!panel) break;

@@ -77,7 +77,7 @@ final class FixtureStream {
     func stop() {monitor.stop();timer?.cancel();timer=nil;if registry[id] === self {registry.removeValue(forKey:id)}}
     var snapshot: [String:Any] {["id":id,"frames":frames,"inputs":inputs,"last_inputs":lastInputs,"paused":paused,"accessibility":monitor.snapshot]}
 }
-let sims:[[String:Any]] = [["id":"emulator-5554","name":"Pixel 6 API 36","platform":"android","width":405,"height":900], ["id":"ios-fixture","name":"iPhone 11","platform":"ios","width":414,"height":896]]
+let sims:[[String:Any]] = [["id":"emulator-5554","name":"Pixel 6 API 36","platform":"android","width":405,"height":900], ["id":"ios-fixture","name":"iPhone 11","platform":"ios","width":414,"height":896], ["id":"emulator-5556","name":"Pixel second emulator","platform":"android","width":405,"height":900]]
 server.authorize={ request in request.headers["cookie"]?.contains("fixture=paired") == true }
 server.upgrade={ request, client in
     if request.path == "/ws/pty" {

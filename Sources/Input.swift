@@ -5,7 +5,7 @@ import ApplicationServices
 // Global HID mouse input must be serialized across devices. A new gesture
 // releases any prior pointer instead of leaving the host mouse pressed.
 final class DeviceInput {
-    static let supportedTypes: Set<String> = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "shake", "app_switcher", "rotate", "appearance", "accessibility_swipe"]
+    static let supportedTypes: Set<String> = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "back", "menu", "shake", "app_switcher", "rotate", "appearance", "accessibility_swipe"]
 
     // Isolate the shortcut policy from host effects so tests never focus or control a real device.
     static func performShake(platform: String, trusted: Bool, window: DeviceWindow?, focus: (DeviceWindow) -> Bool, key: (CGKeyCode, CGEventFlags) throws -> Void) throws {
@@ -21,6 +21,16 @@ final class DeviceInput {
         guard focus(window) else { throw WispError("Cannot focus the selected iOS Simulator window for App switcher") }
         try key(4, [.maskShift, .maskCommand], 2) // ANSI H twice, holding both modifiers throughout.
     }
+
+    // Android navigation uses only the selected serial, never host focus or keys.
+    static func performAndroidControl(_ type: String, platform: String, id: String, adb: (String, [String]) throws -> Void) throws {
+        guard platform == "android" else { throw WispError("This control is Android-only") }
+        let keys = ["back": "4", "menu": "82", "app_switcher": "187"]
+        guard let key = keys[type] else { throw WispError("Unsupported Android control") }
+        try adb(id, ["shell", "input", "keyevent", key])
+    }
+
+    static func adbArguments(_ id: String, _ args: [String]) -> [String] { ["-s", id] + args }
 
     let devices: Devices
     let queue = DispatchQueue(label: "Simwisp.input", qos: .userInteractive)
@@ -111,7 +121,7 @@ final class DeviceInput {
     }
     private func adb(_ id: String, _ args: [String]) throws -> CommandResult {
         guard let adb = devices.adb else { throw WispError("Android SDK adb unavailable") }
-        let result = try command(adb, ["-s", id] + args, timeout: 8)
+        let result = try command(adb, Self.adbArguments(id, args), timeout: 8)
         if result.status != 0 { throw WispError(String(decoding: result.error, as: UTF8.self)) }
         return result
     }
@@ -258,12 +268,18 @@ final class DeviceInput {
                 let result = try command("/usr/bin/xcrun", ["simctl", "launch", id, "com.apple.springboard"], timeout: 8)
                 if result.status != 0, let window { focus(window); try key(4, flags: [.maskCommand, .maskShift]) }
             }
+        case "back", "menu":
+            try Self.performAndroidControl(type, platform: device.platform, id: id, adb: { _ = try self.adb($0, $1) })
         case "shake":
             try Self.performShake(platform: device.platform, trusted: AXIsProcessTrusted(), window: window,
                                   focus: { self.focus($0, verify: true) }, key: { try self.key($0, flags: $1) })
         case "app_switcher":
-            try Self.performAppSwitcher(platform: device.platform, trusted: AXIsProcessTrusted(), window: window,
-                                        focus: { self.focus($0, verify: true) }, key: { try self.key($0, flags: $1, presses: $2) })
+            if android {
+                try Self.performAndroidControl(type, platform: device.platform, id: id, adb: { _ = try self.adb($0, $1) })
+            } else {
+                try Self.performAppSwitcher(platform: device.platform, trusted: AXIsProcessTrusted(), window: window,
+                                            focus: { self.focus($0, verify: true) }, key: { try self.key($0, flags: $1, presses: $2) })
+            }
         case "appearance":
             let mode = m["mode"] as? String == "light" ? "light" : "dark"
             if android { _ = try adb(id, ["shell", "cmd", "uimode", "night", mode == "dark" ? "yes" : "no"]) }

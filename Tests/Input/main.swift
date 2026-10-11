@@ -2,14 +2,14 @@ import Foundation
 import ApplicationServices
 import Darwin
 
-// Exercise the actual shortcut policy with inert host effects: no app launch,
-// discovery, permission prompt, focus change or HID posting occurs in this suite.
+// Exercise actual input policy with inert host/ADB effects: no app launch,
+// discovery, ADB execution, permission prompt, focus change or HID posting occurs.
 var checks: [[String: Any]] = []
 func check(_ name: String, _ pass: @autoclosure () -> Bool) {
     let ok = pass(); checks.append(["name": name, "passed": ok]); if !ok { fputs("FAIL: \(name)\n", stderr) }
 }
-let expected: Set<String> = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "shake", "app_switcher", "rotate", "appearance", "accessibility_swipe"]
-check("Stream allowlist includes Shake/App switcher and preserves all prior controls", DeviceInput.supportedTypes == expected)
+let expected: Set<String> = ["tap", "drag", "touch_down", "touch_move", "touch_up", "key", "text", "home", "back", "menu", "shake", "app_switcher", "rotate", "appearance", "accessibility_swipe"]
+check("Stream allowlist includes Android Back/Menu and both App switcher paths, preserving prior controls", DeviceInput.supportedTypes == expected)
 check("Unknown, shell and settings messages are not input commands", ["unknown", "terminal", "exec", "settings"].allSatisfy { !DeviceInput.supportedTypes.contains($0) })
 let first = DeviceWindow(id: 101, pid: 901, title: "First iPhone", bounds: CGRect(x: 30, y: 60, width: 414, height: 896), crop: CGRect(x: 0, y: 30, width: 414, height: 866))
 let second = DeviceWindow(id: 102, pid: 901, title: "Second iPhone", bounds: CGRect(x: 500, y: 60, width: 390, height: 844), crop: CGRect(x: 0, y: 30, width: 390, height: 814))
@@ -112,7 +112,7 @@ check("App switcher focuses the selected window once before its chord", calls ==
 check("App switcher requests exactly two ANSI H presses", codes == [4] && pressCounts == [2])
 check("App switcher uses exactly Shift and Command, never Control/Option", flags == [[.maskShift,.maskCommand]])
 check("App switcher targets a second window in the same Simulator process", attemptSwitcher("ios", window: second) == nil && focused == second && calls == ["focus","key"])
-check("Android App switcher is explicitly rejected without host effects", attemptSwitcher("android") == "App switcher is iOS-only" && calls.isEmpty && codes.isEmpty)
+check("Android is rejected by the iOS App switcher shortcut helper without host effects", attemptSwitcher("android") == "App switcher is iOS-only" && calls.isEmpty && codes.isEmpty)
 check("Unknown App switcher platforms fail closed", attemptSwitcher("unknown") == "App switcher is iOS-only" && calls.isEmpty)
 check("App switcher platform matching remains exact", attemptSwitcher("iOS") == "App switcher is iOS-only" && calls.isEmpty)
 check("App switcher requires Accessibility before focus/post", attemptSwitcher("ios", trusted: false)?.contains("Accessibility permission") == true && calls.isEmpty)
@@ -157,6 +157,42 @@ for (name,code,chord) in [("Shake",CGKeyCode(6),both),("Paste",CGKeyCode(9),CGEv
     check("\(name) retains its original single-press events, releases and 10ms timing", keyCodes(posted) == keyCodes(original) && posted.map(\.flags) == original.map(\.flags) && waits.count == original.count && waits.allSatisfy { $0 == 0.01 })
 }
 
+// Exercise the same dispatch and complete ADB argument builder as production,
+// replacing only actual command execution; no emulator command or host key is sent.
+var androidCommands: [[String]] = []
+func attemptAndroid(_ type: String, platform: String = "android", id: String = "emulator-5554", fail: Bool = false) -> String? {
+    androidCommands = []
+    do {
+        try DeviceInput.performAndroidControl(type, platform: platform, id: id, adb: { serial, args in
+            androidCommands.append(DeviceInput.adbArguments(serial, args))
+            if fail { throw WispError("fixture ADB command failed") }
+        })
+        return nil
+    } catch { return error.localizedDescription }
+}
+for (type, key) in [("back", "4"), ("app_switcher", "187"), ("menu", "82")] {
+    check("Android \(type) is accepted without host focus/permission/window callbacks", attemptAndroid(type) == nil)
+    check("Android \(type) sends exactly -s selected-serial shell input keyevent \(key) once", androidCommands == [["-s", "emulator-5554", "shell", "input", "keyevent", key]])
+    check("Android \(type) routes independently to a second emulator", attemptAndroid(type, id: "emulator-5556") == nil && androidCommands == [["-s", "emulator-5556", "shell", "input", "keyevent", key]])
+    for platform in ["ios", "unknown", "Android", ""] {
+        check("Android \(type) rejects platform '\(platform)' before any ADB effect", attemptAndroid(type, platform: platform) == "This control is Android-only" && androidCommands.isEmpty)
+    }
+    check("Android \(type) propagates ADB failure to input_error handling", attemptAndroid(type, fail: true) == "fixture ADB command failed" && androidCommands.count == 1)
+    check("Android \(type) works after a failed request", attemptAndroid(type, id: "emulator-5556") == nil && androidCommands.first?[1] == "emulator-5556")
+    var repeatedOK = true
+    for index in 0..<100 {
+        let serial = index % 2 == 0 ? "emulator-5554" : "emulator-5556"
+        repeatedOK = repeatedOK && attemptAndroid(type, id: serial) == nil && androidCommands == [["-s", serial, "shell", "input", "keyevent", key]]
+    }
+    check("Repeated Android \(type) requests retain their own serial and numeric keyevent", repeatedOK)
+}
+for type in ["unknown", "shell", "keyevent", "shake"] {
+    check("Android helper rejects arbitrary control '\(type)' without an ADB command", attemptAndroid(type) == "Unsupported Android control" && androidCommands.isEmpty)
+}
+for args in [["shell", "wm", "size"], ["shell", "input", "keyevent", "KEYCODE_HOME"], ["emu", "rotate"]] {
+    check("Shared ADB targeting preserves prior arguments: \(args.joined(separator: " "))", DeviceInput.adbArguments("emulator-5560", args) == ["-s", "emulator-5560"] + args)
+}
+
 let passed = checks.allSatisfy { $0["passed"] as? Bool == true }
-print(String(decoding: try JSONSerialization.data(withJSONObject: ["passed": passed, "checks": checks, "hostEffects": false], options: [.prettyPrinted, .sortedKeys]), as: UTF8.self))
+print(String(decoding: try JSONSerialization.data(withJSONObject: ["passed": passed, "checks": checks, "hostEffects": false, "deviceCommandsExecuted": false], options: [.prettyPrinted, .sortedKeys]), as: UTF8.self))
 exit(passed ? 0 : 1)
