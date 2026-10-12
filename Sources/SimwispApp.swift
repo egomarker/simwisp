@@ -68,10 +68,20 @@ final class Controller: ObservableObject {
         old.stop { self.state = "Stopped"; self.sessions = []; completion() }
     }
     func restart() { stop { self.settings.save(); self.start() } }
-    var baseURL: String { "http://\(settings.shareLAN ? localAddress() ?? "127.0.0.1" : "127.0.0.1"):\(settings.port)" }
+    var baseURL: String { "https://\(settings.shareLAN ? localAddress() ?? "127.0.0.1" : "127.0.0.1"):\(settings.port)" }
     var pairingURL: String { baseURL + "/#pair=" + settings.pairingToken }
     func openBrowser() { if let url = URL(string: pairingURL) { NSWorkspace.shared.open(url) } }
     func copyURL() { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(pairingURL, forType: .string) }
+    func exportCertificate() {
+        guard let tls = service?.tls else { return }
+        let panel = NSSavePanel(); panel.nameFieldStringValue = "Simwisp-Local-CA.cer"
+        panel.title = "Export public HTTPS certificate"
+        if panel.runModal() == .OK, let url = panel.url {
+            do { try tls.certificate.write(to: url, options: .atomic) }
+            catch { state = "Cannot export public certificate: \(error.localizedDescription)" }
+        }
+    }
+    var certificateFingerprint: String { service?.tls?.fingerprint ?? "Certificate not available" }
     func chooseProject() {
         let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false; panel.prompt = "Choose project"
         panel.directoryURL = URL(fileURLWithPath: settings.projectDirectory)
@@ -128,7 +138,7 @@ struct StatusPanel: View {
             HStack {
                 Text(controller.state).font(.caption).foregroundStyle(.secondary).lineLimit(2)
                 Spacer()
-                Text("ScreenCaptureKit").font(.caption2).foregroundStyle(.secondary)
+                Text("H.264 · HTTPS").font(.caption2).foregroundStyle(.secondary)
             }
             HStack(spacing: 24) {
                 VStack(alignment: .leading, spacing: 3) { Text("CPU").font(.caption2).foregroundStyle(.secondary); Text(String(format: "%.1f%%", controller.cpu)).font(.system(.title3, design: .rounded)).monospacedDigit() }
@@ -179,7 +189,9 @@ struct StatusPanel: View {
                     Toggle("Share on local network", isOn: $controller.settings.shareLAN).onChange(of: controller.settings.shareLAN) { controller.restart() }
                     Toggle("Allow Mac terminal access", isOn: Binding(get: { controller.settings.terminalEnabled == true }, set: { controller.settings.terminalEnabled = $0; controller.restart() }))
                     Text("Terminal access lets paired browsers run commands as your Mac user. Enable only for trusted browsers.").font(.caption2).foregroundStyle(.secondary)
-                    Text("Links authorize control. LAN HTTP is unencrypted; use only a trusted network or an encrypted tunnel.").font(.caption2).foregroundStyle(.secondary)
+                    Text("HTTPS requires trusting this Mac’s local CA on each client. Export only the public certificate; private keys remain on the Mac. No trust is installed automatically.").font(.caption2).foregroundStyle(.secondary)
+                    Button("Export public HTTPS certificate…") { controller.exportCertificate() }
+                    Text("CA SHA-256: " + controller.certificateFingerprint).font(.system(.caption2, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
                     HStack { Text("Port"); TextField("4141", text: $portText).frame(width: 70); Button("Apply") { if let port = Int(portText), (1024...65535).contains(port) { controller.settings.port = port; controller.restart() } }.disabled(!(Int(portText).map { (1024...65535).contains($0) } ?? false)) }
                     Button("Choose project directory…") { controller.chooseProject() }
                     Text(controller.settings.projectDirectory).font(.caption2).foregroundStyle(.secondary).lineLimit(2)

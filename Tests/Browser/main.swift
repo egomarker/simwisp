@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Darwin
+import CoreImage
 
 let root = CommandLine.arguments[1]
 let source = FileManager.default.currentDirectoryPath
@@ -36,7 +37,7 @@ text("Asthma",35,340,24);text("Assessment and management",35,303,15,.gray)
 text("Dehydration",35,215,24);text("Evaluation and treatment",35,178,15,.gray)
 text("HOME          FAVORITES          ABOUT",45,67,12,.gray);text("◁               ◯               □",107,20,18,.gray)
 NSGraphicsContext.restoreGraphicsState()
-let jpeg = rep.representation(using:.jpeg,properties:[.compressionFactor:0.7])!
+
 // A separate, explicitly synthetic iOS preview keeps toolbar screenshots honest.
 let iosRep = NSBitmapImageRep(bitmapDataPlanes:nil,pixelsWide:414,pixelsHigh:896,bitsPerSample:8,samplesPerPixel:4,hasAlpha:true,isPlanar:false,colorSpaceName:.deviceRGB,bytesPerRow:0,bitsPerPixel:0)!
 NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep:iosRep)
@@ -52,10 +53,18 @@ text("Home · Shake · App switcher below",28,224,17)
 text("Test image — not a live device capture",28,194,12,.gray)
 NSColor.darkGray.setFill(); NSBezierPath(roundedRect:NSRect(x:142,y:14,width:130,height:5),xRadius:2.5,yRadius:2.5).fill()
 NSGraphicsContext.restoreGraphicsState()
-let iosJPEG = iosRep.representation(using:.jpeg,properties:[.compressionFactor:0.7])!
+
+func vectors(_ rep: NSBitmapImageRep) throws -> [H264Frame] {
+    let encoder = try H264Encoder(width: rep.pixelsWide, height: rep.pixelsHigh)
+    defer { encoder.close() }
+    let image = CIImage(cgImage: rep.cgImage!)
+    return try (0..<60).map { try encoder.encode(image, quality: 70, fps: 60, forceKeyframe: $0 == 0) }
+}
+let androidVideo = try vectors(rep), iosVideo = try vectors(iosRep)
 final class FixtureStream {
     let id: String, client: ClientConnection, monitor: AccessibilitySession
-    var timer: DispatchSourceTimer?, frames = 0, inputs = 0, paused = false, pendingFrame = false
+    var timer: DispatchSourceTimer?, frames = 0, inputs = 0, paused = false, pendingFrame = false, ready = false
+    var epoch: UInt32 = 1, cursor = 0
     var lastInputs: [[String:Any]] = []
     init(id: String, client: ClientConnection) {
         self.id=id;self.client=client
@@ -64,18 +73,32 @@ final class FixtureStream {
         client.onClose={ [weak self] in self?.stop() }
         client.sendJSON(["type":"input_capabilities","live_touch":true]);client.sendJSON(["type":"rotated","landscape":false])
         let t=DispatchSource.makeTimerSource(queue:server.queue);t.schedule(deadline:.now(),repeating:1.0/60);t.setEventHandler { [weak self] in
-            guard let self,!self.paused,!self.pendingFrame else{return};self.pendingFrame=true;self.frames+=1;self.client.sendBinary(self.id.hasPrefix("emulator-") ? jpeg : iosJPEG)
+            guard let self,self.ready,!self.paused,!self.pendingFrame else{return}
+            let values = self.id.hasPrefix("emulator-") ? androidVideo : iosVideo
+            let source = values[self.cursor]
+            let frame = H264Frame(payload: source.payload, description: source.description, codec: source.codec, keyframe: source.keyframe, timestamp: UInt64(self.frames+1)*16667, width: source.width, height: source.height, codedWidth: source.codedWidth, codedHeight: source.codedHeight)
+            self.cursor = (self.cursor+1)%values.count
+            self.pendingFrame=true;self.frames+=1
+            if frame.keyframe {self.client.sendJSON(frame.configuration(epoch:self.epoch))}
+            self.client.sendBinary(frame.packet(epoch:self.epoch,id:UInt32(self.frames)))
         };t.resume();timer=t
     }
+    func resetVideo() {epoch &+= 1;cursor=0;pendingFrame=false}
     func message(_ m: [String:Any]) {
-        if m["type"] as? String == "frame_ack" { pendingFrame=false }
-        else if m["type"] as? String == "settings" {
-            if let p=m["stream_paused"] as? Bool {paused=p}
+        let type=m["type"] as? String
+        if type == "video_ready" {ready=true}
+        else if type == "video_keyframe" {resetVideo()}
+        else if type == "frame_ack" {
+            guard (m["epoch"] as? NSNumber)?.uint32Value == epoch, (m["frame_id"] as? Int) == frames else{return}
+            pendingFrame=false
+            if m["decode_error"] as? Bool == true {resetVideo()}
+        } else if type == "settings" {
+            if let p=m["stream_paused"] as? Bool,p != paused {paused=p;resetVideo()}
             monitor.update(paneOpen:m["accessibility_enabled"] as? Bool,streamActive:!paused,subscription:m["accessibility_subscription"] as? Int)
         } else {inputs+=1;lastInputs.append(m);if lastInputs.count>16 {lastInputs.removeFirst()}}
     }
     func stop() {monitor.stop();timer?.cancel();timer=nil;if registry[id] === self {registry.removeValue(forKey:id)}}
-    var snapshot: [String:Any] {["id":id,"frames":frames,"inputs":inputs,"last_inputs":lastInputs,"paused":paused,"accessibility":monitor.snapshot]}
+    var snapshot: [String:Any] {["id":id,"frames":frames,"inputs":inputs,"last_inputs":lastInputs,"paused":paused,"codec":"h264","epoch":epoch,"accessibility":monitor.snapshot]}
 }
 let sims:[[String:Any]] = [["id":"emulator-5554","name":"Pixel 6 API 36","platform":"android","width":405,"height":900], ["id":"ios-fixture","name":"iPhone 11","platform":"ios","width":414,"height":896], ["id":"emulator-5556","name":"Pixel second emulator","platform":"android","width":405,"height":900]]
 server.authorize={ request in request.headers["cookie"]?.contains("fixture=paired") == true }
@@ -92,12 +115,18 @@ server.upgrade={ request, client in
         client.sendJSON(["type":"session","id":"fixture-terminal-\(terminalStarts)"])
         client.sendBinary(Data("Fixture terminal output\r\n".utf8));return
     }
-    let id=String(request.path.dropFirst(4));if let old=registry[id] {old.stop();old.client.close()};registry[id]=FixtureStream(id:id,client:client)
+    let id=String(request.path.dropFirst(4))
+    // Match production post-upgrade asynchronous discovery/binding.
+    server.queue.asyncAfter(deadline:.now()+0.15) {
+        guard !client.isClosed else{return}
+        if let old=registry[id] {old.stop();old.client.close()}
+        registry[id]=FixtureStream(id:id,client:client)
+    }
 }
 server.route={ request, complete in
-    if request.path == "/api/pair" {var r=HTTPResponse.json(["ok":true]);r.headers["Set-Cookie"]="fixture=paired; Path=/; HttpOnly; SameSite=Strict";complete(r);return}
+    if request.path == "/api/pair" {var r=HTTPResponse.json(["ok":true]);r.headers["Set-Cookie"]="fixture=paired; Path=/; Secure; HttpOnly; SameSite=Strict";complete(r);return}
     if request.path == "/api/pair/options" {complete(.json(["totp":false]));return}
-    if request.path == "/api/info" {complete(.json(["app":"Simwisp","version":"fixture","has_adb":true,"mode":"fast2 (Native test fixture)","permissions":["screen_recording":true,"accessibility":true],"features":["terminal":terminalEnabled]]));return}
+    if request.path == "/api/info" {complete(.json(["app":"Simwisp","version":"fixture","has_adb":true,"mode":"fast2 (Native H.264 test fixture)","video_codec":"h264","permissions":["screen_recording":true,"accessibility":true],"features":["terminal":terminalEnabled]]));return}
     if request.path == "/api/sims" {complete(.json(sims));return}
     if request.path == "/api/devices" {complete(.json([]));return}
     if request.path == "/fixture/status" {complete(.json(["sessions":registry.values.map(\.snapshot),"real_adb":useRealADB,"terminal":["active":terminalClients.count,"starts":terminalStarts,"output_acks":terminalACKs]]));return}
@@ -115,7 +144,11 @@ server.route={ request, complete in
     }
     complete(.json(["error":"No fixture route"],status:404))
 }
-try server.start(port:45151,lan:false)
+let tls = try TLSIdentity(directory: URL(fileURLWithPath: root + "/tls"), addresses: [], hostname: "localhost")
+server.stateChanged = { state in
+    if state == "Running" { print("Isolated accessibility fixture ready on https://127.0.0.1:45151"); fflush(stdout) }
+    else { log(state); exit(1) }
+}
+try server.start(port:45151,lan:false,tls:tls)
 let signal=DispatchSource.makeSignalSource(signal:SIGTERM,queue:.main);Darwin.signal(SIGTERM,SIG_IGN);signal.setEventHandler{server.stop {lifecycle.notify(queue:.main){exit(0)}}};signal.resume()
-print("Isolated accessibility fixture ready on 127.0.0.1:45151");fflush(stdout)
 dispatchMain()

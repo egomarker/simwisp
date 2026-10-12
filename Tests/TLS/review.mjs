@@ -1,0 +1,27 @@
+import fs from 'node:fs';import tls from 'node:tls';import net from 'node:net';import path from 'node:path';import crypto from 'node:crypto';
+const root=process.argv[2],base='https://127.0.0.1:45152',origin=base;
+const report={checks:[],passed:false,productionService:true,trustStoreModified:false,realCapture:false,realInput:false};
+function check(name,ok){report.checks.push({name,passed:ok===true});if(ok!==true)throw Error('FAIL '+name)}
+const request=(url,options={})=>fetch(base+url,options);
+function raw(headers){return new Promise((res,rej)=>{let data='';const socket=tls.connect({host:'127.0.0.1',port:45152,ca:fs.readFileSync(path.join(root,'tls/root.pem')),servername:'localhost'},()=>socket.write(headers));socket.setTimeout(5000,()=>{socket.destroy();rej(Error('TLS raw timeout'))});socket.on('data',b=>{data+=b;const end=data.indexOf('\r\n\r\n'),match=/content-length: ([0-9]+)/i.exec(data);if(end>=0&&match&&Buffer.byteLength(data.slice(end+4))>=Number(match[1])){socket.setTimeout(0);socket.end();res(data)}});socket.on('end',()=>res(data));socket.on('error',rej)})}
+try{
+ let r=await request('/');check('Workspace is available over validated HTTPS',r.status===200);check('TLS workspace retains strict CSP',r.headers.get('content-security-policy').includes("connect-src 'self'"));
+ r=await request('/simwisp-ca.cer');const cert=Buffer.from(await r.arrayBuffer());check('Only public DER CA is downloadable',r.status===200&&r.headers.get('content-type')==='application/pkix-cert'&&cert.equals(fs.readFileSync(path.join(root,'tls/root.cer'))));
+ r=await request('/api/info');check('Unpaired API still requires authentication',r.status===401);
+ for(const invalid of ['http://127.0.0.1:45152','https://evil.example','null']){r=await request('/api/pair',{method:'POST',headers:{origin:invalid,'content-type':'application/json'},body:JSON.stringify({token:'isolated-tls-link-credential'})});check('Pairing rejects Origin '+invalid,r.status===403)}
+ r=await request('/api/pair',{method:'POST',headers:{origin,'content-type':'application/json'},body:JSON.stringify({token:'isolated-tls-link-credential'})});check('Same HTTPS origin can pair',r.status===200);
+ const setCookie=r.headers.get('set-cookie');check('Pairing cookie is Secure + HttpOnly + Strict',setCookie.includes('; Secure;')&&setCookie.includes('; HttpOnly;')&&setCookie.includes('SameSite=Strict'));
+ const cookie=setCookie.split(';')[0],expected=crypto.createHash('sha256').update('simwisp-session-v1:isolated-tls-link-credential').digest('hex');check('Existing cookie derivation is preserved',cookie==='simwisp_session='+expected);
+ r=await request('/api/info',{headers:{cookie}});const info=await r.json();check('Authenticated production info identifies H.264 + HTTPS',r.status===200&&info.video_codec==='h264'&&info.transport==='https');check('Version and disabled terminal capability retained',info.version==='0.2.0'&&info.features.terminal===false);
+ r=await request('/api/status',{headers:{cookie}});const status=await r.json();check('Isolated service creates no stream/capture demand',status.sessions===0&&status.capture.active===0);check('No idle discovery polling',status.discovery.polling===false);check('No test terminal shell allocated',status.terminal.sessions===0);
+ r=await request('/tls/server.key',{headers:{cookie}});check('Private TLS files are not HTTP resources',r.status===404);
+ r=await request('/js/vendor/xterm.js');check('Large TLS response is not truncated by finish',r.status===200&&(await r.arrayBuffer()).byteLength===fs.statSync('Resources/Web/js/vendor/xterm.js').size);
+ for(const h of ['evil.example:45152','127.0.0.1@evil.example:45152']){const response=await raw('GET / HTTP/1.1\r\nHost: '+h+'\r\n\r\n');check('Host validation survives TLS: '+h,response.startsWith('HTTP/1.1 400'))}
+ for(const [name,org,auth]of [['cross-origin WSS','https://evil.example',cookie],['old HTTP origin WSS','http://127.0.0.1:45152',cookie],['unauthenticated WSS',origin,''],['disabled terminal WSS',origin,cookie]]){
+  const response=await raw('GET /ws/pty HTTP/1.1\r\nHost: 127.0.0.1:45152\r\nOrigin: '+org+'\r\nCookie: '+auth+'\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: AAECAwQFBgcICQoLDA0ODw==\r\n\r\n');check(name+' denied before allocation',response.startsWith('HTTP/1.1 403'));
+ }
+ r=await request('/api/pair',{method:'POST',headers:{origin,'content-type':'application/json'},body:'{"token":"wrong"}'});check('Invalid link credential remains denied',r.status===401);
+ r=await request('/api/pair',{method:'POST',headers:{origin,'content-type':'application/json'},body:'{"token":"wrong"}'});check('Socket-IP pairing budget survives transport change',r.status===429&&Number(r.headers.get('retry-after'))>0);
+ const plaintext=await new Promise((res,rej)=>{let data='';const socket=net.connect(45152,'127.0.0.1',()=>socket.write('GET / HTTP/1.1\r\nHost: 127.0.0.1:45152\r\n\r\n'));socket.on('data',b=>data+=b);socket.on('end',()=>res(data));socket.on('error',()=>res(data));socket.setTimeout(1000,()=>{socket.destroy();res(data)})});check('No plaintext HTTP listener/fallback',!plaintext.includes('HTTP/1.1 200'));
+ report.passed=true;console.log(report.checks.length+' production HTTPS/auth/security checks passed');
+}catch(e){report.error=String(e);process.exitCode=1;console.error(e)}finally{fs.writeFileSync(path.join(root,'tls-review.json'),JSON.stringify(report,null,2)+'\n')}

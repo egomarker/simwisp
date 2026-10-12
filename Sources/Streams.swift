@@ -26,7 +26,11 @@ final class StreamSession: @unchecked Sendable {
     private var nextFrame: Double = 0
     private var lastStats: Double = 0
     private var lastHeartbeat: Double = 0
-    private var lastJPEG: Data?
+    private var videoReady = false
+    private var videoEpoch: UInt32 = 1
+    private var wireFrameID: UInt32 = 0
+    private var awaitingFrameID: UInt32?
+    private var forceKeyframe = true
     private var frameCount = 0
     private var goodFrames = 0
     private var lastError: String?
@@ -47,7 +51,7 @@ final class StreamSession: @unchecked Sendable {
         accessibility = AccessibilitySession(serial: id, platform: devices.device(id)?.platform ?? "ios", executable: devices.adb, queue: queue, lifecycle: lifecycle) { [weak client] value, completion in client?.sendJSON(value, completion: completion) }
     }
     private var accessibilityStreamReady: Bool {
-        !closed && !paused && captureHasFrame && lastError == nil && capture != nil && capture?.failure == nil && devices.window(id) != nil
+        !closed && !paused && captureHasFrame && lastError == nil && capture != nil && capture?.failure == nil && capture?.hasFrame == true && devices.window(id) != nil
     }
     private func reconcileAccessibility() {
         // Avoid capture/discovery locks when no pane is requested. No new timer.
@@ -71,7 +75,7 @@ final class StreamSession: @unchecked Sendable {
         guard !closed else { return }
         let now = monotonic()
         var deadline = now + 0.25
-        if !paused && !configuring && !encoding && !sending {
+        if videoReady && !paused && !configuring && !encoding && !sending {
             if let sent = awaitingACK { deadline = min(deadline, sent + 0.35) }
             else { deadline = min(deadline, max(now, nextFrame)) }
         }
@@ -82,6 +86,7 @@ final class StreamSession: @unchecked Sendable {
         defer { reconcileAccessibility(); reschedule() }
         let now = monotonic()
         if now - lastHeartbeat > 8 { client.sendJSON(["type": "frame_heartbeat"]); client.ping(); lastHeartbeat = now }
+        guard videoReady else { nextFrame = now + 0.25; return }
         guard let window = devices.window(id) else {
             if capture != nil { releaseCapture() }
             notifyError("Device window unavailable"); nextFrame = now + 0.5; return
@@ -95,34 +100,46 @@ final class StreamSession: @unchecked Sendable {
         guard !paused, !configuring, !encoding, !sending, let capture, now >= nextFrame else { return }
         if let sent = awaitingACK {
             if now - sent < 0.35 { return }
-            awaitingACK = nil; fps = max(1, min(targetFPS, fps - 5)); quality = max(1, min(targetQuality, quality - 3)); goodFrames = 0
+            requestKeyframe(); fps = max(1, min(targetFPS, fps - 5)); quality = max(1, min(targetQuality, quality - 3)); goodFrames = 0
             nextFrame = now + 1 / Double(fps); return
         }
         encoding = true; nextFrame = now + 1 / Double(fps)
-        let requestedQuality = quality
+        let requestedQuality = quality, requestedFPS = fps, requestedKey = forceKeyframe, requestedSaver = dataSaver, epoch = videoEpoch
         worker.async { [weak self] in
             let encodeStart = monotonic()
-            let jpeg = capture.jpeg(quality: requestedQuality)
+            let result = Result { try capture.h264(quality: requestedQuality, fps: requestedFPS, forceKeyframe: requestedKey, dataSaver: requestedSaver) }
             let encodeMS = (monotonic() - encodeStart) * 1000
             guard let self else { return }
             self.queue.async {
                 self.encoding = false; self.lastEncodeMS = encodeMS
                 defer { self.reconcileAccessibility(); self.reschedule() }
-                guard !self.closed, self.capture === capture else { return }
-                if let jpeg {
-                    if self.dataSaver, self.lastJPEG == jpeg { return }
-                    self.lastJPEG = self.dataSaver ? jpeg : nil
-                    self.sending = true; self.awaitingACK = monotonic(); self.frameCount += 1; self.lastError = nil; self.captureHasFrame = true
-                    self.client.sendBinary(jpeg) { [weak self] in self?.sending = false; self?.reschedule() }
-                    if monotonic() - self.lastStats >= 1 {
-                        self.lastStats = monotonic(); self.client.sendJSON(["type": "server_stats", "fps": self.fps, "quality": self.quality, "frame_id": self.frameCount])
-                    }
-                } else if monotonic() - self.started > 10 { self.notifyError("No complete frame; check Screen Recording permission") }
+                guard !self.closed, !self.paused, self.capture === capture, self.videoEpoch == epoch else { return }
+                switch result {
+                case .success(let frame):
+                    if let frame {
+                        // Configuration precedes every IDR, including timeout, resize,
+                        // resume and decoder-reset recovery. Epochs reject late ACKs.
+                        if frame.keyframe { self.client.sendJSON(frame.configuration(epoch: epoch)); self.forceKeyframe = false }
+                        else if self.forceKeyframe { return }
+                        self.wireFrameID &+= 1
+                        self.awaitingFrameID = self.wireFrameID
+                        self.sending = true; self.awaitingACK = monotonic(); self.frameCount += 1; self.lastError = nil; self.captureHasFrame = true
+                        self.client.sendBinary(frame.packet(epoch: epoch, id: self.wireFrameID)) { [weak self] in self?.sending = false; self?.reschedule() }
+                        if monotonic() - self.lastStats >= 1 {
+                            self.lastStats = monotonic(); self.client.sendJSON(["type": "server_stats", "codec": "h264", "fps": self.fps, "quality": self.quality, "frame_id": self.frameCount])
+                        }
+                    } else if !capture.hasFrame && monotonic() - self.started > 10 { self.notifyError("No complete frame; check Screen Recording permission") }
+                case .failure(let error):
+                    self.notifyError(error.localizedDescription); self.releaseCapture(); self.nextFrame = monotonic() + 2
+                }
             }
         }
     }
+    private func requestKeyframe() {
+        videoEpoch &+= 1; forceKeyframe = true; awaitingACK = nil; awaitingFrameID = nil
+    }
     private func configure(_ window: DeviceWindow) {
-        configuring = true
+        configuring = true; requestKeyframe()
         let old = capture; capture = nil; geometry = nil; captureHasFrame = false; reconcileAccessibility()
         let new = WindowCapture(target: window), lifecycle = self.lifecycle
         lifecycle.enter()
@@ -134,7 +151,7 @@ final class StreamSession: @unchecked Sendable {
                 self.queue.async {
                     self.configuring = false
                     if self.closed { Task { @MainActor in await new.stop(); lifecycle.leave() }; return }
-                    self.capture = new; self.geometry = window; self.lastJPEG = nil; self.lastError = nil
+                    self.capture = new; self.geometry = window; self.lastError = nil
                     lifecycle.leave(); self.reconcileAccessibility(); self.reschedule()
                 }
             } catch {
@@ -144,7 +161,7 @@ final class StreamSession: @unchecked Sendable {
         }
     }
     private func releaseCapture() {
-        let old = capture; capture = nil; geometry = nil; lastJPEG = nil; captureHasFrame = false
+        let old = capture; capture = nil; geometry = nil; captureHasFrame = false; requestKeyframe()
         reconcileAccessibility()
         if let old {
             let lifecycle = self.lifecycle; lifecycle.enter()
@@ -157,17 +174,23 @@ final class StreamSession: @unchecked Sendable {
     private func message(_ data: [String: Any]) {
         guard !closed, let type = data["type"] as? String else { return }
         defer { reconcileAccessibility(); reschedule() }
-        if type == "frame_ack" {
+        if type == "video_ready" {
+            videoReady = true
+        } else if type == "video_keyframe" {
+            requestKeyframe()
+        } else if type == "frame_ack" {
+            guard (data["epoch"] as? NSNumber)?.uint32Value == videoEpoch, (data["frame_id"] as? NSNumber)?.uint32Value == awaitingFrameID else { return }
             if let sent = awaitingACK {
-                let elapsed = monotonic() - sent; awaitingACK = nil; lastACKMS = elapsed * 1000
+                let elapsed = monotonic() - sent; awaitingACK = nil; awaitingFrameID = nil; lastACKMS = elapsed * 1000
+                if data["decode_error"] as? Bool == true { requestKeyframe(); return }
                 if elapsed > 0.18 { fps = max(1, min(targetFPS, fps - 2)); quality = max(1, min(targetQuality, quality - 1)); goodFrames = 0 }
                 else { goodFrames += 1; if goodFrames >= 30 { goodFrames = 0; fps = min(targetFPS, fps + 2); quality = min(targetQuality, quality + 2) } }
             }
         } else if type == "settings" {
             if let n = data["fps"] as? NSNumber { targetFPS = Int(clamp(n.doubleValue, 1, 60)); fps = targetFPS }
             if let n = data["quality"] as? NSNumber { targetQuality = Int(clamp(n.doubleValue, 1, 95)); quality = targetQuality }
-            if let value = data["data_saver"] as? Bool { dataSaver = value; lastJPEG = nil }
-            if let value = data["stream_paused"] as? Bool { paused = value; if value { awaitingACK = nil } }
+            if let value = data["data_saver"] as? Bool, value != dataSaver { dataSaver = value; requestKeyframe() }
+            if let value = data["stream_paused"] as? Bool, value != paused { paused = value; requestKeyframe() }
             if let value = data["accessibility_enabled"] as? Bool { accessibility.update(paneOpen: value, streamActive: value && accessibilityStreamReady, subscription: data["accessibility_subscription"] as? Int) }
         } else {
             guard DeviceInput.supportedTypes.contains(type) else { return }

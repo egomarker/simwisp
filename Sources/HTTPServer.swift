@@ -9,7 +9,7 @@ struct HTTPRequest {
     let body: Data
     let sourceAddress: String
     var host: String { headers["host"] ?? "" }
-    var sameOrigin: Bool { headers["origin"] == "http://" + host }
+    var sameOrigin: Bool { headers["origin"] == "https://" + host }
 }
 struct HTTPResponse {
     var status = 200
@@ -19,7 +19,7 @@ struct HTTPResponse {
     static func json(_ value: Any, status: Int = 200) -> HTTPResponse { HTTPResponse(status: status, body: jsonData(value)) }
 }
 
-// Dispatch-driven BSD sockets carry bounded HTTP/1.1 and RFC6455 messages.
+// TLS-only readiness I/O carries bounded HTTP/1.1 and RFC6455 messages.
 // One HTTP request per connection, no permissive CORS.
 final class HTTPServer {
     let queue = DispatchQueue(label: "Simwisp.network", qos: .userInitiated)
@@ -30,8 +30,8 @@ final class HTTPServer {
     var upgrade: ((HTTPRequest, ClientConnection) -> Void)?
     var authorize: ((HTTPRequest) -> Bool)?
     var stateChanged: ((String) -> Void)?
-    func start(port: Int, lan: Bool) throws {
-        let listener = try SocketListener(port: port, lan: lan, queue: queue)
+    func start(port: Int, lan: Bool, tls: TLSIdentity) throws {
+        let listener = try SocketListener(port: port, lan: lan, queue: queue, tls: tls)
         listener.onAccept = { [weak self] connection in
             guard let self, self.connections.count < 64 else { connection.start(); connection.cancel(); return }
             if self.activity == nil {
@@ -40,10 +40,10 @@ final class HTTPServer {
             let client = ClientConnection(connection: connection, server: self)
             self.connections[client.id] = client; client.start()
         }
-        self.listener = listener; listener.start()
-        queue.async { [weak self, weak listener] in
-            if let self, self.listener === listener { self.stateChanged?("Running") }
+        listener.onState = { [weak self, weak listener] state in
+            if let self, self.listener === listener { self.stateChanged?(state) }
         }
+        self.listener = listener; listener.start()
     }
     func stop(completion: @escaping () -> Void = {}) {
         queue.async {

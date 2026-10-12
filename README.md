@@ -6,7 +6,7 @@ A native macOS menu-bar app that brings live iOS and Android simulators into a l
 
 ## At a glance
 
-- **Native capture** — ScreenCaptureKit, bounded frame buffers, JPEG streaming, and adaptive pacing up to 60 FPS.
+- **Native capture** — ScreenCaptureKit → VideoToolbox H.264 → WebCodecs, bounded frame buffers, and adaptive pacing up to 60 FPS.
 - **Multiple devices** — view iOS and Android simulators side by side, with resizable panels and independent connections.
 - **Real controls** — taps, drags, Home, iOS Shake and App switcher, rotation, appearance, keyboard/text input, and Android Back/Menu/App switcher/two-finger gestures.
 - **Menu-bar only** — no normal server window; inspect sessions, permissions, and process usage from the menu.
@@ -19,7 +19,8 @@ A native macOS menu-bar app that brings live iOS and Android simulators into a l
 
 | Requirement | Purpose |
 | --- | --- |
-| macOS 14 or newer | Native app and ScreenCaptureKit capture |
+| macOS 15 or newer | Native capture and memory-only HTTPS identity import |
+| Current browser with H.264 WebCodecs support | Decode video over trusted HTTPS (Chrome/Edge/Safari; capability checked at connection) |
 | Xcode with a working `xcrun swiftc` | Build the app; discover and run iOS simulators |
 | Android SDK / Emulator, optional | Discover, boot, and control Android emulators |
 | Screen Recording permission | Capture simulator windows |
@@ -70,10 +71,25 @@ Collapsing the panel preserves tabs. Closing a tab terminates its shell and fore
 
 1. Open Simwisp's menu-bar panel.
 2. Grant Screen Recording and Accessibility access when needed. macOS may require quitting and reopening the app after a permission change.
-3. Choose **Open workspace**, or **Copy link** to open the pairing link on another device.
-4. Select a running simulator from the sidebar. Use **Add simulator** to boot another device.
+3. Choose **Export public HTTPS certificate…** and explicitly trust the exported local CA on every client (including this Mac’s browser). See below.
+4. Choose **Open workspace**, or **Copy link** to open the **HTTPS** pairing link on another device.
+5. Select a running simulator from the sidebar. Use **Add simulator** to boot another device.
 
 The default port is **4141**. Only one controlling browser connection is supported per device; a new connection replaces the previous one. Keep one controller per device to avoid competing reconnects.
+
+### HTTPS and certificate trust
+
+HTTPS/WSS is the only transport; there is no plaintext or JPEG fallback. On first start, Simwisp generates a private local CA and a server identity using the Mac’s built-in OpenSSL. They persist under `~/Library/Application Support/Simwisp/tls/`, outside the repository; the directory is `0700` and private files are `0600`. Keys are loaded into memory, not imported into your login/system keychain. No certificate trust, package or browser is installed automatically.
+
+Export **only** `Simwisp-Local-CA.cer` using **Export public HTTPS certificate…** in the menu-bar panel, or the public `/simwisp-ca.cer` route. Compare its SHA-256 fingerprint with the native panel before trusting it. **Never share** `root.key`, `server.key`, `server.p12` or `server.passphrase` or delete the CA to solve a browser warning. Each client must deliberately trust the public CA:
+
+- **macOS:** manually import the public certificate in Keychain Access and set its SSL trust; reopen the browser if needed.
+- **iPhone/iPad:** explicitly install the transferred public certificate profile, then enable its full trust under **Settings → General → About → Certificate Trust Settings**. Device-management policy may restrict this.
+- **Windows/Android:** explicitly import the public CA in the appropriate user/device trusted-root certificate store. Browser and managed-device trust policies differ.
+
+Then open the HTTPS link using a name/IP covered by the certificate. A warning-page bypass is **not** a reliable WebCodecs secure-context solution. Unsupported/insecure browsers show a clear explanation rather than silently switching pipelines. Trusting this CA authorizes certificates signed by this Mac; keep its private key private and enroll only devices you control.
+
+The CA is reused across launches. Server certificates include localhost, the Mac hostname and current interface IPs (including VPN IPv4 addresses); they are renewed before expiry or after address changes on server restart without changing the CA. New interface addresses may require restarting the server. A damaged/expired CA fails closed and needs explicit repair/renewal and client enrollment, not silent replacement. Pairing remains required after TLS trust, and old link tokens/cookie derivation are preserved; old HTTP bookmarks must change to HTTPS.
 
 ### Shake an iOS simulator
 
@@ -107,7 +123,7 @@ The first launch of this version adds a disabled `pairing` group to `~/Library/A
 
 Replace `null` with a **unique, private Base32 secret containing 20–64 bytes**, generated with a trusted local tool/password manager; enroll the same seed in your authenticator using **SHA-1, six digits, 30 seconds**. Do not use public test/example seeds or online key generators. Missing, null or blank seeds disable TOTP and hide its browser choice. Settings are owner-only (`0600`); neither the seed nor accepted codes are returned by the server or written to logs. Saved settings are pretty-printed, keeping seed and limits together. Old settings remain compatible and their pairing token is preserved. Invalid JSON/types are not silently replaced with new credentials; invalid seeds/limits prevent server startup until corrected.
 
-The unauthenticated screen offers **Pairing link** or **Authenticator code** when configured. The server accepts the current step ±1 for clock skew and exchanges either credential for the same HttpOnly/SameSite Strict browser cookie. A successfully accepted step cannot be reused, including after restart; wait for a fresh step when pairing another browser. This is an **alternative credential, not two-factor authentication**. With terminals enabled, either method grants Mac-user shell access. TOTP does not encrypt HTTP or prevent real-time phishing; use only a trusted LAN or an encrypted tunnel.
+The unauthenticated screen offers **Pairing link** or **Authenticator code** when configured. The server accepts the current step ±1 for clock skew and exchanges either credential for the same Secure/HttpOnly/SameSite Strict browser cookie. A successfully accepted step cannot be reused, including after restart; wait for a fresh step when pairing another browser. This is an **alternative credential, not two-factor authentication**. With terminals enabled, either method grants Mac-user shell access. TLS encrypts the transport, but TOTP does not prevent real-time phishing; keep pairing links and trusted clients private.
 
 Limits apply only to `POST /api/pair`, never simulator/terminal traffic or already-paired requests:
 
@@ -147,8 +163,8 @@ Simwisp serves the workspace and simulator streams directly from your Mac; it do
 
 - Pairing links authorize simulator control and, when explicitly enabled on the Mac, host shell access. Treat them as private credentials.
 - APIs require authentication, and WebSocket upgrades and mutating requests enforce same-origin checks.
-- Browser authentication uses an HttpOnly, SameSite Strict cookie.
-- LAN transport is **unencrypted HTTP**. Use it only on a trusted network, or through an encrypted tunnel; do not expose the port directly to the internet.
+- Browser authentication uses a Secure, HttpOnly, SameSite Strict cookie.
+- Workspace, video and terminal traffic use **HTTPS/WSS**, with deliberate local-CA trust on each client. Keep pairing links private and do not expose the port directly to the internet.
 - Settings, including the pairing token, are stored outside the repository at `~/Library/Application Support/Simwisp/settings.json`.
 
 ## Android TalkBack inspector
@@ -161,11 +177,11 @@ Monitoring is native, bounded and readiness-driven: one serial-targeted ADB read
 
 ## Performance and lifecycle
 
-Streaming is paced by frame deadlines and browser acknowledgements, with bounded encoding and socket buffers. Slow connections can reduce FPS and JPEG quality automatically; 60 FPS is a target, not a guarantee on every network or device.
+Streaming uses H.264 Baseline without B-frame reordering. The existing 1–95 quality control now selects a resolution-scaled target bitrate (about 6 Mbps at 1080×1920/q20), not image compression. Hardware encoding is preferred where available. Only one encode and one unacknowledged access unit are in flight per stream, with a three-buffer pixel pool and bounded socket writes. WebCodecs decodes immediately to the canvas, closes every VideoFrame, then ACKs that exact encoder epoch/frame; late outputs/ACKs cannot advance a replacement stream. Native capability notification replays settings/readiness after asynchronous device discovery, so early post-upgrade messages cannot leave capture stuck at startup. IDRs recover decoding after timeout, reconnect, rotation/size changes or pause. Data saver skips unchanged pixels, never replays cached P-frames. Slow connections can reduce FPS and bitrate quality automatically; 60 FPS is a target, not a guarantee. Text sharpness, bandwidth, GPU cost and live latency depend on workload and client.
 
 When the final simulator streaming client disconnects, capture is torn down and the discovery timer is cancelled. The menu-bar popup's monitoring timer exists only while the popup is visible/key. Browser device-list requests still perform on-demand discovery.
 
-Original no-terminal idle lifecycle verification measured approximately **0.01–0.02% of one CPU core** on the development Mac. A later explicitly sampled terminal review measured **0.0423% with one idle terminal** and **0.0444% with two**, with unchanged PTY I/O counters and no capture demand. Sampling itself adds work; these are short observations, not universal CPU guarantees. The panel's CPU display uses **100% = one core**; measurements are app-process usage, not total simulator or system usage.
+Historical JPEG-build no-terminal idle lifecycle verification measured approximately **0.01–0.02% of one CPU core** on the development Mac. A later explicitly sampled terminal review measured **0.0423% with one idle terminal** and **0.0444% with two**, with unchanged PTY I/O counters and no capture demand. Sampling itself adds work; these are short observations, not universal CPU guarantees. The panel's CPU display uses **100% = one core**; measurements are app-process usage, not total simulator or system usage.
 
 Terminal connections never count as simulator streaming demand. PTY reads/writes and child exits are dispatch-event driven on a separate queue; idle terminals do not poll. Cursor blinking and smooth scrolling are disabled. Shell output waits for browser parsing acknowledgements, with at most one bounded chunk in flight; input and replay buffers are capped at 64 KiB. Connected terminal sockets use a low-frequency keepalive; disconnected retention and ACK deadlines are one-shot timers. Actual shell commands naturally consume CPU when doing work.
 
@@ -175,6 +191,8 @@ Only one Simwisp app instance may run at a time; duplicate launches exit without
 
 | Symptom | Check |
 | --- | --- |
+| Certificate warning / insecure context | Explicitly trust the exported public CA; use its matching HTTPS name/IP, not HTTP or a warning bypass |
+| H.264 unsupported | Update/use a browser with H.264 WebCodecs support; no fallback is retained |
 | No frames / device window unavailable | Screen Recording permission; simulator window open and unminimized |
 | Frames work, input does not | Accessibility permission; selected simulator window and focus |
 | Android devices missing | SDK path, emulator running, and the SDK's `adb devices` output |
@@ -186,7 +204,7 @@ Only one Simwisp app instance may run at a time; duplicate launches exit without
 ## Project layout
 
 ```text
-Sources/                 Native app, capture, input, discovery, HTTP, PTYs and streams
+Sources/                 Native app, capture, H.264, input, discovery, HTTPS, PTYs and streams
 Sources/TerminalHost.c    Small native controlling-terminal/login-shell helper
 Resources/Web/           Browser workspace: HTML, CSS, and JavaScript
 Resources/Info.plist      App metadata and menu-bar-only configuration
@@ -198,7 +216,9 @@ Useful targets:
 
 ```bash
 make check   # Build, sign, and verify
-make test    # Native pairing + accessibility + input regressions; no app launch
+make test    # Native pairing + accessibility + input + H.264/TLS regressions; no app launch
+make test-decoder # Optional isolated decoder fault/lifecycle tests (existing Node)
+make test-tls # Optional production HTTPS/auth fixture (existing Node; port45152)
 make test-browser-accessibility # Optional isolated browser/transport fixtures
 make run     # Build and open using saved settings
 make clean   # Remove build output; quit the app first
@@ -206,12 +226,12 @@ make clean   # Remove build output; quit the app first
 
 The input suite tests Android Back/Menu/App switcher eligibility, exact per-serial numeric keyevents and command-error propagation with inert ADB callbacks, plus iOS Shake/App switcher eligibility, focus-before-shortcut ordering, the actual complete keyboard event sequences (modifier down, key down/up, modifier release with neutral final flags), App switcher's two H presses and 120 ms held-modifier pause through the production dispatcher, repeated requests/paste/rotation/Home/plain-key regressions and Android/missing-permission/window/focus rejection with inert host callbacks; it never focuses or controls a real simulator.
 
-The optional browser target requires existing Google Chrome and Node.js 22+ on macOS, and a free loopback port 45151. It serves synthetic simulator frames and TalkBack events with the real native HTTP/reader/coordinator code; it does not launch an app bundle or control a device. Override the executable with `make NODE=/path/to/node test-browser-accessibility`. To separately check an existing Android ADB connection, run `NODE=/path/to/node Tests/Browser/run.sh --real-adb`; logcat then runs only while the test pane and fixture stream are open, without changing device settings or injecting navigation. A fresh real speech event still needs manual confirmation. Set `TEST_OUTPUT=/path/outside-the-repository` to retain screenshots/JSON; otherwise temporary fixtures and profiles are removed. Tests do not certify live capture FPS.
+The optional browser target requires existing Google Chrome and Node.js 22+ on macOS, and a free loopback port 45151. It serves native-encoded synthetic H.264 frames and TalkBack events over HTTPS/WSS with the real native transport/reader/coordinator code; it does not launch an app bundle or control a device. Override the executable with `make NODE=/path/to/node test-browser-accessibility`. To separately check an existing Android ADB connection, run `NODE=/path/to/node Tests/Browser/run.sh --real-adb`; logcat then runs only while the test pane and fixture stream are open, without changing device settings or injecting navigation. A fresh real speech event still needs manual confirmation. Set `TEST_OUTPUT=/path/outside-the-repository` to retain screenshots/JSON; otherwise temporary fixtures and profiles are removed. Node trusts only the temporary fixture CA via its process environment; Chrome pins only the temporary fixture leaf SPKI. Neither changes OS/browser trust stores. The decoder fixture uses inert WebCodecs/socket mocks to exercise malformed packets, stale outputs, capability probes, backpressure, pause/destruction and missing support. The TLS fixture exercises the actual service, authentication/origin checks, Secure cookies, resource delivery and plaintext rejection without allocating a shell or starting capture/discovery. Tests do not certify real-client certificate enrollment, live capture FPS, Safari/Android decoding or real device input.
 
 ## Development status
 
 **Early development build — version 0.2.0.** Live capture, pairing, multi-device streaming, disconnect/reconnect, and idle cleanup have been exercised on Apple Silicon. The host-architecture build recipe also supports compiling on Intel, but Intel runtime behavior has not been verified.
 
-Some native control combinations still need broader verification, particularly Android rotation and iOS text entry. Terminal PTY/security/lifecycle and desktop/mobile browser controls have been exercised on Apple Silicon. Terminal access is optional and disabled by default; legacy capture backends remain excluded.
+Some native control combinations still need broader verification, particularly Android rotation and iOS text entry. Terminal PTY/security/lifecycle and desktop/mobile browser controls have been exercised on Apple Silicon. Terminal access is optional and disabled by default; the old JPEG pipeline has been removed rather than kept as a fallback.
 
 The repository contains production source and browser resources only; generated logs, diagnostics, review reports, and app bundles are not checked in.

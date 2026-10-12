@@ -3,8 +3,6 @@ import ScreenCaptureKit
 import CoreMedia
 import CoreVideo
 import CoreImage
-import ImageIO
-import UniformTypeIdentifiers
 
 final class CaptureHealth {
     static let shared = CaptureHealth()
@@ -19,7 +17,7 @@ final class CaptureHealth {
 }
 
 // Native capture keeps only the newest complete frame. Encoding is pull-driven
-// by the socket ACK loop, with at most one encoder and one cached JPEG per device.
+// by presentation ACKs, with one H.264 encoder and no encoded-frame cache per device.
 // Mutable frame state is lock-protected; encoding has its own serial lock.
 final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let target: DeviceWindow
@@ -29,14 +27,12 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var stream: SCStream?
     private var latest: CVPixelBuffer?
     private var version: UInt64 = 0
-    private var cached: Data?
-    private var cachedVersion: UInt64 = 0
-    private var cachedQuality = -1
+    private var encoder: H264Encoder?
+    private var encodedVersion: UInt64?
     private var encodedCount: UInt64 = 0
+    private var encoderHardware = false
     private var active = true
     private var error: String?
-    private var context: CIContext?
-    private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     init(target: DeviceWindow) { self.target = target; super.init() }
     func start() async throws {
         if let failure = CaptureHealth.shared.failure { throw WispError(failure) }
@@ -56,53 +52,52 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         do { try await newStream.startCapture() } catch { await stop(); throw error }
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        receive(sampleBuffer, type: type)
+    }
+    func receive(_ sampleBuffer: CMSampleBuffer, type: SCStreamOutputType) {
         autoreleasepool {
             guard type == .screen, sampleBuffer.isValid, CMSampleBufferDataIsReady(sampleBuffer),
                   let infos = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
                   let raw = infos.first?[.status] as? Int, let status = SCFrameStatus(rawValue: raw) else { return }
             lock.lock(); defer { lock.unlock() }
             guard active else { return }
-            if status == .blank || status == .suspended { latest = nil; cached = nil; return }
+            if status == .blank || status == .suspended { latest = nil; return }
             guard status == .complete, let image = sampleBuffer.imageBuffer else { return }
             latest = image; version &+= 1
         }
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        lock.lock(); self.error = error.localizedDescription; latest = nil; cached = nil; lock.unlock()
+        lock.lock(); self.error = error.localizedDescription; latest = nil; lock.unlock()
         log("Capture stopped: \(error.localizedDescription)")
     }
     var failure: String? { lock.lock(); defer { lock.unlock() }; return error }
-    var counters: [String: Any] { lock.withLock { ["fresh_capture_frames": version, "jpeg_encodes": encodedCount] } }
-    func jpeg(quality: Int) -> Data? {
+    var hasFrame: Bool { lock.withLock { active && error == nil && latest != nil } }
+    var counters: [String: Any] { lock.withLock { ["fresh_capture_frames": version, "h264_encodes": encodedCount, "hardware_encoder": encoderHardware] } }
+    func h264(quality: Int, fps: Int, forceKeyframe: Bool, dataSaver: Bool) throws -> H264Frame? {
         encodeLock.lock(); defer { encodeLock.unlock() }
-        return autoreleasepool {
-            lock.lock()
-            guard active, error == nil, let image = latest else { lock.unlock(); return nil }
-            let current = version
-            if cachedVersion == current && cachedQuality == quality, let cached { lock.unlock(); return cached }
-            lock.unlock()
-            if context == nil { context = CIContext(options: [.cacheIntermediates: false]) }
-            let ci = CIImage(cvPixelBuffer: image)
-            let extent = ci.extent
+        return try autoreleasepool {
+            let state = lock.withLock { () -> (CVPixelBuffer, UInt64)? in
+                guard active, error == nil, let latest else { return nil }
+                return (latest, version)
+            }
+            guard let (image, current) = state else { return nil }
+            if dataSaver && encodedVersion == current && !forceKeyframe { return nil }
+            let ci = CIImage(cvPixelBuffer: image), extent = ci.extent, crop = target.crop
             let sx = extent.width / target.bounds.width, sy = extent.height / target.bounds.height
-            let crop = target.crop
             let left = max(0, (crop.minX * sx).rounded()), top = max(0, (crop.minY * sy).rounded())
             let right = min(extent.width, (crop.maxX * sx).rounded()), bottom = min(extent.height, (crop.maxY * sy).rounded())
             let roi = CGRect(x: left, y: extent.height - bottom, width: max(1, right - left), height: max(1, bottom - top))
-            guard let cg = context?.createCGImage(ci, from: roi, format: .RGBA8, colorSpace: colorSpace, deferred: false) else { return nil }
-            let data = NSMutableData()
-            guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
-            CGImageDestinationAddImage(destination, cg, [kCGImageDestinationLossyCompressionQuality: Double(quality) / 100] as CFDictionary)
-            guard CGImageDestinationFinalize(destination) else { return nil }
-            let result = Data(referencing: data)
-            lock.lock()
-            if active { cached = result; cachedVersion = current; cachedQuality = quality; encodedCount &+= 1 }
-            lock.unlock()
-            return result
+            if encoder?.width != Int(roi.width) || encoder?.height != Int(roi.height) {
+                encoder?.close(); encoder = try H264Encoder(width: Int(roi.width), height: Int(roi.height))
+            }
+            let frame = try encoder!.encode(ci.cropped(to: roi).transformed(by: CGAffineTransform(translationX: -roi.minX, y: -roi.minY)), quality: quality, fps: fps, forceKeyframe: forceKeyframe)
+            encodedVersion = current
+            lock.withLock { if active { encodedCount &+= 1; encoderHardware = encoder!.hardware } }
+            return frame
         }
     }
     func stop() async {
-        let old = lock.withLock { () -> SCStream? in active = false; latest = nil; cached = nil; let value = stream; stream = nil; return value }
+        let old = lock.withLock { () -> SCStream? in active = false; latest = nil; let value = stream; stream = nil; return value }
         if let old {
             do { try await old.stopCapture() }
             catch {
@@ -112,6 +107,6 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             try? old.removeStreamOutput(self, type: .screen)
             CaptureHealth.shared.released()
         }
-        encodeLock.withLock { context = nil }
+        encodeLock.withLock { encoder?.close(); encoder = nil; encodedVersion = nil }
     }
 }

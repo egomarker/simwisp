@@ -573,7 +573,7 @@ function addSimPanel(udid, name, w, h, platform) {
     fps:     parseInt(fpsSlider.value),
     quality: parseInt(qualSlider.value),
     data_saver: dsBtn.classList.contains('active'),
-    onStatus:            s => updatePanelStatus(udid, s),
+    onStatus:            (s, message) => updatePanelStatus(udid, s, message),
     onFirstFrame:        () => overlayEl.classList.add('hidden'),
     onOrientationChange: () => sizeFrame(panel),
     onRotateStart:       () => setPanelProgress(udid, 'Rotating…'),
@@ -734,20 +734,23 @@ function updateKeyboardPlaceholder() {
 }
 
 // ── Per-panel status ──────────────────────────────────────────────────────────
-function updatePanelStatus(udid, status) {
+function updatePanelStatus(udid, status, message = null) {
   const panel = simPanels.get(udid);
   if (!panel) return;
   const { dotEl, overlayEl } = panel;
   const active = !document.hidden && !(isMobileViewport() && termOpen) && ['connected', 'streaming'].includes(status);
   panel.accessibility?.setActive(active);
   if (panel.accessibility?.isOpen) panel.stream?.updateSettings({ accessibility_enabled: active, accessibility_subscription: panel.accessibility.subscription });
-  panel.statusEl.textContent = ({ streaming: 'Live', connected: 'Ready', reconnecting: 'Reconnecting', 'no-frames': 'No frames' })[status] || 'Connecting';
+  panel.statusEl.textContent = ({ streaming: 'Live', connected: 'Ready', reconnecting: 'Reconnecting', 'no-frames': 'No frames', unsupported: 'Unsupported' })[status] || 'Connecting';
   dotEl.className = 'status-dot';
   if (status === 'streaming' || status === 'connected') {
     dotEl.classList.add('connected');
   } else if (status === 'reconnecting') {
     dotEl.classList.add('reconnecting');
     overlayEl.innerHTML = '<span>Reconnecting…</span>';
+    overlayEl.classList.remove('hidden');
+  } else if (status === 'unsupported') {
+    overlayEl.innerHTML = `<span>${esc(message || 'H.264 needs WebCodecs over trusted HTTPS.')}</span>`;
     overlayEl.classList.remove('hidden');
   } else if (status === 'no-frames') {
     overlayEl.classList.remove('hidden');
@@ -798,7 +801,7 @@ function updatePanelStats(udid, stats) {
   panel.statsEl.textContent = isMobileViewport()
     ? `${stats.fps}fps ${fmtRateCompact(stats.bps)}`
     : `${stats.fps} fps · ${fmtRate(stats.bps)} · q${quality}`;
-  panel.statsEl.title = `Rendered ${stats.fps} fps. Server target ${serverFps} fps, quality ${quality}. Avg frame ${Math.round(stats.avgFrame / 1024 || 0)} KB. Dropped ${stats.dropped}.`;
+  panel.statsEl.title = `Rendered ${stats.fps} fps. H.264 server target ${serverFps} fps, bitrate quality ${quality}. Avg frame ${Math.round(stats.avgFrame / 1024 || 0)} KB. Dropped ${stats.dropped}.`;
 }
 
 function updateStreamVisibility() {

@@ -17,7 +17,7 @@ cleanup() {
   rm -rf "$root"
 }
 trap cleanup EXIT
-xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/Accessibility.swift Sources/HTTPServer.swift Sources/SocketTransport.swift Tests/Browser/main.swift -o "$root/fixture"
+xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/Accessibility.swift Sources/HTTPServer.swift Sources/SocketTransport.swift Sources/TLS.swift Sources/Video.swift Tests/Browser/main.swift -o "$root/fixture"
 "$root/fixture" "$root" > "$root/fixture.log" 2>&1 &
 fixture_pid=$!
 for ((i=0; i<100; i++)); do
@@ -26,4 +26,4 @@ for ((i=0; i<100; i++)); do
   sleep .05
 done
 grep -q 'Isolated accessibility fixture ready' "$root/fixture.log" || { cat "$root/fixture.log" >&2; exit 1; }
-"$NODE" Tests/Browser/accessibility-review.mjs "$root" "$@"
+NODE_EXTRA_CA_CERTS="$root/tls/root.pem" "$NODE" Tests/Browser/accessibility-review.mjs "$root" "$@"

@@ -8,6 +8,7 @@ final class Service {
     let devices: Devices
     let input: DeviceInput
     let server = HTTPServer()
+    private(set) var tls: TLSIdentity?
     private let terminals: TerminalManager
     private let workers = DispatchQueue(label: "Simwisp.tools", qos: .userInitiated, attributes: .concurrent)
     private var streams: [String: StreamSession] = [:] // network queue owns registry
@@ -16,11 +17,12 @@ final class Service {
     private let pairingQueue = DispatchQueue(label: "Simwisp.pairing", qos: .userInitiated)
     private var pairing: PairingAuthenticator!
     private let pairingStateURL: URL
+    private let tlsDirectory: URL
     private var usage = Usage() // sampled on the network queue for diagnostics only
     private var panelState: [String: Any] = ["visible": false, "refresh_timer": false, "refreshes": 0]
     var stateChanged: ((String) -> Void)?
-    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json")) {
-        self.pairingStateURL = pairingStateURL
+    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory) {
+        self.pairingStateURL = pairingStateURL; self.tlsDirectory = tlsDirectory
         self.settings = settings; devices = Devices(settings: settings); input = DeviceInput(devices: devices)
         terminals = TerminalManager(settings: settings, network: server.queue)
         cookie = SHA256.hash(data: Data(("simwisp-session-v1:" + settings.pairingToken).utf8)).map { String(format: "%02x", $0) }.joined()
@@ -35,7 +37,8 @@ final class Service {
     func start() throws {
         if let error = settings.loadingError { throw WispError(error) }
         pairing = try PairingAuthenticator(settings: settings.pairing, token: settings.pairingToken, stateURL: pairingStateURL)
-        try server.start(port: settings.port, lan: settings.shareLAN)
+        let tls = try TLSIdentity(directory: tlsDirectory); self.tls = tls
+        try server.start(port: settings.port, lan: settings.shareLAN, tls: tls)
     }
     func updatePanelState(visible: Bool, refreshing: Bool, count: UInt64) {
         server.queue.async { self.panelState = ["visible": visible, "refresh_timer": refreshing, "refreshes": count] }
@@ -80,6 +83,11 @@ final class Service {
         streams[id] = session; devices.setStreamingDemand(true); session.start()
     }
     private func route(_ request: HTTPRequest, complete: @escaping (HTTPResponse) -> Void) {
+        if request.path == "/simwisp-ca.cer", request.method == "GET", let tls {
+            var response = HTTPResponse(body: tls.certificate, type: "application/pkix-cert")
+            response.headers["Content-Disposition"] = "attachment; filename=Simwisp-Local-CA.cer"
+            complete(response); return
+        }
         if request.path == "/api/pair/options", request.method == "GET" {
             complete(.json(["totp": pairing.totpEnabled])); return
         }
@@ -92,7 +100,7 @@ final class Service {
                 switch decision {
                 case .accepted:
                     response = .json(["ok": true])
-                    response.headers["Set-Cookie"] = "simwisp_session=\(self.cookie); Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000"
+                    response.headers["Set-Cookie"] = "simwisp_session=\(self.cookie); Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=2592000"
                 case .denied: response = .json(["error": "Invalid pairing credential"], status: 401)
                 case .unavailable: response = .json(["error": "TOTP unavailable. Use a pairing link or check Simwisp on the Mac."], status: 503)
                 case .throttled(let seconds):
@@ -116,7 +124,7 @@ final class Service {
         if request.method != "GET" && !request.sameOrigin { complete(.json(["error": "Origin denied"], status: 403)); return }
         switch (request.method, request.path) {
         case ("GET", "/api/info"):
-            var info: [String: Any] = ["mode": "fast2 (Native ScreenCaptureKit + Quartz input)", "app": "Simwisp", "version": "0.2.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true]]
+            var info: [String: Any] = ["mode": "fast2 (ScreenCaptureKit + VideoToolbox H.264 + Quartz input)", "video_codec": "h264", "transport": "https", "app": "Simwisp", "version": "0.2.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true]]
             if settings.terminalEnabled == true { info["project_dir"] = settings.projectDirectory }
             if let bundle = devices.projectBundleID { info["bundle_id"] = bundle }
             complete(.json(info))

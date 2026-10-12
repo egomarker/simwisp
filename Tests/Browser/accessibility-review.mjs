@@ -2,10 +2,14 @@ import fs from 'node:fs';import path from 'node:path';import {spawn,execFileSync
 const root=process.argv[2];const source=fs.realpathSync(process.cwd());if(!root||process.platform!=='darwin'||typeof WebSocket==='undefined')throw Error('Run on macOS with Node22 and a private output directory');
 if(!fs.existsSync(source+'/Sources/Accessibility.swift'))throw Error('Run from the project root');
 const report={host:execFileSync('/bin/hostname',{encoding:'utf8'}).trim(),canonical:source,fixtures:true,liveAppRestarted:false,checks:[],screenshots:[]};
-const base='http://127.0.0.1:45151';const delay=ms=>new Promise(r=>setTimeout(r,ms));
+const base='https://127.0.0.1:45151';const delay=ms=>new Promise(r=>setTimeout(r,ms));
 const status=async()=>await(await fetch(base+'/fixture/status')).json();
 const profile=path.join(root,'chrome-profile');
-const child=spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',['--headless=new','--disable-gpu','--force-device-scale-factor=1','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0',`--user-data-dir=${profile}`,'--no-first-run','--no-default-browser-check','--disable-background-networking','--disable-component-update','--disable-sync','--disable-extensions','about:blank'],{stdio:['ignore','ignore','pipe'],detached:true});
+const publicKey=execFileSync('/usr/bin/openssl',['x509','-in',path.join(root,'tls/server.pem'),'-pubkey','-noout']);
+const der=execFileSync('/usr/bin/openssl',['pkey','-pubin','-outform','DER'],{input:publicKey});
+const pin=execFileSync('/usr/bin/openssl',['dgst','-sha256','-binary'],{input:der}).toString('base64');
+report.videoCodec='h264';report.delayedNativeSessionSetup=true;report.tls={fixtureLeafSPKIPin:pin,trustStoreModified:false};
+const child=spawn('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',['--headless=new',`--ignore-certificate-errors-spki-list=${pin}`,'--disable-gpu','--force-device-scale-factor=1','--remote-debugging-address=127.0.0.1','--remote-debugging-port=0',`--user-data-dir=${profile}`,'--no-first-run','--no-default-browser-check','--disable-background-networking','--disable-component-update','--disable-sync','--disable-extensions','about:blank'],{stdio:['ignore','ignore','pipe'],detached:true});
 let chromeErr='';child.stderr.on('data',b=>chromeErr=(chromeErr+b.toString()).slice(-10000));
 let ws;let seq=0;const pending=new Map();const exceptions=[];
 function cdp(method,params={}){return new Promise((resolve,reject)=>{const id=++seq;const timer=setTimeout(()=>{pending.delete(id);reject(Error('CDP timeout '+method))},12000);pending.set(id,{resolve,reject,timer});ws.send(JSON.stringify({id,method,params}))});}
@@ -50,12 +54,13 @@ try{
  ws=new WebSocket(tabs.find(t=>t.type==='page').webSocketDebuggerUrl);await new Promise((res,rej)=>{ws.addEventListener('open',res,{once:true});ws.addEventListener('error',rej,{once:true})});
  ws.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.id&&pending.has(m.id)){const p=pending.get(m.id);clearTimeout(p.timer);pending.delete(m.id);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result)}else if(m.method==='Runtime.exceptionThrown')exceptions.push(m.params)});
  await cdp('Page.enable');await cdp('Runtime.enable');await cdp('Network.enable');
- await cdp('Network.setCookie',{name:'fixture',value:'paired',url:base,httpOnly:true,sameSite:'Strict'});
- await cdp('Page.addScriptToEvaluateOnNewDocument',{source:`window.__wire={settings:[],inputs:[],acks:0,sockets:[]};const Real=WebSocket;window.WebSocket=class extends Real{constructor(...args){super(...args);window.__wire.sockets.push(this)}send(data){try{const m=JSON.parse(data);if(m.type==='settings'){window.__wire.settings.push(m);if(window.__wire.settings.length>128)window.__wire.settings.shift()}else if(m.type==='frame_ack')window.__wire.acks++;else{window.__wire.inputs.push(m);if(window.__wire.inputs.length>128)window.__wire.inputs.shift()}}catch{}return super.send(data)}};`});
+ await cdp('Network.setCookie',{name:'fixture',value:'paired',url:base,httpOnly:true,sameSite:'Strict',secure:true});
+ await cdp('Page.addScriptToEvaluateOnNewDocument',{source:`window.__video={created:0,closed:0,outputs:0,frameCloses:0,live:0,maxQueue:0,ackBeforeClose:false,packets:0,deltas:0};const RealDecoder=VideoDecoder;window.VideoDecoder=class extends RealDecoder{constructor(init){super({...init,output:f=>{window.__video.outputs++;window.__video.live++;init.output(f)}});window.__video.created++}decode(chunk){super.decode(chunk);window.__video.maxQueue=Math.max(window.__video.maxQueue,this.decodeQueueSize)}close(){window.__video.closed++;super.close()}};const closeFrame=VideoFrame.prototype.close;VideoFrame.prototype.close=function(){window.__video.live--;window.__video.frameCloses++;return closeFrame.call(this)};window.__wire={settings:[],inputs:[],acks:0,sockets:[]};const Real=WebSocket;window.WebSocket=class extends Real{constructor(...args){super(...args);window.__wire.sockets.push(this);this.addEventListener('message',e=>{if(e.data instanceof ArrayBuffer&&e.data.byteLength>=24){const v=new DataView(e.data);if(v.getUint32(0)===0x53575631){window.__video.packets++;if(v.getUint8(4)===0)window.__video.deltas++}}})}send(data){try{const m=JSON.parse(data);if(m.type==='settings'){window.__wire.settings.push(m);if(window.__wire.settings.length>128)window.__wire.settings.shift()}else if(m.type==='frame_ack'){window.__wire.acks++;if(!m.decode_error&&window.__video.live!==0)window.__video.ackBeforeClose=true}else if(!['video_ready','video_keyframe'].includes(m.type)){window.__wire.inputs.push(m);if(window.__wire.inputs.length>128)window.__wire.inputs.shift()}}catch{}return super.send(data)}};`});
  await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({real:false})});
  const sizes=[{name:'desktop',w:1440,h:1000,m:false},{name:'phone',w:390,h:844,m:true},{name:'small-phone',w:320,h:568,m:true},{name:'short-phone',w:375,h:500,m:true},{name:'landscape-phone',w:844,h:390,m:true}];
  for(const size of sizes){
   await navigate(size.w,size.h,size.m);
+  await check(size.name+' real H.264 WebCodecs output over secure HTTPS',"isSecureContext&&location.protocol==='https:'&&window.__video.outputs>0&&window.__video.frameCloses===window.__video.outputs&&!window.__video.ackBeforeClose&&window.__video.maxQueue<=1&&window.__wire.sockets[0].url.startsWith('wss:')");
 
   await check(size.name+' logo tagline removed',"!document.querySelector('.brand-caption')&&!document.querySelector('.sidebar-logo').textContent.includes('A little closer to your app')");
   await check(size.name+' no bottom bar or Controlling label',"!document.querySelector('#focus-summary')&&!document.querySelector('#bottom-tab-bar')&&!document.querySelector('#tab-terminal')");
@@ -321,13 +326,14 @@ try{
  await nativeCheck('Open pane explicitly resubscribes after reconnect',async()=>(await androidInfo()).reader.running===true);
  await click('.a11y-close');await delay(300);
  await evaluate("window.__wire.sockets.find(s=>s.readyState===1).close()");
+ await wait("document.querySelector('.panel-status').textContent==='Reconnecting'");
  await wait("document.querySelector('.panel-status').textContent==='Live'",6000);
  await nativeCheck('Closed pane reconnect never allocates reader',async()=>Object.keys((await androidInfo()).reader).length===0);
  const fps=[];
  async function sample(mode){const start=(await status()).sessions.find(s=>s.id==='emulator-5554').frames,at=performance.now();await delay(2500);const end=(await status()).sessions.find(s=>s.id==='emulator-5554').frames;fps.push({mode,fps:(end-start)*1000/(performance.now()-at)});}
  await sample('pane closed');await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");await sample('pane open, event-driven idle reader');await click('.a11y-close');await sample('pane closed again');
  report.fixtureFPS=fps;
- await nativeCheck('Fixture JPEG/ACK path stays above 50 FPS',async()=>fps.every(s=>s.fps>50));
+ await nativeCheck('Fixture H.264/WebCodecs/presentation-ACK path stays above 50 FPS',async()=>fps.every(s=>s.fps>50));
  await nativeCheck('Idle inspector does not reduce fixture FPS by 10%',async()=>fps[1].fps/fps[0].fps>.9);
  await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");await click('.a11y-more');
  await evaluate("document.documentElement.dataset.theme='dark'");await shot('desktop-dark-expanded');
@@ -371,7 +377,7 @@ try{
   await wait("!!document.querySelector('.sim-panel')&&!document.querySelector('#terminal-panel').hidden&&document.querySelector('#term-status-dot').title==='connected'&&document.querySelector('.xterm-rows').textContent.includes('Fixture terminal output')");
   await check(size.name+' reload automatically restores open terminal and saved session',"document.querySelector('#btn-terminal').getAttribute('aria-expanded')==='true'&&document.querySelectorAll('.term-tab').length===1&&window.__wire.sockets.some(s=>s.url.includes('/ws/pty')&&s.url.includes("+JSON.stringify(savedID)+"))");
   await check(size.name+' reload preserves pin preference',"document.querySelector('#content').classList.contains('pinned-right')==="+(!size.m));
-  await nativeCheck(size.name+' automatic restore remains terminal-only demand',async()=>{const s=await status();return s.terminal.active===1&&s.terminal.starts===terminalBefore.starts+2&&Object.keys(s.sessions[0].accessibility.reader).length===0});
+  await nativeCheck(size.name+' automatic restore remains terminal-only demand',async()=>{const s=await status();return s.terminal.active===1&&s.terminal.starts===terminalBefore.starts+2&&s.sessions.every(session=>Object.keys(session.accessibility.reader).length===0)});
   await shot(size.name+'-terminal-reloaded');
   await click('#btn-close-term');
   const collapsedID=await evaluate("JSON.parse(sessionStorage.getItem('simwispTerminalTabs'))[0].sessionId");
@@ -387,6 +393,9 @@ try{
  }
  await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({terminal:false})});
 
+ await check('H.264 dependent delta access units decoded',"window.__video.deltas>0&&window.__video.outputs>10&&window.__video.maxQueue<=1&&!window.__video.ackBeforeClose");
+ await check('Final stream close releases all decoders and output frames',"window.__video.closed===window.__video.created&&window.__video.live===0&&window.__video.frameCloses===window.__video.outputs");
+ report.webCodecs=await evaluate('window.__video');
  report.browserExceptions=exceptions.length;report.passed=report.checks.every(c=>c.passed)&&exceptions.length===0;
  if(!report.passed)throw Error('Browser exception or assertion failure');
  fs.writeFileSync(path.join(root,'browser-review.json'),JSON.stringify(report,null,2)+'\n');
