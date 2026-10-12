@@ -43,6 +43,10 @@ for _ in 0..<Int(avcc[5] & 31) { readSet() }
 let ppsCount = Int(avcc[offset]); offset += 1
 for _ in 0..<ppsCount { readSet() }
 expect(sets.count == 2 && avcc[4] & 3 == 3, "SPS/PPS and 4-byte NAL lengths")
+let restrictions = try H264SPS.restrictions(in: sets[0])
+expect(restrictions.reorderFrames == 0 &&
+       restrictions.bufferFrames == max(1, restrictions.referenceFrames),
+       "VideoToolbox SPS signals zero reorder latency")
 var format: CMFormatDescription?
 let formatStatus = sets[0].withUnsafeBufferPointer { sps in sets[1].withUnsafeBufferPointer { pps in
     let pointers = [sps.baseAddress!, pps.baseAddress!], sizes = [sps.count, pps.count]

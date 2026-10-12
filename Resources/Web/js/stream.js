@@ -4,6 +4,9 @@ const NO_FRAME_WARN   = 4000;
 const WATCHDOG_POLL   = 3000;
 const WATCHDOG_STALE  = 16000;
 const DRAG_THRESHOLD  = 0.015;
+// Protect against hung decoders while allowing implementations to buffer output.
+const MAX_PENDING_FRAMES = 48;
+const MAX_DECODE_QUEUE = 16;
 
 export class SimStream {
   #liveTouch = false;
@@ -12,7 +15,7 @@ export class SimStream {
   #ws = null; #connectTimer = null; #reconnectTimer = null; #watchdog = null;
   #lastFrameAt = 0; #firstFrame = false; #captureUnavailable = false;
   #decoder = null; #decoderToken = 0; #videoConfig = null; #configuration = null;
-  #pendingFrame = null; #needsKeyframe = true; #noFrameTimer = null; #destroyed = false;
+  #pendingFrames = new Map(); #needsKeyframe = true; #noFrameTimer = null; #destroyed = false;
   #portraitW; #portraitH; #isLandscape = false;
   #onStatus; #onFirstFrame; #onOrientationChange; #onRotateStart; #onRotateEnd;
   #onStats; #onAccessibility; #statsTimer = null;
@@ -93,7 +96,7 @@ export class SimStream {
     this.#decoderToken++;
     if (this.#decoder && this.#decoder.state !== 'closed') this.#decoder.close();
     this.#decoder = null; this.#configuration = null; this.#videoConfig = null;
-    this.#pendingFrame = null; this.#needsKeyframe = true;
+    this.#pendingFrames.clear(); this.#needsKeyframe = true;
   }
 
   #unsupported(message) {
@@ -108,10 +111,10 @@ export class SimStream {
     if (token !== this.#decoderToken || this.#destroyed) return;
     console.warn('H.264 decoder recovery:', error?.message ?? error);
     this.#stats.dropped++;
-    const pending = this.#pendingFrame;
     this.#resetDecoder();
-    if (pending) this.send({ type: 'frame_ack', epoch: pending.epoch, frame_id: pending.id, decode_error: true });
-    else this.send({ type: 'video_keyframe' });
+    // Submitted frames have already released flow-control credits. Ask the
+    // server to start a fresh epoch instead of acknowledging a stale frame.
+    this.send({ type: 'video_keyframe' });
   }
 
   #configureVideo(msg, ws) {
@@ -151,27 +154,42 @@ export class SimStream {
     if (epoch !== this.#videoConfig?.epoch || !this.#configuration) {
       this.#stats.dropped++; this.send({ type: 'frame_ack', epoch, frame_id: id, decode_error: true }); return;
     }
-    if (this.#pendingFrame || (this.#needsKeyframe && !keyframe)) {
-      this.#recover('Video backpressure or missing keyframe');
-      this.send({ type: 'frame_ack', epoch, frame_id: id, decode_error: true }); return;
+    if (this.#needsKeyframe && !keyframe) {
+      this.#recover('Missing initial H.264 keyframe'); return;
+    }
+    if (this.#pendingFrames.size >= MAX_PENDING_FRAMES || this.#pendingFrames.has(timestamp)) {
+      this.#recover('H.264 decoder stopped producing output'); return;
     }
     const token = this.#decoderToken;
     this.#stats.bytes += buffer.byteLength; this.#lastFrameAt = Date.now();
-    this.#pendingFrame = { epoch, id, timestamp };
-    // Exactly one packet may wait for asynchronous capability probing. It is
-    // invalidated on pause, resize, disconnect or destruction, not queued.
+    this.#pendingFrames.set(timestamp, { epoch, id, timestamp });
+    // The server waits for a decode-input ACK. One packet may await the
+    // initial capability probe; subsequent video input is acknowledged as soon
+    // as the decoder accepts it, not when the output callback runs.
     this.#configuration.then(ready => {
       if (!ready || token !== this.#decoderToken || this.#ws !== ws || this.#destroyed) return;
       try {
-        if (this.#decoder.decodeQueueSize > 0) throw Error('Decoder queue is full');
-        this.#decoder.decode(new EncodedVideoChunk({ type: keyframe ? 'key' : 'delta', timestamp, data: new Uint8Array(buffer, 24) }));
+        if (this.#decoder.decodeQueueSize >= MAX_DECODE_QUEUE) {
+          throw Error('H.264 decoder queue is overloaded');
+        }
+        this.#decoder.decode(new EncodedVideoChunk({
+          type: keyframe ? 'key' : 'delta',
+          timestamp,
+          data: new Uint8Array(buffer, 24),
+        }));
+        if (token !== this.#decoderToken || this.#ws !== ws) return;
         this.#needsKeyframe = false;
+        // This ACK is a DECODE-INPUT credit, not a presentation receipt.
+        // The server may now send the next frame, even if Safari holds this
+        // decoded output until subsequent input arrives.
+        this.send({ type: 'frame_ack', epoch, frame_id: id });
       } catch (error) { this.#recover(error, token); }
     });
   }
 
   #present(frame, token, ws) {
-    const pending = this.#pendingFrame, timestamp = frame.timestamp;
+    const timestamp = frame.timestamp;
+    const pending = this.#pendingFrames.get(timestamp);
     let error = null;
     try {
       if (this.#destroyed || token !== this.#decoderToken || this.#ws !== ws || !pending || timestamp !== pending.timestamp) return;
@@ -195,11 +213,8 @@ export class SimStream {
     } catch (failure) { error = failure; }
     finally {
       frame.close();
-      if (token === this.#decoderToken && this.#ws === ws && this.#pendingFrame === pending && pending && timestamp === pending.timestamp) {
-        this.#pendingFrame = null;
-        // ACK only after decode + drawing + close. Generation/frame identity
-        // stops delayed outputs from acknowledging a replacement encoder.
-        this.send({ type: 'frame_ack', epoch: pending.epoch, frame_id: pending.id, ...(error ? { decode_error: true } : {}) });
+      if (token === this.#decoderToken && this.#ws === ws && pending && this.#pendingFrames.get(timestamp) === pending) {
+        this.#pendingFrames.delete(timestamp);
       }
     }
     if (error) this.#recover(error, token);

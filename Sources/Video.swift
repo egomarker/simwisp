@@ -108,7 +108,10 @@ final class H264Encoder {
             let length = CMBlockBufferGetDataLength(block)
             guard length > 0, length < 16_000_000,
                   let atoms = CMFormatDescriptionGetExtension(format, extensionKey: kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms) as? [String: Any],
-                  let description = atoms["avcC"] as? Data, description.count >= 7 else { outputLock.withLock { outputError = -2 }; return }
+                  let rawDescription = atoms["avcC"] as? Data, rawDescription.count >= 7 else { outputLock.withLock { outputError = -2 }; return }
+            let description: Data
+            do { description = try H264SPS.lowLatencyAVCC(rawDescription) }
+            catch { outputLock.withLock { outputError = -3 }; return }
             var data = Data(count: length)
             let copied = data.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }
             guard copied == noErr else { outputLock.withLock { outputError = copied }; return }
