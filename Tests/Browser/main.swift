@@ -63,7 +63,8 @@ func vectors(_ rep: NSBitmapImageRep) throws -> [H264Frame] {
 let androidVideo = try vectors(rep), iosVideo = try vectors(iosRep)
 final class FixtureStream {
     let id: String, client: ClientConnection, monitor: AccessibilitySession
-    var timer: DispatchSourceTimer?, frames = 0, inputs = 0, paused = false, pendingFrame = false, ready = false
+    var timer: DispatchSourceTimer?, frames = 0, inputs = 0, paused = false, sending = false, ready = false, closed = false
+    var flow = StreamFlow(fps: 60, quality: 70), feedbacks = 0
     var epoch: UInt32 = 1, cursor = 0
     var lastInputs: [[String:Any]] = []
     init(id: String, client: ClientConnection) {
@@ -71,34 +72,48 @@ final class FixtureStream {
         monitor=AccessibilitySession(serial:id,platform:id.hasPrefix("emulator-") ? "android" : "ios",executable:useRealADB ? realADB : fakeADB,queue:server.queue,lifecycle:lifecycle) { [weak client] value, done in client?.sendJSON(value,completion:done) }
         client.onMessage={ [weak self] value in self?.message(dictionary(Data(value.utf8))) }
         client.onClose={ [weak self] in self?.stop() }
-        client.sendJSON(["type":"input_capabilities","live_touch":true]);client.sendJSON(["type":"rotated","landscape":false])
-        let t=DispatchSource.makeTimerSource(queue:server.queue);t.schedule(deadline:.now(),repeating:1.0/60);t.setEventHandler { [weak self] in
-            guard let self,self.ready,!self.paused,!self.pendingFrame else{return}
+        client.sendJSON(["type":"input_capabilities","live_touch":true,"video_flow":"paced-v1"]);client.sendJSON(["type":"rotated","landscape":false])
+        let t=DispatchSource.makeTimerSource(queue:server.queue);t.schedule(deadline:.now());t.setEventHandler { [weak self] in
+            guard let self,!self.closed else{return}
+            defer {self.reschedule()}
+            if self.ready && !self.paused && self.flow.unresponsive(now:monotonic()) {self.client.close();return}
+            guard self.ready,!self.paused,!self.sending,self.flow.beginFrame(now:monotonic()) else{return}
             let values = self.id.hasPrefix("emulator-") ? androidVideo : iosVideo
             let source = values[self.cursor]
             let frame = H264Frame(payload: source.payload, description: source.description, codec: source.codec, keyframe: source.keyframe, timestamp: UInt64(self.frames+1)*16667, width: source.width, height: source.height, codedWidth: source.codedWidth, codedHeight: source.codedHeight)
+            guard self.flow.canSend(bytes:frame.payload.count+24) else {self.flow.deferSend(bytes:frame.payload.count+24,now:monotonic());self.resetVideo();return}
             self.cursor = (self.cursor+1)%values.count
-            self.pendingFrame=true;self.frames+=1
+            self.sending=true;self.frames+=1
+            _ = self.flow.recordSend(epoch:self.epoch,id:UInt32(self.frames),bytes:frame.payload.count+24,now:monotonic())
             if frame.keyframe {self.client.sendJSON(frame.configuration(epoch:self.epoch))}
-            self.client.sendBinary(frame.packet(epoch:self.epoch,id:UInt32(self.frames)))
+            self.client.sendBinary(frame.packet(epoch:self.epoch,id:UInt32(self.frames))) { [weak self] in
+                guard let self,!self.closed else{return};self.sending=false;self.reschedule()
+            }
         };t.resume();timer=t
     }
-    func resetVideo() {epoch &+= 1;cursor=0;pendingFrame=false}
+    func reschedule() {
+        guard !closed else{return}
+        let now=monotonic(),deadline=ready && !paused && !sending && flow.hasCapacity ? min(now+0.25,max(now,flow.nextFrame)) : now+0.25
+        timer?.schedule(deadline:.now()+max(0.0001,deadline-now),leeway:.microseconds(100))
+    }
+    func resetVideo() {epoch &+= 1;cursor=0}
     func message(_ m: [String:Any]) {
+        guard !closed else{return};defer {reschedule()}
         let type=m["type"] as? String
-        if type == "video_ready" {ready=true}
-        else if type == "video_keyframe" {resetVideo()}
-        else if type == "frame_ack" {
-            guard (m["epoch"] as? NSNumber)?.uint32Value == epoch, (m["frame_id"] as? Int) == frames else{return}
-            pendingFrame=false
-            if m["decode_error"] as? Bool == true {resetVideo()}
+        if type == "video_ready" {ready=m["flow"] as? String == "paced-v1"}
+        else if type == "video_keyframe" {
+            if let e=m["epoch"] as? NSNumber,e.doubleValue != Double(epoch) {return}
+            if m["overloaded"] as? Bool == true {flow.congested(now:monotonic())}
+            resetVideo()
+        } else if type == "video_feedback" {
+            if let feedback=StreamFeedback(m),flow.feedback(feedback,currentEpoch:epoch,now:monotonic()) {feedbacks+=1}
         } else if type == "settings" {
             if let p=m["stream_paused"] as? Bool,p != paused {paused=p;resetVideo()}
             monitor.update(paneOpen:m["accessibility_enabled"] as? Bool,streamActive:!paused,subscription:m["accessibility_subscription"] as? Int)
         } else {inputs+=1;lastInputs.append(m);if lastInputs.count>16 {lastInputs.removeFirst()}}
     }
-    func stop() {monitor.stop();timer?.cancel();timer=nil;if registry[id] === self {registry.removeValue(forKey:id)}}
-    var snapshot: [String:Any] {["id":id,"frames":frames,"inputs":inputs,"last_inputs":lastInputs,"paused":paused,"codec":"h264","epoch":epoch,"accessibility":monitor.snapshot]}
+    func stop() {guard !closed else{return};closed=true;monitor.stop();timer?.cancel();timer=nil;if registry[id] === self {registry.removeValue(forKey:id)}}
+    var snapshot: [String:Any] {["id":id,"frames":frames,"inputs":inputs,"last_inputs":lastInputs,"paused":paused,"codec":"h264","epoch":epoch,"feedbacks":feedbacks,"unreceived_frames":flow.count,"unreceived_bytes":flow.bytes,"accessibility":monitor.snapshot]}
 }
 let sims:[[String:Any]] = [["id":"emulator-5554","name":"Pixel 6 API 36","platform":"android","width":405,"height":900], ["id":"ios-fixture","name":"iPhone 11","platform":"ios","width":414,"height":896], ["id":"emulator-5556","name":"Pixel second emulator","platform":"android","width":405,"height":900]]
 server.authorize={ request in request.headers["cookie"]?.contains("fixture=paired") == true }

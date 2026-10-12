@@ -11,13 +11,13 @@ cleanup() {
   fi
   if [[ -n "${TEST_OUTPUT:-}" ]]; then
     mkdir -p "$TEST_OUTPUT"
-    cp "$root"/*.png "$root"/browser-review*.json "$TEST_OUTPUT"/ 2>/dev/null || true
+    cp "$root"/*.png "$root"/browser-review*.json "$root"/transport-review.json "$TEST_OUTPUT"/ 2>/dev/null || true
     cp "$root"/fixture.log "$TEST_OUTPUT"/fixture.log
   fi
   rm -rf "$root"
 }
 trap cleanup EXIT
-xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/Accessibility.swift Sources/HTTPServer.swift Sources/SocketTransport.swift Sources/TLS.swift Sources/Video.swift Tests/Browser/main.swift -o "$root/fixture"
+xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/Accessibility.swift Sources/HTTPServer.swift Sources/SocketTransport.swift Sources/TLS.swift Sources/H264SPS.swift Sources/Video.swift Sources/StreamFlow.swift Tests/Browser/main.swift -o "$root/fixture"
 "$root/fixture" "$root" > "$root/fixture.log" 2>&1 &
 fixture_pid=$!
 for ((i=0; i<100; i++)); do
@@ -27,3 +27,4 @@ for ((i=0; i<100; i++)); do
 done
 grep -q 'Isolated accessibility fixture ready' "$root/fixture.log" || { cat "$root/fixture.log" >&2; exit 1; }
 NODE_EXTRA_CA_CERTS="$root/tls/root.pem" "$NODE" Tests/Browser/accessibility-review.mjs "$root" "$@"
+NODE_EXTRA_CA_CERTS="$root/tls/root.pem" "$NODE" Tests/Streaming/transport.mjs "$root"

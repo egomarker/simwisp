@@ -16,8 +16,8 @@ final class CaptureHealth {
     func failed(_ message: String) { lock.withLock { fatal = message } }
 }
 
-// Native capture keeps only the newest complete frame. Encoding is pull-driven
-// by presentation ACKs, with one H.264 encoder and no encoded-frame cache per device.
+// Native capture keeps only the newest complete frame. Encoding is independently
+// paced, with one H.264 encoder and no encoded-frame cache per device.
 // Mutable frame state is lock-protected; encoding has its own serial lock.
 final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let target: DeviceWindow

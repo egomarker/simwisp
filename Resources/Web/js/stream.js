@@ -7,15 +7,22 @@ const DRAG_THRESHOLD  = 0.015;
 // Protect against hung decoders while allowing implementations to buffer output.
 const MAX_PENDING_FRAMES = 48;
 const MAX_DECODE_QUEUE = 16;
+const MAX_PENDING_BYTES = 8_388_608;
+const FEEDBACK_INTERVAL = 250;
+const OUTPUT_STALE = 2000;
+const RECOVERY_TIMEOUT = 3000;
 
 export class SimStream {
   #liveTouch = false;
   #twoFinger = false;
   #udid; #canvas; #ctx;
   #ws = null; #connectTimer = null; #reconnectTimer = null; #watchdog = null;
-  #lastFrameAt = 0; #firstFrame = false; #captureUnavailable = false;
+  #lastMessageAt = 0; #firstFrame = false; #captureUnavailable = false;
   #decoder = null; #decoderToken = 0; #videoConfig = null; #configuration = null;
-  #pendingFrames = new Map(); #needsKeyframe = true; #noFrameTimer = null; #destroyed = false;
+  #pendingFrames = new Map(); #pendingBytes = 0; #needsKeyframe = true; #noFrameTimer = null; #destroyed = false;
+  #feedbackTimer = null; #receivedEpoch = null; #receivedID = null;
+  #awaitingRecovery = false; #recoveryEpoch = null; #recoveryAt = 0;
+  #latestFrame = null; #renderRAF = 0; #lastRenderedTimestamp = -1;
   #portraitW; #portraitH; #isLandscape = false;
   #onStatus; #onFirstFrame; #onOrientationChange; #onRotateStart; #onRotateEnd;
   #onStats; #onAccessibility; #statsTimer = null;
@@ -79,7 +86,7 @@ export class SimStream {
     clearTimeout(this.#connectTimer);
     clearTimeout(this.#reconnectTimer);
     clearInterval(this.#watchdog);
-    clearInterval(this.#statsTimer);
+    clearInterval(this.#statsTimer); clearInterval(this.#feedbackTimer);
     if (this.#ws) { this.#ws.onclose = null; this.#ws.close(); this.#ws = null; }
   }
 
@@ -96,25 +103,47 @@ export class SimStream {
     this.#decoderToken++;
     if (this.#decoder && this.#decoder.state !== 'closed') this.#decoder.close();
     this.#decoder = null; this.#configuration = null; this.#videoConfig = null;
-    this.#pendingFrames.clear(); this.#needsKeyframe = true;
+    this.#stats.dropped += this.#pendingFrames.size;
+    this.#pendingFrames.clear(); this.#pendingBytes = 0; this.#needsKeyframe = true;
+    if (this.#renderRAF) cancelAnimationFrame(this.#renderRAF);
+    this.#renderRAF = 0;
+    if (this.#latestFrame) { this.#latestFrame.frame.close(); this.#stats.dropped++; }
+    this.#latestFrame = null; this.#lastRenderedTimestamp = -1;
   }
 
   #unsupported(message) {
     this.#resetDecoder();
     clearTimeout(this.#noFrameTimer); clearTimeout(this.#connectTimer);
-    clearTimeout(this.#reconnectTimer); clearInterval(this.#watchdog); clearInterval(this.#statsTimer);
+    clearTimeout(this.#reconnectTimer); clearInterval(this.#watchdog); clearInterval(this.#statsTimer); clearInterval(this.#feedbackTimer);
     if (this.#ws) { this.#ws.onclose = null; this.#ws.close(); this.#ws = null; }
     this.#onStatus('unsupported', message);
   }
 
-  #recover(error, token = this.#decoderToken) {
-    if (token !== this.#decoderToken || this.#destroyed) return;
+  #recover(error, token = this.#decoderToken, overloaded = false) {
+    if (token !== this.#decoderToken || this.#destroyed || this.#awaitingRecovery) return;
     console.warn('H.264 decoder recovery:', error?.message ?? error);
-    this.#stats.dropped++;
+    const epoch = this.#videoConfig?.epoch;
+    if (!this.#pendingFrames.size && !this.#latestFrame) this.#stats.dropped++;
     this.#resetDecoder();
-    // Submitted frames have already released flow-control credits. Ask the
-    // server to start a fresh epoch instead of acknowledging a stale frame.
-    this.send({ type: 'video_keyframe' });
+    this.#awaitingRecovery = true; this.#recoveryEpoch = epoch ?? null; this.#recoveryAt = performance.now();
+    // Do not drop a random P frame and continue its dependent reference chain.
+    // Ignore old-epoch packets/configs until the server supplies a fresh IDR.
+    this.send({ type: 'video_keyframe', ...(epoch === undefined ? {} : { epoch }), overloaded });
+  }
+
+  #feedback(ws) {
+    if (this.#ws !== ws || ws.readyState !== WebSocket.OPEN || this.#destroyed) return;
+    const now = performance.now();
+    if (this.#awaitingRecovery && now - this.#recoveryAt > RECOVERY_TIMEOUT) { this.#connect(); return; }
+    const oldest = this.#pendingFrames.values().next().value;
+    const age = oldest ? Math.max(0, now - oldest.receivedAt) : 0;
+    if (this.settings.stream_paused !== true && !this.#awaitingRecovery && age > OUTPUT_STALE) {
+      this.#recover('H.264 decoder output stalled', this.#decoderToken, true);
+    }
+    if (this.#receivedEpoch === null || this.#receivedID === null) return;
+    this.send({ type: 'video_feedback', epoch: this.#receivedEpoch, frame_id: this.#receivedID,
+      pending_frames: this.#pendingFrames.size, decode_queue: Math.min(MAX_DECODE_QUEUE, this.#decoder?.decodeQueueSize ?? 0),
+      oldest_pending_ms: Math.min(60_000, this.#pendingFrames.size ? age : 0) });
   }
 
   #configureVideo(msg, ws) {
@@ -125,24 +154,31 @@ export class SimStream {
         msg.width > msg.coded_width || msg.height > msg.coded_height) {
       this.#recover('Invalid H.264 configuration'); return;
     }
-    if (this.#videoConfig?.epoch === msg.epoch && this.#videoConfig?.description === msg.description &&
-        this.#videoConfig.width === msg.width && this.#videoConfig.height === msg.height && this.#decoder?.state === 'configured') return;
+    if (this.#awaitingRecovery && msg.epoch === this.#recoveryEpoch) return;
+    if (this.#videoConfig?.epoch === msg.epoch && this.#videoConfig.description === msg.description &&
+        this.#videoConfig.codec === msg.codec && this.#videoConfig.width === msg.width && this.#videoConfig.height === msg.height &&
+        this.#videoConfig.coded_width === msg.coded_width && this.#videoConfig.coded_height === msg.coded_height && this.#configuration) return;
     this.#resetDecoder();
     const token = this.#decoderToken;
-    this.#videoConfig = msg;
-    const config = { codec: msg.codec, description: Uint8Array.from(atob(msg.description), c => c.charCodeAt(0)),
+    this.#videoConfig = msg; this.#awaitingRecovery = false; this.#recoveryEpoch = null;
+    let description;
+    try { description = Uint8Array.from(atob(msg.description), c => c.charCodeAt(0)); }
+    catch (error) { this.#recover(error, token); return; }
+    const config = { codec: msg.codec, description,
       codedWidth: msg.coded_width, codedHeight: msg.coded_height, optimizeForLatency: true, hardwareAcceleration: 'no-preference' };
     this.#configuration = VideoDecoder.isConfigSupported(config).then(support => {
       if (this.#destroyed || this.#ws !== ws || token !== this.#decoderToken) return false;
       if (!support.supported) { this.#unsupported('This browser cannot decode H.264 with WebCodecs. Use a current Chrome, Edge or Safari over trusted HTTPS.'); return false; }
       this.#decoder = new VideoDecoder({ output: frame => this.#present(frame, token, ws), error: error => this.#recover(error, token) });
       this.#decoder.configure(config);
+      // Keep probe-time payloads only in the bounded Map, not captured by an
+      // uncancellable promise callback for every packet. Reset frees them.
+      for (const pending of this.#pendingFrames.values()) this.#submit(pending, token, ws);
       return true;
     }).catch(error => { this.#recover(error, token); return false; });
   }
 
   #decodePacket(buffer, ws) {
-    if (this.settings.stream_paused === true) return;
     if (buffer.byteLength < 25 || buffer.byteLength > 16_000_024) { this.#recover('Invalid H.264 packet size'); return; }
     const view = new DataView(buffer);
     if (view.getUint32(0) !== 0x53575631 || view.getUint8(4) > 1 || view.getUint8(5) || view.getUint16(6)) {
@@ -151,48 +187,68 @@ export class SimStream {
     const epoch = view.getUint32(8), id = view.getUint32(12), timestamp = Number(view.getBigUint64(16));
     const keyframe = view.getUint8(4) === 1;
     if (!Number.isSafeInteger(timestamp)) { this.#recover('Invalid video timestamp'); return; }
+    // Receipt telemetry also retires old packets already queued before pause or
+    // recovery. It never authorizes drawing them or tunes a replacement epoch.
+    this.#receivedEpoch = epoch; this.#receivedID = id; this.#stats.bytes += buffer.byteLength;
+    if (this.settings.stream_paused === true || this.#awaitingRecovery) return;
     if (epoch !== this.#videoConfig?.epoch || !this.#configuration) {
-      this.#stats.dropped++; this.send({ type: 'frame_ack', epoch, frame_id: id, decode_error: true }); return;
+      this.#stats.dropped++;
+      if (!this.#videoConfig) this.#recover('Missing H.264 configuration');
+      return;
     }
-    if (this.#needsKeyframe && !keyframe) {
-      this.#recover('Missing initial H.264 keyframe'); return;
+    if (this.#needsKeyframe && !keyframe) { this.#recover('Missing initial H.264 keyframe'); return; }
+    if (this.#pendingFrames.size >= MAX_PENDING_FRAMES ||
+        (this.#pendingFrames.size && this.#pendingBytes + buffer.byteLength > MAX_PENDING_BYTES)) {
+      this.#recover('H.264 decoder backlog is overloaded', this.#decoderToken, true); return;
     }
-    if (this.#pendingFrames.size >= MAX_PENDING_FRAMES || this.#pendingFrames.has(timestamp)) {
-      this.#recover('H.264 decoder stopped producing output'); return;
-    }
+    if (this.#pendingFrames.has(timestamp)) { this.#recover('Duplicate H.264 timestamp'); return; }
     const token = this.#decoderToken;
-    this.#stats.bytes += buffer.byteLength; this.#lastFrameAt = Date.now();
-    this.#pendingFrames.set(timestamp, { epoch, id, timestamp });
-    // The server waits for a decode-input ACK. One packet may await the
-    // initial capability probe; subsequent video input is acknowledged as soon
-    // as the decoder accepts it, not when the output callback runs.
-    this.#configuration.then(ready => {
-      if (!ready || token !== this.#decoderToken || this.#ws !== ws || this.#destroyed) return;
-      try {
-        if (this.#decoder.decodeQueueSize >= MAX_DECODE_QUEUE) {
-          throw Error('H.264 decoder queue is overloaded');
-        }
-        this.#decoder.decode(new EncodedVideoChunk({
-          type: keyframe ? 'key' : 'delta',
-          timestamp,
-          data: new Uint8Array(buffer, 24),
-        }));
-        if (token !== this.#decoderToken || this.#ws !== ws) return;
-        this.#needsKeyframe = false;
-        // This ACK is a DECODE-INPUT credit, not a presentation receipt.
-        // The server may now send the next frame, even if Safari holds this
-        // decoded output until subsequent input arrives.
-        this.send({ type: 'frame_ack', epoch, frame_id: id });
-      } catch (error) { this.#recover(error, token); }
-    });
+    const pending = { epoch, id, timestamp, keyframe, data: new Uint8Array(buffer, 24), bytes: buffer.byteLength, receivedAt: performance.now() };
+    this.#pendingFrames.set(timestamp, pending);
+    this.#pendingBytes += buffer.byteLength;
+    // The first queued chunk must be a key, not every packet. A single support
+    // probe drains retained packets in wire order; configured decoders submit
+    // directly, without adding a promise and packet closure for every frame.
+    this.#needsKeyframe = false;
+    if (this.#decoder?.state === 'configured') this.#submit(pending, token, ws);
+  }
+
+  #submit(pending, token, ws) {
+    if (token !== this.#decoderToken || this.#ws !== ws || this.#destroyed || !pending.data) return;
+    const data = pending.data; pending.data = null;
+    try {
+      if (this.#decoder.decodeQueueSize >= MAX_DECODE_QUEUE) {
+        this.#recover('H.264 decoder queue is overloaded', token, true); return;
+      }
+      this.#decoder.decode(new EncodedVideoChunk({ type: pending.keyframe ? 'key' : 'delta', timestamp: pending.timestamp, data }));
+    } catch (error) { this.#recover(error, token); }
   }
 
   #present(frame, token, ws) {
-    const timestamp = frame.timestamp;
-    const pending = this.#pendingFrames.get(timestamp);
+    const pending = this.#pendingFrames.get(frame.timestamp);
+    let retained = false;
+    try {
+      if (this.#destroyed || token !== this.#decoderToken || this.#ws !== ws || !pending) return;
+      this.#pendingFrames.delete(frame.timestamp); this.#pendingBytes -= pending.bytes;
+      if (frame.timestamp <= this.#lastRenderedTimestamp || (this.#latestFrame && frame.timestamp <= this.#latestFrame.frame.timestamp)) {
+        this.#stats.dropped++; return;
+      }
+      if (this.#latestFrame) { this.#latestFrame.frame.close(); this.#stats.dropped++; }
+      this.#latestFrame = { frame, token, ws }; retained = true;
+      // Decode reference frames, but render only the newest available output.
+      // At most one VideoFrame survives until the next animation frame.
+      if (!this.#renderRAF) this.#renderRAF = requestAnimationFrame(() => this.#drawLatest());
+    } finally { if (!retained) frame.close(); }
+  }
+
+  #drawLatest() {
+    this.#renderRAF = 0;
+    const latest = this.#latestFrame; this.#latestFrame = null;
+    if (!latest) return;
+    const { frame, token, ws } = latest;
     let error = null;
     try {
-      if (this.#destroyed || token !== this.#decoderToken || this.#ws !== ws || !pending || timestamp !== pending.timestamp) return;
+      if (this.#destroyed || token !== this.#decoderToken || this.#ws !== ws || !this.#videoConfig) return;
       const { width, height } = this.#videoConfig;
       const landscape = width > height, pw = Math.min(width, height), ph = Math.max(width, height);
       if (pw !== this.#portraitW || ph !== this.#portraitH) {
@@ -201,9 +257,9 @@ export class SimStream {
         this.send({ type: 'settings', dev_w: width, dev_h: height });
         this.#onOrientationChange(width, height);
       } else { this.#setOrientation(landscape); }
-      // Odd capture sizes are padded by one pixel for 4:2:0; never show that padding.
+      // Odd capture sizes have even 4:2:0 padding; never show that padding.
       this.#ctx.drawImage(frame, 0, 0, width, height, 0, 0, this.#canvas.width, this.#canvas.height);
-      this.#stats.frames++; this.#lastFrameAt = Date.now();
+      this.#lastRenderedTimestamp = frame.timestamp; this.#stats.frames++;
       if (!this.#firstFrame || this.#captureUnavailable) {
         const first = !this.#firstFrame;
         this.#firstFrame = true; this.#captureUnavailable = false;
@@ -211,12 +267,7 @@ export class SimStream {
         if (first) this.#onFirstFrame();
       }
     } catch (failure) { error = failure; }
-    finally {
-      frame.close();
-      if (token === this.#decoderToken && this.#ws === ws && pending && this.#pendingFrames.get(timestamp) === pending) {
-        this.#pendingFrames.delete(timestamp);
-      }
-    }
+    finally { frame.close(); }
     if (error) this.#recover(error, token);
   }
 
@@ -225,13 +276,15 @@ export class SimStream {
     // messages can precede native handlers; capabilities confirm binding.
     this.send({ type: 'settings', ...this.settings, stream_paused: this.settings.stream_paused === true,
       accessibility_enabled: this.settings.accessibility_enabled === true, accessibility_subscription: this.settings.accessibility_subscription ?? 0 });
-    this.send({ type: 'video_ready' });
+    this.send({ type: 'video_ready', flow: 'paced-v1' });
   }
 
   #connect() {
     if (this.#destroyed) return;
     clearTimeout(this.#connectTimer); clearTimeout(this.#reconnectTimer); clearTimeout(this.#noFrameTimer);
-    this.#resetDecoder();
+    clearInterval(this.#feedbackTimer); this.#feedbackTimer = null;
+    this.#awaitingRecovery = false; this.#recoveryEpoch = null; this.#receivedEpoch = null; this.#receivedID = null;
+    this.#lastMessageAt = Date.now(); this.#resetDecoder();
     if (this.#ws) { this.#ws.onclose = null; this.#ws.close(); }
     if (!globalThis.isSecureContext || typeof VideoDecoder === 'undefined' || typeof EncodedVideoChunk === 'undefined') {
       this.#unsupported('H.264 requires WebCodecs in a secure context. Trust the public Simwisp local CA and open the HTTPS link in a current Chrome, Edge or Safari.'); return;
@@ -252,18 +305,22 @@ export class SimStream {
     ws.onopen = () => {
       if (this.#ws !== ws || this.#destroyed) return;
       clearTimeout(this.#connectTimer); this.#onStatus('connected');
+      clearInterval(this.#feedbackTimer);
+      this.#feedbackTimer = setInterval(() => this.#feedback(ws), FEEDBACK_INTERVAL);
       this.#sessionReady();
       this.#noFrameTimer = setTimeout(() => { if (!this.#firstFrame) this.#onStatus('no-frames'); }, NO_FRAME_WARN);
     };
     ws.onclose = () => {
       if (this.#ws !== ws || this.#destroyed) return;
-      clearTimeout(this.#connectTimer); clearTimeout(this.#noFrameTimer); this.#resetDecoder();
+      clearTimeout(this.#connectTimer); clearTimeout(this.#noFrameTimer);
+      clearInterval(this.#feedbackTimer); this.#feedbackTimer = null; this.#resetDecoder();
       this.#onStatus('reconnecting');
       this.#reconnectTimer = setTimeout(() => this.#connect(), RECONNECT_DELAY);
     };
     ws.onerror = () => ws.close();
     ws.onmessage = e => {
       if (this.#ws !== ws || this.#destroyed) return;
+      this.#lastMessageAt = Date.now();
       if (typeof e.data !== 'string') {
         if (e.data instanceof ArrayBuffer) this.#decodePacket(e.data, ws);
         return;
@@ -275,13 +332,14 @@ export class SimStream {
         } else if (msg.type === 'accessibility_status' || msg.type === 'accessibility_event') {
           if (this.settings.accessibility_enabled === true && this.settings.stream_paused !== true) this.#onAccessibility(msg);
         } else if (msg.type === 'input_capabilities') {
+          if (msg.video_flow !== 'paced-v1') { this.#unsupported('Streaming protocol updated; update the app and reload this page.'); return; }
           this.#liveTouch = msg.live_touch === true;
           this.#sessionReady();
         } else if (msg.type === 'capture_error' || msg.type === 'input_error') {
           console.warn('Simwisp:', msg.message);
           if (msg.type === 'capture_error') { this.#captureUnavailable = true; this.#resetDecoder(); this.#onStatus('no-frames'); }
         } else if (msg.type === 'frame_heartbeat') {
-          this.#lastFrameAt = Date.now();
+          this.#lastMessageAt = Date.now();
         } else if (msg.type === 'rotated') {
           this.#setOrientation(typeof msg.landscape === 'boolean' ? msg.landscape : !this.#isLandscape);
           this.#onRotateEnd(true);
@@ -294,7 +352,7 @@ export class SimStream {
     };
     clearInterval(this.#watchdog);
     this.#watchdog = setInterval(() => {
-      if (this.#ws?.readyState === WebSocket.OPEN && this.#lastFrameAt > 0 && Date.now() - this.#lastFrameAt > WATCHDOG_STALE) this.#connect();
+      if (this.#ws?.readyState === WebSocket.OPEN && this.#lastMessageAt > 0 && Date.now() - this.#lastMessageAt > WATCHDOG_STALE) this.#connect();
     }, WATCHDOG_POLL);
     clearInterval(this.#statsTimer);
     this.#statsTimer = setInterval(() => {

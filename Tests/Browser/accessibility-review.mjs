@@ -55,12 +55,12 @@ try{
  ws.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.id&&pending.has(m.id)){const p=pending.get(m.id);clearTimeout(p.timer);pending.delete(m.id);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result)}else if(m.method==='Runtime.exceptionThrown')exceptions.push(m.params)});
  await cdp('Page.enable');await cdp('Runtime.enable');await cdp('Network.enable');
  await cdp('Network.setCookie',{name:'fixture',value:'paired',url:base,httpOnly:true,sameSite:'Strict',secure:true});
- await cdp('Page.addScriptToEvaluateOnNewDocument',{source:`window.__video={created:0,closed:0,outputs:0,frameCloses:0,live:0,maxQueue:0,ackBeforeClose:false,packets:0,deltas:0};const RealDecoder=VideoDecoder;window.VideoDecoder=class extends RealDecoder{constructor(init){super({...init,output:f=>{window.__video.outputs++;window.__video.live++;init.output(f)}});window.__video.created++}decode(chunk){super.decode(chunk);window.__video.maxQueue=Math.max(window.__video.maxQueue,this.decodeQueueSize)}close(){window.__video.closed++;super.close()}};const closeFrame=VideoFrame.prototype.close;VideoFrame.prototype.close=function(){window.__video.live--;window.__video.frameCloses++;return closeFrame.call(this)};window.__wire={settings:[],inputs:[],acks:0,sockets:[]};const Real=WebSocket;window.WebSocket=class extends Real{constructor(...args){super(...args);window.__wire.sockets.push(this);this.addEventListener('message',e=>{if(e.data instanceof ArrayBuffer&&e.data.byteLength>=24){const v=new DataView(e.data);if(v.getUint32(0)===0x53575631){window.__video.packets++;if(v.getUint8(4)===0)window.__video.deltas++}}})}send(data){try{const m=JSON.parse(data);if(m.type==='settings'){window.__wire.settings.push(m);if(window.__wire.settings.length>128)window.__wire.settings.shift()}else if(m.type==='frame_ack'){window.__wire.acks++;if(!m.decode_error&&window.__video.live!==0)window.__video.ackBeforeClose=true}else if(!['video_ready','video_keyframe'].includes(m.type)){window.__wire.inputs.push(m);if(window.__wire.inputs.length>128)window.__wire.inputs.shift()}}catch{}return super.send(data)}};`});
+ await cdp('Page.addScriptToEvaluateOnNewDocument',{source:`window.__video={created:0,closed:0,outputs:0,frameCloses:0,live:0,maxQueue:0,ackBeforeClose:false,packets:0,deltas:0};const RealDecoder=VideoDecoder;window.VideoDecoder=class extends RealDecoder{constructor(init){super({...init,output:f=>{window.__video.outputs++;window.__video.live++;init.output(f)}});window.__video.created++}decode(chunk){super.decode(chunk);window.__video.maxQueue=Math.max(window.__video.maxQueue,this.decodeQueueSize)}close(){window.__video.closed++;super.close()}};const closeFrame=VideoFrame.prototype.close;VideoFrame.prototype.close=function(){window.__video.live--;window.__video.frameCloses++;return closeFrame.call(this)};window.__wire={settings:[],inputs:[],acks:0,feedbacks:0,sockets:[]};window.__feedbackDelay=0;const Real=WebSocket;window.WebSocket=class extends Real{constructor(...args){super(...args);window.__wire.sockets.push(this);this.addEventListener('message',e=>{if(e.data instanceof ArrayBuffer&&e.data.byteLength>=24){const v=new DataView(e.data);if(v.getUint32(0)===0x53575631){window.__video.packets++;if(v.getUint8(4)===0)window.__video.deltas++}}})}send(data){try{const m=JSON.parse(data);if(m.type==='settings'){window.__wire.settings.push(m);if(window.__wire.settings.length>128)window.__wire.settings.shift()}else if(m.type==='frame_ack'){window.__wire.acks++}else if(m.type==='video_feedback'){window.__wire.feedbacks++;if(window.__feedbackDelay){setTimeout(()=>{if(this.readyState===1)Real.prototype.send.call(this,data)},window.__feedbackDelay);return}}else if(!['video_ready','video_keyframe'].includes(m.type)){window.__wire.inputs.push(m);if(window.__wire.inputs.length>128)window.__wire.inputs.shift()}}catch{}return super.send(data)}};`});
  await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({real:false})});
  const sizes=[{name:'desktop',w:1440,h:1000,m:false},{name:'phone',w:390,h:844,m:true},{name:'small-phone',w:320,h:568,m:true},{name:'short-phone',w:375,h:500,m:true},{name:'landscape-phone',w:844,h:390,m:true}];
  for(const size of sizes){
   await navigate(size.w,size.h,size.m);
-  await check(size.name+' real H.264 WebCodecs output over secure HTTPS',"isSecureContext&&location.protocol==='https:'&&window.__video.outputs>0&&window.__video.frameCloses===window.__video.outputs&&!window.__video.ackBeforeClose&&window.__video.maxQueue<=1&&window.__wire.sockets[0].url.startsWith('wss:')");
+  await check(size.name+' real H.264 WebCodecs output over secure HTTPS',"isSecureContext&&location.protocol==='https:'&&window.__video.outputs>0&&window.__video.outputs-window.__video.frameCloses<=1&&window.__video.live<=1&&window.__wire.acks===0&&window.__video.maxQueue<=16&&window.__wire.sockets[0].url.startsWith('wss:')");
 
   await check(size.name+' logo tagline removed',"!document.querySelector('.brand-caption')&&!document.querySelector('.sidebar-logo').textContent.includes('A little closer to your app')");
   await check(size.name+' no bottom bar or Controlling label',"!document.querySelector('#focus-summary')&&!document.querySelector('#bottom-tab-bar')&&!document.querySelector('#tab-terminal')");
@@ -137,6 +137,17 @@ try{
   await check(size.name+' close clears diagnostic/speech content',`document.querySelector('.accessibility-pane').hidden&&document.querySelector('.a11y-details').childElementCount===0`);
   await closeStreams();
  }
+
+ // Delaying cumulative telemetry does not impose a round trip per frame.
+ await navigate(1440,1000,false);await evaluate('window.__feedbackDelay=400');await delay(900);
+ const pacedBefore=(await status()).sessions.find(s=>s.id==='emulator-5554');
+ await delay(1000);const pacedAfter=(await status()).sessions.find(s=>s.id==='emulator-5554');
+ report.independentStreaming={feedbackDelayMS:400,framesInOneSecond:pacedAfter.frames-pacedBefore.frames,realNetworkDelay:false};
+ await nativeCheck('Paced stream continues above45fps with400ms delayed telemetry',async()=>pacedAfter.frames-pacedBefore.frames>=45&&pacedAfter.unreceived_frames<=120);
+ await check('Streaming uses periodic feedback and zero per-frame ACKs','window.__wire.feedbacks>0&&window.__wire.acks===0');
+ await pointerClick('[data-action=home]');
+ await nativeCheck('Input remains independent of delayed video telemetry',async()=>(await status()).sessions.find(s=>s.id==='emulator-5554').last_inputs.at(-1)?.type==='home');
+ await evaluate('window.__feedbackDelay=0');await closeStreams();
 
  // User sizing preferences are local to this private test browser/device.
  await navigate(1440,1000,false);await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
@@ -393,7 +404,7 @@ try{
  }
  await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({terminal:false})});
 
- await check('H.264 dependent delta access units decoded',"window.__video.deltas>0&&window.__video.outputs>10&&window.__video.maxQueue<=1&&!window.__video.ackBeforeClose");
+ await check('Dependent H.264 access units decode with bounded queue and zero frame ACKs',"window.__video.deltas>0&&window.__video.outputs>10&&window.__video.maxQueue<=16&&window.__wire.acks===0");
  await check('Final stream close releases all decoders and output frames',"window.__video.closed===window.__video.created&&window.__video.live===0&&window.__video.frameCloses===window.__video.outputs");
  report.webCodecs=await evaluate('window.__video');
  report.browserExceptions=exceptions.length;report.passed=report.checks.every(c=>c.passed)&&exceptions.length===0;

@@ -15,27 +15,23 @@ final class StreamSession: @unchecked Sendable {
     private var configuring = false
     private var encoding = false
     private var closed = false
-    private var awaitingACK: Double?
     private var sending = false
+    private var sendStarted: Double?
+    private var flow: StreamFlow
     private var paused = false
     private var dataSaver = false
-    private var fps: Int
-    private var targetFPS: Int
-    private var quality: Int
-    private var targetQuality: Int
+    private var fps: Int { flow.fps }
+    private var quality: Int { flow.quality }
     private var nextFrame: Double = 0
     private var lastStats: Double = 0
     private var lastHeartbeat: Double = 0
     private var videoReady = false
     private var videoEpoch: UInt32 = 1
     private var wireFrameID: UInt32 = 0
-    private var awaitingFrameID: UInt32?
     private var forceKeyframe = true
     private var frameCount = 0
-    private var goodFrames = 0
     private var lastError: String?
     private var lastEncodeMS: Double = 0
-    private var lastACKMS: Double = 0
     private var pendingInput: [[String: Any]] = []
     private var inputBusy = false
     private var captureHasFrame = false
@@ -44,8 +40,7 @@ final class StreamSession: @unchecked Sendable {
     var onClose: (() -> Void)?
     init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup) {
         self.id = id; self.client = client; self.devices = devices; self.input = input; self.queue = queue; self.lifecycle = lifecycle
-        fps = min(60, max(1, Int(request.query["fps"] ?? "") ?? settings.fps)); targetFPS = fps
-        quality = min(95, max(1, Int(request.query["quality"] ?? "") ?? settings.quality)); targetQuality = quality
+        flow = StreamFlow(fps: Int(request.query["fps"] ?? "") ?? settings.fps, quality: Int(request.query["quality"] ?? "") ?? settings.quality)
         dataSaver = request.query["data_saver"] == "1"
         worker = DispatchQueue(label: "Simwisp.encode.\(id)", qos: .userInitiated)
         accessibility = AccessibilitySession(serial: id, platform: devices.device(id)?.platform ?? "ios", executable: devices.adb, queue: queue, lifecycle: lifecycle) { [weak client] value, completion in client?.sendJSON(value, completion: completion) }
@@ -60,24 +55,24 @@ final class StreamSession: @unchecked Sendable {
     func start() {
         client.onMessage = { [weak self] text in self?.message(dictionary(Data(text.utf8))) }
         client.onClose = { [weak self] in self?.stop() }
-        client.sendJSON(["type": "input_capabilities", "live_touch": true])
+        client.sendJSON(["type": "input_capabilities", "live_touch": true, "video_flow": "paced-v1"])
         if let window = devices.window(id) { client.sendJSON(["type": "rotated", "landscape": window.landscape]) }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), leeway: .microseconds(100))
         timer.setEventHandler { [weak self] in self?.tick() }; timer.resume(); self.timer = timer
     }
     var snapshot: [String: Any] {
-        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (capture == nil ? "Starting" : "Streaming")), "uptime": Int(monotonic() - started), "capture_counters": capture?.counters ?? [:], "last_encode_ms": lastEncodeMS, "last_ack_ms": lastACKMS, "accessibility": accessibility.snapshot]
+        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (capture == nil ? "Starting" : "Streaming")), "uptime": Int(monotonic() - started), "capture_counters": capture?.counters ?? [:], "last_encode_ms": lastEncodeMS, "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending, "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS, "accessibility": accessibility.snapshot]
     }
     // One-shot deadlines avoid quantizing 16.67 ms frames onto 16 ms polling
-    // ticks. ACK and encoder/send completions wake the same bounded scheduler.
+    // ticks. Local encode/write completions wake it; receiver RTT never gates
+    // each frame. Cumulative feedback only enforces a finite transport budget.
     private func reschedule() {
         guard !closed else { return }
         let now = monotonic()
         var deadline = now + 0.25
-        if videoReady && !paused && !configuring && !encoding && !sending {
-            if let sent = awaitingACK { deadline = min(deadline, sent + 0.35) }
-            else { deadline = min(deadline, max(now, nextFrame)) }
+        if videoReady && !paused && !configuring && !encoding && !sending && flow.hasCapacity {
+            deadline = min(deadline, max(now, max(nextFrame, flow.nextFrame)))
         }
         timer?.schedule(deadline: .now() + max(0.0001, deadline - now), leeway: .microseconds(100))
     }
@@ -87,6 +82,11 @@ final class StreamSession: @unchecked Sendable {
         let now = monotonic()
         if now - lastHeartbeat > 8 { client.sendJSON(["type": "frame_heartbeat"]); client.ping(); lastHeartbeat = now }
         guard videoReady else { nextFrame = now + 0.25; return }
+        if !paused && (flow.unresponsive(now: now) || sendStarted.map({ now - $0 > StreamFlow.receiptTimeout }) == true) {
+            // TCP cannot retract old bytes. Reconnect rather than retain seconds
+            // of stale video or an indefinitely blocked local write.
+            client.close(); return
+        }
         guard let window = devices.window(id) else {
             if capture != nil { releaseCapture() }
             notifyError("Device window unavailable"); nextFrame = now + 0.5; return
@@ -98,12 +98,9 @@ final class StreamSession: @unchecked Sendable {
             configure(window); return
         }
         guard !paused, !configuring, !encoding, !sending, let capture, now >= nextFrame else { return }
-        if let sent = awaitingACK {
-            if now - sent < 0.35 { return }
-            requestKeyframe(); fps = max(1, min(targetFPS, fps - 5)); quality = max(1, min(targetQuality, quality - 3)); goodFrames = 0
-            nextFrame = now + 1 / Double(fps); return
-        }
-        encoding = true; nextFrame = now + 1 / Double(fps)
+        if !flow.hasCapacity { flow.congested(now: now); return }
+        guard flow.beginFrame(now: now) else { return }
+        encoding = true
         let requestedQuality = quality, requestedFPS = fps, requestedKey = forceKeyframe, requestedSaver = dataSaver, epoch = videoEpoch
         worker.async { [weak self] in
             let encodeStart = monotonic()
@@ -117,14 +114,27 @@ final class StreamSession: @unchecked Sendable {
                 switch result {
                 case .success(let frame):
                     if let frame {
-                        // Configuration precedes every IDR, including timeout, resize,
-                        // resume and decoder-reset recovery. Epochs reject late ACKs.
+                        let packetBytes = frame.payload.count + 24
+                        guard self.flow.canSend(bytes: packetBytes) else {
+                            self.flow.deferSend(bytes: packetBytes, now: monotonic())
+                            // An encoded-but-unsent P frame changes the encoder's
+                            // references. Force an IDR before transmitting again.
+                            self.requestKeyframe(); return
+                        }
+                        // Configuration precedes every IDR. Epochs reject stale
+                        // decoder recovery and adaptation, not per-frame ACKs.
                         if frame.keyframe { self.client.sendJSON(frame.configuration(epoch: epoch)); self.forceKeyframe = false }
                         else if self.forceKeyframe { return }
                         self.wireFrameID &+= 1
-                        self.awaitingFrameID = self.wireFrameID
-                        self.sending = true; self.awaitingACK = monotonic(); self.frameCount += 1; self.lastError = nil; self.captureHasFrame = true
-                        self.client.sendBinary(frame.packet(epoch: epoch, id: self.wireFrameID)) { [weak self] in self?.sending = false; self?.reschedule() }
+                        let sentAt = monotonic()
+                        guard self.flow.recordSend(epoch: epoch, id: self.wireFrameID, bytes: packetBytes, now: sentAt) else { return }
+                        self.sending = true; self.sendStarted = sentAt; self.frameCount += 1; self.lastError = nil; self.captureHasFrame = true
+                        self.client.sendBinary(frame.packet(epoch: epoch, id: self.wireFrameID)) { [weak self] in
+                            guard let self, !self.closed else { return }
+                            self.sending = false; self.sendStarted = nil
+                            if monotonic() - sentAt > 0.1 { self.flow.congested(now: monotonic()) }
+                            self.reschedule()
+                        }
                         if monotonic() - self.lastStats >= 1 {
                             self.lastStats = monotonic(); self.client.sendJSON(["type": "server_stats", "codec": "h264", "fps": self.fps, "quality": self.quality, "frame_id": self.frameCount])
                         }
@@ -136,7 +146,9 @@ final class StreamSession: @unchecked Sendable {
         }
     }
     private func requestKeyframe() {
-        videoEpoch &+= 1; forceKeyframe = true; awaitingACK = nil; awaitingFrameID = nil
+        videoEpoch &+= 1; forceKeyframe = true
+        // Never erase outstanding transport debt on reset; delayed feedback
+        // from an older epoch can still retire already-delivered bytes.
     }
     private func configure(_ window: DeviceWindow) {
         configuring = true; requestKeyframe()
@@ -175,20 +187,21 @@ final class StreamSession: @unchecked Sendable {
         guard !closed, let type = data["type"] as? String else { return }
         defer { reconcileAccessibility(); reschedule() }
         if type == "video_ready" {
+            guard data["flow"] as? String == "paced-v1" else {
+                notifyError("Streaming protocol updated; reload the browser page."); return
+            }
             videoReady = true
         } else if type == "video_keyframe" {
+            if let epoch = data["epoch"] as? NSNumber, epoch.doubleValue != Double(videoEpoch) { return }
+            if data["overloaded"] as? Bool == true { flow.congested(now: monotonic()) }
             requestKeyframe()
-        } else if type == "frame_ack" {
-            guard (data["epoch"] as? NSNumber)?.uint32Value == videoEpoch, (data["frame_id"] as? NSNumber)?.uint32Value == awaitingFrameID else { return }
-            if let sent = awaitingACK {
-                let elapsed = monotonic() - sent; awaitingACK = nil; awaitingFrameID = nil; lastACKMS = elapsed * 1000
-                if data["decode_error"] as? Bool == true { requestKeyframe(); return }
-                if elapsed > 0.18 { fps = max(1, min(targetFPS, fps - 2)); quality = max(1, min(targetQuality, quality - 1)); goodFrames = 0 }
-                else { goodFrames += 1; if goodFrames >= 30 { goodFrames = 0; fps = min(targetFPS, fps + 2); quality = min(targetQuality, quality + 2) } }
-            }
+        } else if type == "video_feedback" {
+            guard let feedback = StreamFeedback(data) else { return }
+            _ = flow.feedback(feedback, currentEpoch: videoEpoch, now: monotonic())
         } else if type == "settings" {
-            if let n = data["fps"] as? NSNumber { targetFPS = Int(clamp(n.doubleValue, 1, 60)); fps = targetFPS }
-            if let n = data["quality"] as? NSNumber { targetQuality = Int(clamp(n.doubleValue, 1, 95)); quality = targetQuality }
+            let f = (data["fps"] as? NSNumber).flatMap { $0.doubleValue.isFinite ? Int(clamp($0.doubleValue, 1, 60)) : nil }
+            let q = (data["quality"] as? NSNumber).flatMap { $0.doubleValue.isFinite ? Int(clamp($0.doubleValue, 1, 95)) : nil }
+            if f != nil || q != nil { flow.settings(fps: f, quality: q, now: monotonic()) }
             if let value = data["data_saver"] as? Bool, value != dataSaver { dataSaver = value; requestKeyframe() }
             if let value = data["stream_paused"] as? Bool, value != paused { paused = value; requestKeyframe() }
             if let value = data["accessibility_enabled"] as? Bool { accessibility.update(paneOpen: value, streamActive: value && accessibilityStreamReady, subscription: data["accessibility_subscription"] as? Int) }

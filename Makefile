@@ -2,10 +2,11 @@ SHELL := /bin/bash
 APP := build/Simwisp.app
 SOURCES := $(wildcard Sources/*.swift)
 NODE ?= node
+TEST_BUILD ?= build/tests
 ARCH := $(shell uname -m)
 SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 
-.PHONY: build check test test-pairing test-accessibility test-input test-video test-sps test-decoder test-tls test-browser-accessibility run clean install
+.PHONY: build check test test-pairing test-accessibility test-input test-video test-sps test-stream-flow test-decoder test-tls test-browser-accessibility run clean install
 build:
 	@mkdir -p '$(APP)/Contents/MacOS' '$(APP)/Contents/Resources'
 	xcrun clang -O2 -Wall -Wextra -Werror -isysroot '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/TerminalHost.c -o '$(APP)/Contents/MacOS/SimwispShell'
@@ -19,19 +20,19 @@ build:
 	codesign --verify --deep --strict '$(APP)'
 check: build
 	@/usr/libexec/PlistBuddy -c 'Print :LSUIElement' '$(APP)/Contents/Info.plist'
-test: test-pairing test-accessibility test-input test-video
+test: test-pairing test-accessibility test-input test-video test-stream-flow
 test-pairing:
-	@mkdir -p build/tests
-	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Tests/main.swift -o build/tests/pairing-tests
-	@build/tests/pairing-tests
+	@mkdir -p '$(TEST_BUILD)'
+	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Tests/main.swift -o '$(TEST_BUILD)/pairing-tests'
+	@'$(TEST_BUILD)/pairing-tests'
 test-accessibility:
-	@mkdir -p build/tests
-	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/Accessibility.swift Tests/Accessibility/main.swift -o build/tests/accessibility-tests
-	@build/tests/accessibility-tests
+	@mkdir -p '$(TEST_BUILD)'
+	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/Accessibility.swift Tests/Accessibility/main.swift -o '$(TEST_BUILD)/accessibility-tests'
+	@'$(TEST_BUILD)/accessibility-tests'
 test-input:
-	@mkdir -p build/tests
-	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/Devices.swift Sources/Input.swift Tests/Input/main.swift -o build/tests/input-tests
-	@build/tests/input-tests
+	@mkdir -p '$(TEST_BUILD)'
+	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/Devices.swift Sources/Input.swift Tests/Input/main.swift -o '$(TEST_BUILD)/input-tests'
+	@'$(TEST_BUILD)/input-tests'
 test-sps:
 	@set -euo pipefail; exe=$$(mktemp /tmp/simwisp-sps-tests.XXXXXX); trap 'rm -f "$$exe"' EXIT; \
 	 xcrun swiftc -swift-version 5 -O Sources/H264SPS.swift Tests/Video/SPS/main.swift -o "$$exe"; \
@@ -41,6 +42,10 @@ test-video: test-sps
 	 xcrun swiftc -swift-version 5 -O -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/H264SPS.swift Sources/Video.swift Sources/TLS.swift Sources/Devices.swift Sources/Capture.swift Tests/Video/main.swift -o "$$root/video-tests"; \
 	 "$$root/video-tests" "$$root/results"; \
 	 if [[ -n "$${TEST_OUTPUT:-}" ]]; then mkdir -p "$$TEST_OUTPUT"; cp "$$root/results/video-review.json" "$$TEST_OUTPUT/"; fi
+test-stream-flow:
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-flow-tests.XXXXXX); trap 'rm -rf "$$root"' EXIT; \
+	 xcrun swiftc -swift-version 5 -O Sources/StreamFlow.swift Tests/Streaming/main.swift -o "$$root/flow-tests"; \
+	 "$$root/flow-tests"
 test-decoder:
 	NODE="$(NODE)" Tests/Video/run-decoder.sh
 test-tls:
