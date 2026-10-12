@@ -75,6 +75,8 @@ Collapsing the panel preserves tabs. Closing a tab terminates its shell and fore
 4. Choose **Open workspace**, or **Copy link** to open the **HTTPS** pairing link on another device.
 5. Select a running simulator from the sidebar. Use **Add simulator** to boot another device.
 
+Tap/click a device’s **FPS/bandwidth counter** to open live stream debug info: rendered FPS, requested cap, server target, bitrate quality, bandwidth, bytes per canvas draw, and total/per-second dropped frames. It updates from the existing stats callback without extra polling. Tap again, tap outside, use the close button, or press Escape to dismiss. The counter also works with Enter/Space. Server FPS is a target, not measured throughput; drops include superseded outputs and decoder resets, not just network loss.
+
 The default port is **4141**. Only one controlling browser connection is supported per device; a new connection replaces the previous one. Keep one controller per device to avoid competing reconnects.
 
 ### HTTPS and certificate trust

@@ -27,6 +27,17 @@ export class SimStream {
   #onStatus; #onFirstFrame; #onOrientationChange; #onRotateStart; #onRotateEnd;
   #onStats; #onAccessibility; #statsTimer = null;
   #stats = { frames: 0, bytes: 0, dropped: 0, lastFrames: 0, lastBytes: 0, fps: 0, bps: 0, avgFrame: 0 };
+  #timing = {
+    decodedOutputs: 0, latestFrameDrops: 0, rafCallbacks: 0,
+    lastOutputAt: null, lastRenderAt: null, lastRAFAt: null,
+    decodeLatencyTotal: 0, decodeLatencySamples: 0,
+    outputToRenderTotal: 0, outputToRenderSamples: 0,
+    receiveToRenderTotal: 0, receiveToRenderSamples: 0,
+    sampleAt: 0, lastDecodedOutputs: 0, lastRenderedFrames: 0, lastDroppedFrames: 0,
+    lastLatestFrameDrops: 0, lastRAFCallbacks: 0,
+    sample: { sampleMS: 0, decodedOutputFPS: 0, renderedFPS: 0, droppedFPS: 0, latestDropFPS: 0, rafFPS: 0,
+      receiveToOutputMS: null, outputToRenderMS: null, receiveToRenderMS: null },
+  };
   #serverStats = { fps: null, quality: null };
 
   constructor(
@@ -131,6 +142,61 @@ export class SimStream {
     this.send({ type: 'video_keyframe', ...(epoch === undefined ? {} : { epoch }), overloaded });
   }
 
+  #beginTimingSample(now) {
+    const timing = this.#timing;
+    timing.sampleAt = now;
+    timing.lastDecodedOutputs = timing.decodedOutputs;
+    timing.lastRenderedFrames = this.#stats.frames;
+    timing.lastDroppedFrames = this.#stats.dropped;
+    timing.lastLatestFrameDrops = timing.latestFrameDrops;
+    timing.lastRAFCallbacks = timing.rafCallbacks;
+    timing.decodeLatencyTotal = 0; timing.decodeLatencySamples = 0;
+    timing.outputToRenderTotal = 0; timing.outputToRenderSamples = 0;
+    timing.receiveToRenderTotal = 0; timing.receiveToRenderSamples = 0;
+  }
+
+  #sampleTiming(now) {
+    const timing = this.#timing;
+    const elapsed = Math.max(1, now - timing.sampleAt);
+    const rate = (current, previous) => Math.max(0, current - previous) * 1000 / elapsed;
+    timing.sample = {
+      sampleMS: Math.min(60_000, elapsed),
+      decodedOutputFPS: rate(timing.decodedOutputs, timing.lastDecodedOutputs),
+      renderedFPS: rate(this.#stats.frames, timing.lastRenderedFrames),
+      droppedFPS: rate(this.#stats.dropped, timing.lastDroppedFrames),
+      latestDropFPS: rate(timing.latestFrameDrops, timing.lastLatestFrameDrops),
+      rafFPS: rate(timing.rafCallbacks, timing.lastRAFCallbacks),
+      receiveToOutputMS: timing.decodeLatencySamples ? timing.decodeLatencyTotal / timing.decodeLatencySamples : null,
+      outputToRenderMS: timing.outputToRenderSamples ? timing.outputToRenderTotal / timing.outputToRenderSamples : null,
+      receiveToRenderMS: timing.receiveToRenderSamples ? timing.receiveToRenderTotal / timing.receiveToRenderSamples : null,
+    };
+    this.#beginTimingSample(now);
+  }
+
+  #clientTiming(now) {
+    const timing = this.#timing;
+    const age = value => value === null ? null : Math.min(60_000, Math.max(0, now - value));
+    return {
+      decoded_outputs: timing.decodedOutputs,
+      rendered_frames: this.#stats.frames,
+      dropped_frames: this.#stats.dropped,
+      latest_frame_drops: timing.latestFrameDrops,
+      raf_callbacks: timing.rafCallbacks,
+      sample_ms: timing.sample.sampleMS,
+      decoded_output_fps: timing.sample.decodedOutputFPS,
+      rendered_fps: timing.sample.renderedFPS,
+      dropped_fps: timing.sample.droppedFPS,
+      latest_drop_fps: timing.sample.latestDropFPS,
+      raf_fps: timing.sample.rafFPS,
+      receive_to_output_ms: timing.sample.receiveToOutputMS,
+      output_to_render_ms: timing.sample.outputToRenderMS,
+      receive_to_render_ms: timing.sample.receiveToRenderMS,
+      output_age_ms: age(timing.lastOutputAt),
+      render_age_ms: age(timing.lastRenderAt),
+      raf_age_ms: age(timing.lastRAFAt),
+    };
+  }
+
   #feedback(ws) {
     if (this.#ws !== ws || ws.readyState !== WebSocket.OPEN || this.#destroyed) return;
     const now = performance.now();
@@ -143,7 +209,8 @@ export class SimStream {
     if (this.#receivedEpoch === null || this.#receivedID === null) return;
     this.send({ type: 'video_feedback', epoch: this.#receivedEpoch, frame_id: this.#receivedID,
       pending_frames: this.#pendingFrames.size, decode_queue: Math.min(MAX_DECODE_QUEUE, this.#decoder?.decodeQueueSize ?? 0),
-      oldest_pending_ms: Math.min(60_000, this.#pendingFrames.size ? age : 0) });
+      oldest_pending_ms: Math.min(60_000, this.#pendingFrames.size ? age : 0),
+      client_timing: this.#clientTiming(now) });
   }
 
   #configureVideo(msg, ws) {
@@ -228,24 +295,33 @@ export class SimStream {
     const pending = this.#pendingFrames.get(frame.timestamp);
     let retained = false;
     try {
-      if (this.#destroyed || token !== this.#decoderToken || this.#ws !== ws || !pending) return;
+      if (this.#destroyed || token !== this.#decoderToken || this.#ws !== ws) return;
+      const outputAt = performance.now();
+      this.#timing.decodedOutputs++; this.#timing.lastOutputAt = outputAt;
+      if (!pending) return;
       this.#pendingFrames.delete(frame.timestamp); this.#pendingBytes -= pending.bytes;
+      this.#timing.decodeLatencyTotal += Math.min(60_000, Math.max(0, outputAt - pending.receivedAt));
+      this.#timing.decodeLatencySamples++;
       if (frame.timestamp <= this.#lastRenderedTimestamp || (this.#latestFrame && frame.timestamp <= this.#latestFrame.frame.timestamp)) {
         this.#stats.dropped++; return;
       }
-      if (this.#latestFrame) { this.#latestFrame.frame.close(); this.#stats.dropped++; }
-      this.#latestFrame = { frame, token, ws }; retained = true;
+      if (this.#latestFrame) {
+        this.#latestFrame.frame.close(); this.#stats.dropped++; this.#timing.latestFrameDrops++;
+      }
+      this.#latestFrame = { frame, token, ws, outputAt, receivedAt: pending.receivedAt }; retained = true;
       // Decode reference frames, but render only the newest available output.
       // At most one VideoFrame survives until the next animation frame.
-      if (!this.#renderRAF) this.#renderRAF = requestAnimationFrame(() => this.#drawLatest());
+      if (!this.#renderRAF) this.#renderRAF = requestAnimationFrame(at => this.#drawLatest(at));
     } finally { if (!retained) frame.close(); }
   }
 
-  #drawLatest() {
+  #drawLatest(rafAt = performance.now()) {
     this.#renderRAF = 0;
+    rafAt = Number.isFinite(rafAt) ? rafAt : performance.now();
+    this.#timing.rafCallbacks++; this.#timing.lastRAFAt = rafAt;
     const latest = this.#latestFrame; this.#latestFrame = null;
     if (!latest) return;
-    const { frame, token, ws } = latest;
+    const { frame, token, ws, outputAt, receivedAt } = latest;
     let error = null;
     try {
       if (this.#destroyed || token !== this.#decoderToken || this.#ws !== ws || !this.#videoConfig) return;
@@ -259,7 +335,13 @@ export class SimStream {
       } else { this.#setOrientation(landscape); }
       // Odd capture sizes have even 4:2:0 padding; never show that padding.
       this.#ctx.drawImage(frame, 0, 0, width, height, 0, 0, this.#canvas.width, this.#canvas.height);
+      const renderAt = performance.now();
       this.#lastRenderedTimestamp = frame.timestamp; this.#stats.frames++;
+      this.#timing.lastRenderAt = renderAt;
+      this.#timing.outputToRenderTotal += Math.min(60_000, Math.max(0, renderAt - outputAt));
+      this.#timing.outputToRenderSamples++;
+      this.#timing.receiveToRenderTotal += Math.min(60_000, Math.max(0, renderAt - receivedAt));
+      this.#timing.receiveToRenderSamples++;
       if (!this.#firstFrame || this.#captureUnavailable) {
         const first = !this.#firstFrame;
         this.#firstFrame = true; this.#captureUnavailable = false;
@@ -285,6 +367,10 @@ export class SimStream {
     clearInterval(this.#feedbackTimer); this.#feedbackTimer = null;
     this.#awaitingRecovery = false; this.#recoveryEpoch = null; this.#receivedEpoch = null; this.#receivedID = null;
     this.#lastMessageAt = Date.now(); this.#resetDecoder();
+    this.#timing.lastOutputAt = null; this.#timing.lastRenderAt = null; this.#timing.lastRAFAt = null;
+    this.#timing.sample = { sampleMS: 0, decodedOutputFPS: 0, renderedFPS: 0, droppedFPS: 0, latestDropFPS: 0, rafFPS: 0,
+      receiveToOutputMS: null, outputToRenderMS: null, receiveToRenderMS: null };
+    this.#beginTimingSample(performance.now());
     if (this.#ws) { this.#ws.onclose = null; this.#ws.close(); }
     if (!globalThis.isSecureContext || typeof VideoDecoder === 'undefined' || typeof EncodedVideoChunk === 'undefined') {
       this.#unsupported('H.264 requires WebCodecs in a secure context. Trust the public Simwisp local CA and open the HTTPS link in a current Chrome, Edge or Safari.'); return;
@@ -356,11 +442,18 @@ export class SimStream {
     }, WATCHDOG_POLL);
     clearInterval(this.#statsTimer);
     this.#statsTimer = setInterval(() => {
+      const now = performance.now();
       const frames = this.#stats.frames - this.#stats.lastFrames, bytes = this.#stats.bytes - this.#stats.lastBytes;
       this.#stats.lastFrames = this.#stats.frames; this.#stats.lastBytes = this.#stats.bytes;
       this.#stats.fps = frames; this.#stats.bps = bytes;
       this.#stats.avgFrame = frames ? bytes / frames : this.#stats.avgFrame;
-      this.#onStats({ fps: this.#stats.fps, bps: this.#stats.bps, avgFrame: this.#stats.avgFrame, dropped: this.#stats.dropped, serverFps: this.#serverStats.fps, serverQuality: this.#serverStats.quality, codec: 'h264' });
+      this.#sampleTiming(now);
+      const timing = this.#timing.sample;
+      this.#onStats({ fps: this.#stats.fps, bps: this.#stats.bps, avgFrame: this.#stats.avgFrame, dropped: this.#stats.dropped,
+        decodedFps: timing.decodedOutputFPS, rafFps: timing.rafFPS, latestDroppedPerSecond: timing.latestDropFPS,
+        receiveToOutputMs: timing.receiveToOutputMS, outputToRenderMs: timing.outputToRenderMS, receiveToRenderMs: timing.receiveToRenderMS,
+        pendingFrames: this.#pendingFrames.size, decodeQueue: Math.min(MAX_DECODE_QUEUE, this.#decoder?.decodeQueueSize ?? 0),
+        serverFps: this.#serverStats.fps, serverQuality: this.#serverStats.quality, codec: 'h264' });
     }, 1000);
   }
 

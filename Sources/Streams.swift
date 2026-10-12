@@ -62,7 +62,13 @@ final class StreamSession: @unchecked Sendable {
         timer.setEventHandler { [weak self] in self?.tick() }; timer.resume(); self.timer = timer
     }
     var snapshot: [String: Any] {
-        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (capture == nil ? "Starting" : "Streaming")), "uptime": Int(monotonic() - started), "capture_counters": capture?.counters ?? [:], "last_encode_ms": lastEncodeMS, "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending, "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS, "accessibility": accessibility.snapshot]
+        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios",
+         "peer": client.peer, "fps": fps, "quality": quality, "frames": frameCount,
+         "state": lastError ?? (paused ? "Paused" : (capture == nil ? "Starting" : "Streaming")),
+         "uptime": Int(monotonic() - started), "capture_counters": capture?.counters ?? [:], "last_encode_ms": lastEncodeMS,
+         "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending,
+         "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS,
+         "receiver_timing": flow.receiverTiming?.snapshot ?? NSNull(), "accessibility": accessibility.snapshot]
     }
     // One-shot deadlines avoid quantizing 16.67 ms frames onto 16 ms polling
     // ticks. Local encode/write completions wake it; receiver RTT never gates

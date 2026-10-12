@@ -40,6 +40,7 @@ const _pendingBoots = new Map(); // id → {name, platform}  (booting but not ye
 
 // udid → { stream, panelEl, frameEl, canvasEl, overlayEl, pillEl, dotEl, ro, appearMode }
 const simPanels = new Map();
+let statsPopover = null;
 let focusedUdid = null;
 
 // Terminal tabs: [{id, label, terminal, el}]
@@ -593,6 +594,7 @@ function removeSimPanel(udid, { silent = false } = {}) {
   const panel = simPanels.get(udid);
   if (!panel) return;
 
+  if (statsPopover?.panel === panel) closeStatsPopover();
   panel.accessibility?.setOpen(false);
   panel.stream?.destroy();
   panel.ro?.disconnect();
@@ -742,6 +744,7 @@ function updatePanelStatus(udid, status, message = null) {
   panel.accessibility?.setActive(active);
   if (panel.accessibility?.isOpen) panel.stream?.updateSettings({ accessibility_enabled: active, accessibility_subscription: panel.accessibility.subscription });
   panel.statusEl.textContent = ({ streaming: 'Live', connected: 'Ready', reconnecting: 'Reconnecting', 'no-frames': 'No frames', unsupported: 'Unsupported' })[status] || 'Connecting';
+  updateStatsPopover(panel);
   dotEl.className = 'status-dot';
   if (status === 'streaming' || status === 'connected') {
     dotEl.classList.add('connected');
@@ -793,15 +796,145 @@ function fmtRateCompact(bytesPerSecond) {
   return `${Math.round(bytesPerSecond)}B`;
 }
 
+// One non-modal debug popover. It reads the existing stats callback: no polling.
+function closeStatsPopover(restoreFocus = false) {
+  if (!statsPopover) return;
+  const { panel, element } = statsPopover;
+  statsPopover = null;
+  element.remove();
+  panel.statsEl.setAttribute('aria-expanded', 'false');
+  panel.statsEl.removeAttribute('aria-controls');
+  document.removeEventListener('pointerdown', dismissStatsPopover, true);
+  document.removeEventListener('focusin', dismissStatsPopover, true);
+  document.removeEventListener('keydown', statsPopoverKeydown, true);
+  document.removeEventListener('scroll', positionStatsPopover, true);
+  document.removeEventListener('visibilitychange', statsPopoverVisibility);
+  window.removeEventListener('resize', positionStatsPopover);
+  window.visualViewport?.removeEventListener('resize', positionStatsPopover);
+  window.visualViewport?.removeEventListener('scroll', positionStatsPopover);
+  if (restoreFocus && panel.statsEl.isConnected) panel.statsEl.focus({ preventScroll: true });
+}
+
+function dismissStatsPopover(event) {
+  if (statsPopover && !statsPopover.element.contains(event.target) && !statsPopover.panel.statsEl.contains(event.target)) closeStatsPopover();
+}
+
+function statsPopoverKeydown(event) {
+  if (event.key !== 'Escape') return;
+  event.preventDefault(); event.stopPropagation();
+  closeStatsPopover(true);
+}
+
+function statsPopoverVisibility() {
+  if (document.hidden) closeStatsPopover();
+}
+
+function positionStatsPopover(event) {
+  if (!statsPopover || (event?.target instanceof Node && statsPopover.element.contains(event.target))) return;
+  const { panel, element } = statsPopover;
+  const viewport = window.visualViewport;
+  const left = viewport?.offsetLeft ?? 0, top = viewport?.offsetTop ?? 0;
+  const width = viewport?.width ?? innerWidth, height = viewport?.height ?? innerHeight;
+  const anchor = panel.statsEl.getBoundingClientRect();
+  if (!panel.statsEl.isConnected || anchor.bottom < top || anchor.top > top + height || anchor.right < left || anchor.left > left + width) { closeStatsPopover(); return; }
+  element.style.width = Math.min(340, Math.max(0, width - 24)) + 'px';
+  // Keep the trigger uncovered, including short/keyboard-sized viewports.
+  const above = Math.max(0, anchor.top - top - 20);
+  const below = Math.max(0, top + height - anchor.bottom - 20);
+  const useAbove = above >= below;
+  element.style.maxHeight = Math.max(0, Math.min(height - 24, useAbove ? above : below)) + 'px';
+  const box = element.getBoundingClientRect();
+  element.style.left = Math.max(left + 12, Math.min(anchor.right - box.width, left + width - box.width - 12)) + 'px';
+  element.style.top = Math.max(top + 12, Math.min(useAbove ? anchor.top - box.height - 8 : anchor.bottom + 8, top + height - box.height - 12)) + 'px';
+}
+
+function updateStatsPopover(panel) {
+  if (statsPopover?.panel !== panel) return;
+  const stats = panel.statsSample;
+  const rate = value => Number.isFinite(value) ? value.toFixed(1) + ' fps' : '—';
+  const latency = value => Number.isFinite(value) ? value.toFixed(1) + ' ms' : '—';
+  const values = {
+    status: panel.statusEl.textContent,
+    rendered: stats ? stats.fps + ' fps' : '—',
+    decoded: rate(stats?.decodedFps),
+    raf: rate(stats?.rafFps),
+    requested: fpsSlider.value + ' fps',
+    target: stats?.serverFps == null ? '—' : stats.serverFps + ' fps',
+    decodeLatency: latency(stats?.receiveToOutputMs),
+    presentLatency: latency(stats?.outputToRenderMs),
+    clientLatency: latency(stats?.receiveToRenderMs),
+    backlog: stats && Number.isInteger(stats.pendingFrames) && Number.isInteger(stats.decodeQueue)
+      ? `${stats.pendingFrames} pending · ${stats.decodeQueue} queued` : '—',
+    quality: stats?.serverQuality == null ? '—' : String(stats.serverQuality),
+    bandwidth: stats ? fmtRate(stats.bps) : '—',
+    average: stats?.avgFrame > 0 ? (stats.avgFrame / 1024).toFixed(1) + ' KB' : '—',
+    dropped: stats ? String(stats.dropped) : '—',
+    dropRate: stats?.droppedPerSecond == null ? '—' : stats.droppedPerSecond.toFixed(1) + ' /s',
+    latestDropRate: Number.isFinite(stats?.latestDroppedPerSecond) ? stats.latestDroppedPerSecond.toFixed(1) + ' /s' : '—',
+  };
+  for (const [key, value] of Object.entries(values)) statsPopover.element.querySelector('[data-stat="' + key + '"]').textContent = value;
+}
+
+function toggleStatsPopover(panel) {
+  if (!panel) return;
+  if (statsPopover?.panel === panel) { closeStatsPopover(true); return; }
+  closeStatsPopover();
+  const element = document.createElement('section');
+  element.id = 'stream-stats-popover'; element.className = 'stats-popover';
+  element.setAttribute('role', 'dialog');
+  element.setAttribute('aria-labelledby', 'stream-stats-heading');
+  element.setAttribute('aria-describedby', 'stream-stats-note');
+  element.innerHTML = `<div class="stats-popover-header"><h2 id="stream-stats-heading">Stream debug · H.264</h2><button type="button" class="stats-popover-close" aria-label="Close stream debug info" title="Close">×</button></div>
+    <p class="stats-popover-device"></p><dl>
+      <dt>Status</dt><dd data-stat="status"></dd>
+      <dt>Rendered FPS</dt><dd data-stat="rendered"></dd>
+      <dt>Decoded output</dt><dd data-stat="decoded"></dd>
+      <dt>Render rAF</dt><dd data-stat="raf"></dd>
+      <dt>Requested cap</dt><dd data-stat="requested"></dd>
+      <dt>Server target</dt><dd data-stat="target"></dd>
+      <dt>Receive → output</dt><dd data-stat="decodeLatency"></dd>
+      <dt>Output → draw</dt><dd data-stat="presentLatency"></dd>
+      <dt>Receive → draw</dt><dd data-stat="clientLatency"></dd>
+      <dt>Decoder backlog</dt><dd data-stat="backlog"></dd>
+      <dt>Bitrate quality</dt><dd data-stat="quality"></dd>
+      <dt>Bandwidth</dt><dd data-stat="bandwidth"></dd>
+      <dt>Bytes / canvas draw</dt><dd data-stat="average"></dd>
+      <dt>Dropped total</dt><dd data-stat="dropped"></dd>
+      <dt>Dropped / second</dt><dd data-stat="dropRate"></dd>
+      <dt>Latest-only drops / second</dt><dd data-stat="latestDropRate"></dd>
+    </dl><span id="stream-stats-note" hidden>Latency values cover client receipt through canvas drawing; they exclude server and network time.</span>`;
+  element.querySelector('.stats-popover-device').textContent = panel.name;
+  element.querySelector('.stats-popover-close').addEventListener('click', () => closeStatsPopover(true));
+  statsPopover = { panel, element };
+  document.body.appendChild(element);
+  panel.statsEl.setAttribute('aria-controls', element.id);
+  panel.statsEl.setAttribute('aria-expanded', 'true');
+  updateStatsPopover(panel); positionStatsPopover();
+  document.addEventListener('pointerdown', dismissStatsPopover, true);
+  document.addEventListener('focusin', dismissStatsPopover, true);
+  document.addEventListener('keydown', statsPopoverKeydown, true);
+  document.addEventListener('scroll', positionStatsPopover, true);
+  document.addEventListener('visibilitychange', statsPopoverVisibility);
+  window.addEventListener('resize', positionStatsPopover);
+  window.visualViewport?.addEventListener('resize', positionStatsPopover);
+  window.visualViewport?.addEventListener('scroll', positionStatsPopover);
+  element.querySelector('.stats-popover-close').focus({ preventScroll: true });
+}
+
 function updatePanelStats(udid, stats) {
   const panel = simPanels.get(udid);
   if (!panel?.statsEl) return;
+  const at = performance.now(), previous = panel.statsSample;
+  const droppedPerSecond = previous && at > previous.at && stats.dropped >= previous.dropped
+    ? (stats.dropped - previous.dropped) * 1000 / (at - previous.at) : null;
+  panel.statsSample = { ...stats, at, droppedPerSecond };
   const quality = stats.serverQuality ?? parseInt(qualSlider.value);
   const serverFps = stats.serverFps ?? parseInt(fpsSlider.value);
   panel.statsEl.textContent = isMobileViewport()
     ? `${stats.fps}fps ${fmtRateCompact(stats.bps)}`
     : `${stats.fps} fps · ${fmtRate(stats.bps)} · q${quality}`;
-  panel.statsEl.title = `Rendered ${stats.fps} fps. H.264 server target ${serverFps} fps, bitrate quality ${quality}. Avg frame ${Math.round(stats.avgFrame / 1024 || 0)} KB. Dropped ${stats.dropped}.`;
+  panel.statsEl.title = `Rendered ${stats.fps} fps. H.264 server target ${serverFps} fps, bitrate quality ${quality}. Avg frame ${Math.round(stats.avgFrame / 1024 || 0)} KB. Dropped ${stats.dropped}. Tap for stream debug info.`;
+  updateStatsPopover(panel);
 }
 
 function updateStreamVisibility() {
@@ -818,7 +951,7 @@ function createPill(udid, name, platform) {
   pill.className = 'controls-pill';
   pill.innerHTML = `
     <div class="panel-telemetry"><span class="status-dot"></span><span class="panel-status">Connecting</span>
-      <span class="stream-stats" title="Stream stats">— fps · — KB/s</span>
+      <button type="button" class="stream-stats" data-action="stats" title="Show stream debug info" aria-haspopup="dialog" aria-expanded="false">— fps · — KB/s</button>
     </div>
     <div class="panel-actions" role="group" aria-label="Simulator controls">
     <button class="pill-btn" data-action="rotate" title="Rotate">
@@ -876,6 +1009,7 @@ function createPill(udid, name, platform) {
   pill.querySelector('.panel-telemetry').title = name;
   pill.querySelector('.panel-actions').setAttribute('aria-label', name + ' controls');
   pill.querySelectorAll('button').forEach(button => button.setAttribute('aria-label', button.title));
+  pill.querySelector('.stream-stats').setAttribute('aria-label', name + ' stream debug info');
 
   pill.addEventListener('click', e => {
     const btn = e.target.closest('[data-action]');
@@ -886,6 +1020,7 @@ function createPill(udid, name, platform) {
     setFocusedPanel(udid);
 
     switch (action) {
+      case 'stats': toggleStatsPopover(panel); break;
       case 'close': removeSimPanel(udid); break;
       case 'rotate': panel?.stream?.send({ type: 'rotate' }); break;
       case 'home':   panel?.stream?.send({ type: 'home' });   break;
@@ -1097,7 +1232,7 @@ termResizeHandle.addEventListener('pointermove', event => {
   updateViewportVars();
 });
 ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(name => termResizeHandle.addEventListener(name, () => { termDrag = null; }));
-window.addEventListener('pagehide', () => { simPanels.forEach(p => { p.accessibility?.setOpen(false); p.stream?.destroy(); }); persistTerminalTabs(); termTabs.forEach(tab => tab.terminal.destroy({ terminate: false })); });
+window.addEventListener('pagehide', () => { closeStatsPopover(); simPanels.forEach(p => { p.accessibility?.setOpen(false); p.stream?.destroy(); }); persistTerminalTabs(); termTabs.forEach(tab => tab.terminal.destroy({ terminate: false })); });
 window.addEventListener('pageshow', e => { if (e.persisted) location.reload(); });
 
 // ── Session persistence ───────────────────────────────────────────────────────

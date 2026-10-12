@@ -557,6 +557,16 @@
 .pill-btn.active { color: var(--accent); }
 
 .stream-stats {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-radius: var(--r-sm);
+  min-height: 32px;
+  padding: 4px 6px;
+  text-align: right;
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
   min-width: 0;
   color: var(--text-tertiary);
   font-size: 10px;
@@ -566,6 +576,31 @@
   text-overflow: ellipsis;
   margin-left: auto;
 }
+
+.stream-stats:hover { background: var(--bg-overlay); color: var(--text-primary); }
+.stream-stats[aria-expanded="true"] { background: var(--accent-bg); color: var(--accent); }
+.stats-popover {
+  position: fixed;
+  z-index: 60;
+  padding: 14px 16px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-lg);
+  font-size: 12px;
+  white-space: normal;
+}
+.stats-popover-header { position: sticky; top: 0; background: var(--bg-elevated); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.stats-popover h2 { font-size: 14px; font-weight: 600; }
+.stats-popover-close { width: 32px; height: 32px; flex-shrink: 0; border: none; border-radius: var(--r-sm); background: var(--bg-overlay); color: var(--text-secondary); font-size: 22px; cursor: pointer; touch-action: manipulation; }
+.stats-popover-close:hover { background: var(--bg-active); color: var(--text-primary); }
+.stats-popover-device { color: var(--text-secondary); overflow-wrap: anywhere; margin: 2px 0 14px; }
+.stats-popover dl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 12px; }
+.stats-popover dt { color: var(--text-secondary); }
+.stats-popover dd { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
 
 .pill-sep {
   width: 1px;

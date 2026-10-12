@@ -99,6 +99,13 @@ try {
   const duplicate = d.deliver(33334); check('Unmatched late output closes without drawing', duplicate.closed && t.canvas.draws.length === 2);
   advance(249); check('No per-packet or premature feedback', feedback(t).length === 0);
   advance(1); check('Cumulative feedback sent at250ms', feedback(t).length === 1 && feedback(t)[0].epoch === 1 && feedback(t)[0].frame_id === 3 && feedback(t)[0].pending_frames === 0);
+  const initialTiming = feedback(t)[0].client_timing;
+  check('Feedback includes cumulative output/render/rAF and latest-only drop counters', initialTiming.decoded_outputs === 4 && initialTiming.rendered_frames === 2 && initialTiming.raf_callbacks === 2 && initialTiming.dropped_frames === 1 && initialTiming.latest_frame_drops === 1);
+  check('Feedback includes bounded event ages before first rate sample', initialTiming.output_age_ms === 250 && initialTiming.render_age_ms === 250 && initialTiming.raf_age_ms === 250);
+  advance(1000);
+  const sampledTiming = feedback(t).at(-1).client_timing;
+  check('One-second feedback sample reports decoded/render/drop/rAF cadence', sampledTiming.sample_ms === 1000 && sampledTiming.decoded_output_fps === 4 && sampledTiming.rendered_fps === 2 && sampledTiming.dropped_fps === 1 && sampledTiming.latest_drop_fps === 1 && sampledTiming.raf_fps === 2);
+  check('One-second feedback sample reports receive/output/draw client latency', sampledTiming.receive_to_output_ms === 0 && sampledTiming.output_to_render_ms === 0 && sampledTiming.receive_to_render_ms === 0);
   const chunks = d.chunks.length; t.ws.receive(packet({ epoch: 99, id: 200 })); await flush();
   check('Wrong-epoch packet never enters current decoder', d.chunks.length === chunks && requests(t).length === 0);
   t.stream.updateSettings({ stream_paused: true }); check('Pause closes decoder immediately', d.state === 'closed');

@@ -81,6 +81,45 @@ check("oversized IDR excludes following sends", !bytes.hasCapacity && !bytes.can
 check("hard packet cap enforced", !StreamFlow(fps: 60, quality: 20).canSend(bytes: 16_000_025))
 let valid: [String: Any] = ["epoch": 1, "frame_id": 2, "pending_frames": 0, "decode_queue": 0, "oldest_pending_ms": 0]
 check("valid feedback parses", StreamFeedback(valid) != nil)
+let timing: [String: Any] = [
+    "decoded_outputs": 12, "rendered_frames": 10, "dropped_frames": 2, "latest_frame_drops": 2, "raf_callbacks": 10,
+    "sample_ms": 1001.5, "decoded_output_fps": 11.98, "rendered_fps": 9.99, "dropped_fps": 2.0,
+    "latest_drop_fps": 2.0, "raf_fps": 9.99, "receive_to_output_ms": 3.2, "output_to_render_ms": 7.4,
+    "receive_to_render_ms": 10.6, "output_age_ms": 4.0, "render_age_ms": 8.0, "raf_age_ms": 8.0,
+]
+var timedValue = valid; timedValue["client_timing"] = timing
+let timed = StreamFeedback(timedValue)
+check("client rendering timing parses", timed?.clientTiming?.decodedOutputs == 12 && timed?.clientTiming?.renderedFPS == 9.99)
+var timingFlow = StreamFlow(fps: 60, quality: 20)
+check("timed receipt has a matching sent frame", timingFlow.recordSend(epoch: 1, id: 2, bytes: 1000, now: 0))
+check("current epoch stores passive client rendering timing", timingFlow.feedback(timed!, currentEpoch: 1, now: 0.1) && timingFlow.receiverTiming?.latestFrameDrops == 2)
+check("client rendering timing is snapshot ready", timingFlow.receiverTiming?.snapshot["receive_to_render_ms"] as? Double == 10.6)
+var staleTiming = timing; staleTiming["decoded_outputs"] = 99; staleTiming["rendered_frames"] = 90; staleTiming["raf_callbacks"] = 90
+var staleValue = valid; staleValue["client_timing"] = staleTiming
+let staleTimingFeedback = StreamFeedback(staleValue)
+check("old epoch receipt cannot replace current decoder timing", timingFlow.feedback(staleTimingFeedback!, currentEpoch: 2, now: 0.2) && timingFlow.receiverTiming?.decodedOutputs == 12)
+var nullableTiming = timing
+nullableTiming["receive_to_output_ms"] = NSNull(); nullableTiming["output_to_render_ms"] = NSNull()
+nullableTiming["receive_to_render_ms"] = NSNull(); nullableTiming["output_age_ms"] = NSNull()
+nullableTiming["render_age_ms"] = NSNull(); nullableTiming["raf_age_ms"] = NSNull()
+var nullableValue = valid; nullableValue["client_timing"] = nullableTiming
+let nullableFeedback = StreamFeedback(nullableValue)
+check("unavailable client latency remains valid and unknown", nullableFeedback != nil && nullableFeedback!.clientTiming!.receiveToRenderMS == nil)
+let nullableSnapshot = nullableFeedback!.clientTiming!.snapshot
+check("unavailable client timing snapshots as explicit nulls", nullableSnapshot["receive_to_output_ms"] is NSNull && nullableSnapshot["receive_to_render_ms"] is NSNull && nullableSnapshot["raf_age_ms"] is NSNull)
+for (key, bad) in [
+    ("decoded_outputs", true as Any), ("rendered_frames", -1), ("sample_ms", Double.infinity),
+    ("decoded_output_fps", 1001), ("receive_to_output_ms", "3.2"), ("raf_age_ms", -0.1),
+] {
+    var invalidTiming = timing; invalidTiming[key] = bad
+    var invalidValue = valid; invalidValue["client_timing"] = invalidTiming
+    check("invalid client timing rejected: \(key)", StreamFeedback(invalidValue) == nil)
+}
+var impossibleTiming = timing; impossibleTiming["rendered_frames"] = 13
+var impossibleValue = valid; impossibleValue["client_timing"] = impossibleTiming
+check("impossible rendered/output counters rejected", StreamFeedback(impossibleValue) == nil)
+var malformedTiming = valid; malformedTiming["client_timing"] = "not telemetry"
+check("malformed client timing rejected", StreamFeedback(malformedTiming) == nil)
 for (key, bad) in [("epoch", -1 as Any), ("epoch", 4_294_967_296), ("frame_id", 1.5), ("frame_id", true), ("pending_frames", 49), ("decode_queue", 17), ("oldest_pending_ms", Double.infinity), ("oldest_pending_ms", -0.1), ("oldest_pending_ms", "10")] {
     var value = valid; value[key] = bad
     check("invalid telemetry rejected: \(key)", StreamFeedback(value) == nil)

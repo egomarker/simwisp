@@ -1,11 +1,75 @@
 import Foundation
 import CoreFoundation
 
+struct StreamClientTiming {
+    let decodedOutputs, renderedFrames, droppedFrames, latestFrameDrops, rafCallbacks: Int
+    let sampleMS, decodedOutputFPS, renderedFPS, droppedFPS, latestDropFPS, rafFPS: Double
+    let receiveToOutputMS, outputToRenderMS, receiveToRenderMS: Double?
+    let outputAgeMS, renderAgeMS, rafAgeMS: Double?
+
+    init?(_ value: [String: Any]) {
+        func number(_ key: String, _ maximum: Double, integer: Bool = false) -> Double? {
+            guard let n = value[key] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+            let d = n.doubleValue
+            guard d.isFinite, d >= 0, d <= maximum, !integer || d.rounded(.down) == d else { return nil }
+            return d
+        }
+        func optionalNumber(_ key: String, _ maximum: Double) -> (valid: Bool, value: Double?) {
+            guard let raw = value[key] else { return (true, nil) }
+            if raw is NSNull { return (true, nil) }
+            guard let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return (false, nil) }
+            let d = n.doubleValue
+            guard d.isFinite, d >= 0, d <= maximum else { return (false, nil) }
+            return (true, d)
+        }
+        let maxCounter = 9_007_199_254_740_991.0
+        guard let outputs = number("decoded_outputs", maxCounter, integer: true),
+              let rendered = number("rendered_frames", maxCounter, integer: true),
+              let dropped = number("dropped_frames", maxCounter, integer: true),
+              let latestDrops = number("latest_frame_drops", maxCounter, integer: true),
+              let rafs = number("raf_callbacks", maxCounter, integer: true),
+              let sample = number("sample_ms", 60_000),
+              let outputFPS = number("decoded_output_fps", 1_000),
+              let renderedFPS = number("rendered_fps", 1_000),
+              let droppedFPS = number("dropped_fps", 1_000),
+              let latestDropFPS = number("latest_drop_fps", 1_000),
+              let rafFPS = number("raf_fps", 1_000) else { return nil }
+        let decode = optionalNumber("receive_to_output_ms", 60_000)
+        let present = optionalNumber("output_to_render_ms", 60_000)
+        let pipeline = optionalNumber("receive_to_render_ms", 60_000)
+        let outputAge = optionalNumber("output_age_ms", 60_000)
+        let renderAge = optionalNumber("render_age_ms", 60_000)
+        let rafAge = optionalNumber("raf_age_ms", 60_000)
+        guard decode.valid, present.valid, pipeline.valid, outputAge.valid, renderAge.valid, rafAge.valid else { return nil }
+        decodedOutputs = Int(outputs); renderedFrames = Int(rendered); droppedFrames = Int(dropped)
+        latestFrameDrops = Int(latestDrops); rafCallbacks = Int(rafs)
+        guard renderedFrames <= decodedOutputs, latestFrameDrops <= droppedFrames, renderedFrames <= rafCallbacks else { return nil }
+        sampleMS = sample; decodedOutputFPS = outputFPS; self.renderedFPS = renderedFPS
+        self.droppedFPS = droppedFPS; self.latestDropFPS = latestDropFPS; self.rafFPS = rafFPS
+        receiveToOutputMS = decode.value; outputToRenderMS = present.value; receiveToRenderMS = pipeline.value
+        outputAgeMS = outputAge.value; renderAgeMS = renderAge.value; rafAgeMS = rafAge.value
+    }
+
+    var snapshot: [String: Any] {
+        func nullable(_ value: Double?) -> Any { value.map { $0 as Any } ?? NSNull() }
+        return [
+            "decoded_outputs": decodedOutputs, "rendered_frames": renderedFrames, "dropped_frames": droppedFrames,
+            "latest_frame_drops": latestFrameDrops, "raf_callbacks": rafCallbacks, "sample_ms": sampleMS,
+            "decoded_output_fps": decodedOutputFPS, "rendered_fps": renderedFPS, "dropped_fps": droppedFPS,
+            "latest_drop_fps": latestDropFPS, "raf_fps": rafFPS,
+            "receive_to_output_ms": nullable(receiveToOutputMS), "output_to_render_ms": nullable(outputToRenderMS),
+            "receive_to_render_ms": nullable(receiveToRenderMS), "output_age_ms": nullable(outputAgeMS),
+            "render_age_ms": nullable(renderAgeMS), "raf_age_ms": nullable(rafAgeMS),
+        ]
+    }
+}
+
 // Cumulative receiver telemetry, not a per-frame permission to send.
 struct StreamFeedback {
     let epoch: UInt32, frameID: UInt32
     let pending: Int, decodeQueue: Int
     let oldestMS: Double
+    let clientTiming: StreamClientTiming?
     init?(_ value: [String: Any]) {
         func number(_ key: String, _ maximum: Double, integer: Bool = true) -> Double? {
             guard let n = value[key] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
@@ -17,6 +81,12 @@ struct StreamFeedback {
               let p = number("pending_frames", 48), let q = number("decode_queue", 16),
               let ms = number("oldest_pending_ms", 60_000, integer: false) else { return nil }
         epoch = UInt32(e); frameID = UInt32(id); pending = Int(p); decodeQueue = Int(q); oldestMS = ms
+        if let rawTiming = value["client_timing"] {
+            guard let object = rawTiming as? [String: Any], let timing = StreamClientTiming(object) else { return nil }
+            clientTiming = timing
+        } else {
+            clientTiming = nil
+        }
     }
 }
 
@@ -40,6 +110,7 @@ struct StreamFlow {
     private(set) var lastFeedbackAt: Double?
     private(set) var receiverPending = 0, receiverQueue = 0
     private(set) var receiverOldestMS = 0.0
+    private(set) var receiverTiming: StreamClientTiming?
     var count: Int { sent.count }
     var hasCapacity: Bool { count < Self.maxFrames && canSend(bytes: requiredBytes) }
     init(fps: Int, quality: Int) {
@@ -88,6 +159,7 @@ struct StreamFlow {
         lastFeedbackAt = now
         // Old epochs can drain transport debt, but cannot tune a new decoder.
         guard report.epoch == currentEpoch else { return true }
+        receiverTiming = report.clientTiming
         if adaptiveEpoch != currentEpoch { adaptiveEpoch = currentEpoch; healthySince = nil }
         receiverPending = report.pending; receiverQueue = report.decodeQueue; receiverOldestMS = report.oldestMS
         if report.decodeQueue >= 8 || (report.pending >= 8 && report.oldestMS > 250) {

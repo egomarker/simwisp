@@ -26,5 +26,5 @@ for ((i=0; i<100; i++)); do
   sleep .05
 done
 grep -q 'Isolated accessibility fixture ready' "$root/fixture.log" || { cat "$root/fixture.log" >&2; exit 1; }
-NODE_EXTRA_CA_CERTS="$root/tls/root.pem" "$NODE" Tests/Browser/accessibility-review.mjs "$root" "$@"
+NODE_EXTRA_CA_CERTS="$root/tls/root.pem" "$NODE" "Tests/Browser/${BROWSER_REVIEW:-accessibility-review.mjs}" "$root" "$@"
 NODE_EXTRA_CA_CERTS="$root/tls/root.pem" "$NODE" Tests/Streaming/transport.mjs "$root"

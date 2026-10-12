@@ -6,7 +6,7 @@ TEST_BUILD ?= build/tests
 ARCH := $(shell uname -m)
 SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 
-.PHONY: build check test test-pairing test-accessibility test-input test-video test-sps test-stream-flow test-decoder test-tls test-browser-accessibility run clean install
+.PHONY: build check test test-pairing test-accessibility test-input test-video test-sps test-stream-flow test-decoder test-tls test-browser-accessibility test-browser-stats run clean install
 build:
 	@mkdir -p '$(APP)/Contents/MacOS' '$(APP)/Contents/Resources'
 	xcrun clang -O2 -Wall -Wextra -Werror -isysroot '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/TerminalHost.c -o '$(APP)/Contents/MacOS/SimwispShell'
@@ -52,6 +52,8 @@ test-tls:
 	NODE="$(NODE)" Tests/TLS/run.sh
 test-browser-accessibility:
 	@NODE='$(NODE)' Tests/Browser/run.sh
+test-browser-stats:
+	@NODE='$(NODE)' BROWSER_REVIEW=stats-review.mjs Tests/Browser/run.sh
 run: build
 	open '$(APP)'
 install:
