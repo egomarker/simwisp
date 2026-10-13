@@ -183,6 +183,8 @@ Video transport debt is bounded at **120 frames / 1 MiB**, with a single larger 
 
 Data saver skips unchanged pixels, never replays cached P-frames. Idle Data saver with no pending output does not trigger recovery. Slow local writes, finite transport budgets and receiver overload can reduce FPS/bitrate quality; sustained healthy feedback restores them up to the user's targets. TCP can still head-of-line block on loss: **60 FPS and low live latency are targets, not guarantees**, and this architecture alone does not certify Safari or real internet performance. Text sharpness, bandwidth, GPU cost and latency depend on workload and client.
 
+Capture teardown tracks startup, running and terminal states. Closing a simulator window ends only that capture; already-stopped streams are not stopped again, failed starts detach their output, and overlapping cleanup callers await the same teardown. Unexpected cleanup failures remain visible in logs and `/api/status` capture `last_cleanup_error`, but do not block capture startup for unrelated devices.
+
 When the final simulator streaming client disconnects, capture is torn down and the discovery timer is cancelled. The menu-bar popup's monitoring timer exists only while the popup is visible/key. Browser device-list requests still perform on-demand discovery.
 
 Historical JPEG-build no-terminal idle lifecycle verification measured approximately **0.01–0.02% of one CPU core** on the development Mac. A later explicitly sampled terminal review measured **0.0423% with one idle terminal** and **0.0444% with two**, with unchanged PTY I/O counters and no capture demand. Sampling itself adds work; these are short observations, not universal CPU guarantees. The panel's CPU display uses **100% = one core**; measurements are app-process usage, not total simulator or system usage.
@@ -203,7 +205,8 @@ Only one Simwisp app instance may run at a time; duplicate launches exit without
 | Repeated reconnects | Another browser may be controlling the same device |
 | Port already in use | Quit the existing Simwisp instance or choose another `--port` |
 | New launch options have no effect | `open` reused an existing instance; quit and relaunch |
-| Capture cleanup error | Quit and reopen Simwisp before starting new streams |
+| Capture stopped / window closed | Reopen the simulator window; its stream can restart without quitting Simwisp |
+| Unexpected capture cleanup error | Inspect `/api/status` capture `last_cleanup_error` and logs; domain/code identify the affected capture |
 
 ## Project layout
 

@@ -8,13 +8,23 @@ final class CaptureHealth {
     static let shared = CaptureHealth()
     private let lock = NSLock()
     private var count = 0
-    private var fatal: String?
-    var snapshot: [String: Any] { lock.withLock { ["active": count, "fatal_error": fatal as Any? ?? NSNull()] } }
-    var failure: String? { lock.withLock { fatal } }
+    private var lastCleanupError: String?
+    // Keep fatal_error for status API compatibility. A per-stream cleanup error
+    // is diagnostic, never a process-wide admission lock for new captures.
+    var snapshot: [String: Any] { lock.withLock { ["active": count, "fatal_error": NSNull(), "last_cleanup_error": lastCleanupError as Any? ?? NSNull()] } }
     func created() { lock.withLock { count += 1 } }
     func released() { lock.withLock { count = max(0, count - 1) } }
-    func failed(_ message: String) { lock.withLock { fatal = message } }
+    func cleanupFailed(_ message: String) { lock.withLock { lastCleanupError = message } }
 }
+
+// The native stream implements this small seam directly. Tests can drive the
+// actual WindowCapture lifecycle without creating a ScreenCaptureKit session.
+protocol CaptureStream: AnyObject {
+    @MainActor func startCapture() async throws
+    @MainActor func stopCapture() async throws
+    @MainActor func removeStreamOutput(_ output: any SCStreamOutput, type: SCStreamOutputType) throws
+}
+extension SCStream: CaptureStream {}
 
 // Native capture keeps only the newest complete frame. Encoding is independently
 // paced, with one H.264 encoder and no encoded-frame cache per device.
@@ -24,7 +34,13 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private let lock = NSLock()
     private let encodeLock = NSLock()
     private let callbacks = DispatchQueue(label: "Simwisp.capture.samples", qos: .userInteractive)
-    private var stream: SCStream?
+    private enum Phase { case idle, starting, running, stopping, ended, stopped }
+    private var phase = Phase.idle // lock protects native state and delegate callbacks
+    private var stream: (any CaptureStream)?
+    private let health: CaptureHealth
+    private let makeStream: (@MainActor (WindowCapture) async throws -> any CaptureStream)?
+    @MainActor private var startTask: Task<Void, Error>?
+    @MainActor private var stopTask: Task<Void, Never>?
     private var latest: CVPixelBuffer?
     private var version: UInt64 = 0
     private var encoder: H264Encoder?
@@ -33,9 +49,55 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     private var encoderHardware = false
     private var active = true
     private var error: String?
-    init(target: DeviceWindow) { self.target = target; super.init() }
-    func start() async throws {
-        if let failure = CaptureHealth.shared.failure { throw WispError(failure) }
+    init(target: DeviceWindow, health: CaptureHealth = .shared, makeStream: (@MainActor (WindowCapture) async throws -> any CaptureStream)? = nil) {
+        self.target = target; self.health = health; self.makeStream = makeStream; super.init()
+    }
+    @MainActor func start() async throws {
+        let task: Task<Void, Error>
+        if let existing = startTask { task = existing }
+        else {
+            guard lock.withLock({ active && phase == .idle }) else { throw WispError("Capture cannot be started twice or after stopping") }
+            lock.withLock { phase = .starting }
+            task = Task { @MainActor in
+                do {
+                    let newStream: any CaptureStream
+                    if let makeStream = self.makeStream { newStream = try await makeStream(self) }
+                    else { newStream = try await self.createStream() }
+                    self.lock.withLock { self.stream = newStream }
+                    self.health.created()
+                    guard self.lock.withLock({ self.active }) else { throw WispError("Capture stopped before startup completed") }
+                    try await newStream.startCapture()
+                    let ready = self.lock.withLock { () -> Bool in
+                        // A terminal delegate callback can precede start's
+                        // completion; never resurrect that stream as running.
+                        if self.phase == .starting { self.phase = .running }
+                        return self.active && self.phase == .running
+                    }
+                    guard ready else { throw WispError(self.failure ?? "Capture stopped during startup") }
+                } catch {
+                    self.lock.withLock {
+                        self.active = false; self.latest = nil
+                        // A successfully started stream with a pending stop is
+                        // still running and must be stopped by the cleanup task.
+                        if self.phase == .starting { self.phase = .ended }
+                        if self.error == nil { self.error = error.localizedDescription }
+                    }
+                    throw error
+                }
+            }
+            startTask = task
+        }
+        do {
+            try await task.value
+            guard lock.withLock({ active && phase == .running }) else { throw WispError(failure ?? "Capture stopped during startup") }
+            startTask = nil
+        } catch {
+            // Cleanup waits for the startup task, never from inside that task.
+            // This also joins a simultaneous explicit stop instead of racing it.
+            await stop(); throw error
+        }
+    }
+    @MainActor private func createStream() async throws -> any CaptureStream {
         let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
         guard let window = content.windows.first(where: { $0.windowID == target.id }) else { throw WispError("Simulator window is not shareable. Check Screen Recording permission.") }
         let config = SCStreamConfiguration()
@@ -47,11 +109,10 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
         if #available(macOS 14.2, *) { config.includeChildWindows = false }
         let newStream = SCStream(filter: SCContentFilter(desktopIndependentWindow: window), configuration: config, delegate: self)
         try newStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: callbacks)
-        lock.withLock { stream = newStream }
-        CaptureHealth.shared.created()
-        do { try await newStream.startCapture() } catch { await stop(); throw error }
+        return newStream
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard lock.withLock({ self.stream === stream && active && error == nil }) else { return }
         receive(sampleBuffer, type: type)
     }
     func receive(_ sampleBuffer: CMSampleBuffer, type: SCStreamOutputType) {
@@ -60,15 +121,37 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
                   let infos = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
                   let raw = infos.first?[.status] as? Int, let status = SCFrameStatus(rawValue: raw) else { return }
             lock.lock(); defer { lock.unlock() }
-            guard active else { return }
+            guard active, error == nil else { return }
             if status == .blank || status == .suspended { latest = nil; return }
             guard status == .complete, let image = sampleBuffer.imageBuffer else { return }
             latest = image; version &+= 1
         }
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        lock.lock(); self.error = error.localizedDescription; latest = nil; lock.unlock()
-        log("Capture stopped: \(error.localizedDescription)")
+        captureStopped(stream, error: error)
+    }
+    func captureStopped(_ stream: any CaptureStream, error: Error) {
+        let report = lock.withLock { () -> Bool in
+            guard self.stream === stream, phase == .starting || phase == .running || phase == .stopping else { return false }
+            let unexpected = active
+            phase = .ended; active = false; latest = nil
+            if unexpected { self.error = error.localizedDescription }
+            return unexpected
+        }
+        if report { log(diagnostic("stopped", error)) }
+    }
+    private func diagnostic(_ action: String, _ error: Error) -> String {
+        let native = error as NSError
+        return "Capture \(target.id) \(action): \(native.localizedDescription) [\(native.domain):\(native.code)]"
+    }
+    static func alreadyStopped(_ error: Error) -> Bool {
+        let native = error as NSError
+        return native.domain == SCStreamError.errorDomain && native.code == SCStreamError.Code.attemptToStopStreamState.rawValue
+    }
+    private func cleanupFailed(_ action: String, _ error: Error) {
+        let message = diagnostic(action, error)
+        lock.withLock { if self.error == nil { self.error = message } }
+        health.cleanupFailed(message); log(message)
     }
     var failure: String? { lock.lock(); defer { lock.unlock() }; return error }
     var hasFrame: Bool { lock.withLock { active && error == nil && latest != nil } }
@@ -96,17 +179,40 @@ final class WindowCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
             return frame
         }
     }
-    func stop() async {
-        let old = lock.withLock { () -> SCStream? in active = false; latest = nil; let value = stream; stream = nil; return value }
-        if let old {
-            do { try await old.stopCapture() }
-            catch {
-                let message = "Capture cleanup failed; restart Simwisp before starting new streams: \(error.localizedDescription)"
-                CaptureHealth.shared.failed(message); log(message)
+    @MainActor func stop() async {
+        if let existing = stopTask { await existing.value; return }
+        guard lock.withLock({ phase != .stopped }) else { return }
+        lock.withLock { active = false; latest = nil }
+        let starting = startTask
+        let task = Task { @MainActor in
+            // If discovery/start is still pending, wait for its outcome. A late
+            // successful start must be stopped; a failed/unstarted one must not.
+            if let starting { _ = await starting.result }
+            let state = self.lock.withLock { () -> ((any CaptureStream)?, Bool) in
+                let needsStop = self.phase == .running
+                if needsStop { self.phase = .stopping }
+                return (self.stream, needsStop)
             }
-            try? old.removeStreamOutput(self, type: .screen)
-            CaptureHealth.shared.released()
+            if let old = state.0 {
+                if state.1 {
+                    do { try await old.stopCapture() }
+                    catch {
+                        // The source may disappear between the state check and
+                        // the native stop call. Only this specific state error
+                        // is benign; unrelated codes/domains remain visible.
+                        if !Self.alreadyStopped(error) { self.cleanupFailed("cleanup failed", error) }
+                    }
+                }
+                do { try old.removeStreamOutput(self, type: .screen) }
+                catch { self.cleanupFailed("output removal failed", error) }
+                self.lock.withLock { self.stream = nil }
+                self.health.released()
+            }
+            self.encodeLock.withLock { self.encoder?.close(); self.encoder = nil; self.encodedVersion = nil }
+            self.lock.withLock { self.phase = .stopped }
         }
-        encodeLock.withLock { encoder?.close(); encoder = nil; encodedVersion = nil }
+        stopTask = task
+        await task.value
+        startTask = nil; stopTask = nil
     }
 }
