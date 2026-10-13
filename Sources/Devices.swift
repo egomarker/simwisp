@@ -43,15 +43,19 @@ final class Devices {
     private var cropCache: [CGWindowID: (bounds: CGRect, checked: Double, crop: CGRect?)] = [:]
     private var projectApps: [String: Bool] = [:]
     let settings: Settings
+    let control: DeviceControl
+    private let discoveryOverride: (() -> ([Device], [[String: Any]], [String: DeviceWindow]))?
+    private let bootOverride: ((String) throws -> Void)?
     let adb: String?
     let emulator: String?
-    init(settings: Settings) {
-        self.settings = settings
+    init(settings: Settings, control: DeviceControl? = nil, discovery: (() -> ([Device], [[String: Any]], [String: DeviceWindow]))? = nil, boot: ((String) throws -> Void)? = nil) {
+        self.settings = settings; discoveryOverride = discovery; bootOverride = boot
         let env = ProcessInfo.processInfo.environment
         let roots = [settings.androidSDK, env["ANDROID_HOME"] ?? "", env["ANDROID_SDK_ROOT"] ?? "", NSHomeDirectory() + "/Library/Android/sdk", NSHomeDirectory() + "/.androidsdk"]
         adb = roots.filter { !$0.isEmpty }.map { $0 + "/platform-tools/adb" }.first { FileManager.default.isExecutableFile(atPath: $0) }
         emulator = roots.filter { !$0.isEmpty }.map { $0 + "/emulator/emulator" }.first { FileManager.default.isExecutableFile(atPath: $0) }
         bundleID = Self.projectBundle(settings.projectDirectory)
+        self.control = control ?? DeviceControl(adb: adb)
     }
     func setStreamingDemand(_ active: Bool) {
         lock.withLock { streamingDemand = active }
@@ -98,6 +102,11 @@ final class Devices {
 
     private func refresh() {
         lock.withLock { refreshCount &+= 1 }
+        if let discoveryOverride {
+            let snapshot = discoveryOverride()
+            lock.withLock { running = snapshot.0; available = snapshot.1; windows = snapshot.2 }
+            return
+        }
         autoreleasepool {
             let refreshTools = monotonic() - lastTools > 8
             if refreshTools {
@@ -194,6 +203,7 @@ final class Devices {
         }
     }
     func boot(_ id: String) throws {
+        if let bootOverride { try bootOverride(id); invalidate(); return }
         guard let entry = library().first(where: { $0["id"] as? String == id }) else { throw WispError("Unknown or already running device") }
         if entry["platform"] as? String == "android" {
             guard let emulator else { throw WispError("Android Emulator not found") }

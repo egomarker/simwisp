@@ -1,4 +1,4 @@
-import { fetchInfo, fetchSims, fetchAvailableDevices, bootSim, bootAvd, requestPermission } from './api.js';
+import { fetchInfo, fetchSims, fetchAvailableDevices, bootSim, bootAvd, stopSim, fetchStopStatus, requestPermission } from './api.js';
 import { SimStream } from './stream.js';
 import { initTheme } from './theme.js';
 
@@ -8,6 +8,7 @@ initTheme();
 const $ = id => document.getElementById(id);
 const app            = $('app');
 const deviceList     = $('device-list');
+const deviceActionStatus = $('device-action-status');
 const mobileMenuBtn  = $('mobile-menu-btn');
 const sidebarBackdrop = $('sidebar-backdrop');
 const addSimBtn      = $('add-sim-btn');
@@ -36,6 +37,10 @@ const permsList      = $('perms-list');
 // ── State ────────────────────────────────────────────────────────────────────
 let allSims = [];
 let hasAdb = false;
+let canStopDevices = false;
+const stoppingIds = new Set();
+let deviceAction = null; // latest keyed action owns the single status banner
+let simsLoadVersion = 0;
 const _pendingBoots = new Map(); // id → {name, platform}  (booting but not yet in sims)
 
 // udid → { stream, panelEl, frameEl, canvasEl, overlayEl, pillEl, dotEl, ro, appearMode }
@@ -250,7 +255,9 @@ function _writeSimsCache(sims, info) {
 }
 
 // ── Device list ──────────────────────────────────────────────────────────────
-async function loadSims() {
+async function loadSims({ reconcileAction = true } = {}) {
+  const version = ++simsLoadVersion;
+  const action = reconcileAction && deviceAction?.phase !== 'stopping' ? deviceAction : null;
   // Show cached data immediately so the sidebar isn't blank while we wait
   const cached = _readSimsCache();
   if (cached?.sims) {
@@ -269,12 +276,15 @@ async function loadSims() {
 
   try {
     const [sims, info] = await Promise.all([fetchSims(), fetchInfo()]);
+    if (version !== simsLoadVersion) return;
+    if (!Array.isArray(sims)) throw new Error('Invalid device list');
     allSims = sims;
     hasAdb = info.has_adb !== false;
     _writeSimsCache(sims, info);
     updateModeBadge(info);
     renderPermsWidget(info);
     terminalCapability(info.features?.terminal);
+    canStopDevices = info.features?.device_stop === true;
 
     if (info.bundle_id) {
       projFilterWrap.classList.add('visible');
@@ -285,8 +295,9 @@ async function loadSims() {
     }
 
     renderDeviceList();
+    await reconcileDeviceAction(action, version);
   } catch {
-    if (!cached?.sims) {
+    if (version === simsLoadVersion && !cached?.sims) {
       deviceList.innerHTML = '<div class="device-list-empty">Could not reach server</div>';
     }
   }
@@ -426,6 +437,66 @@ addPopover.addEventListener('keydown', e => {
   if (e.key === 'Escape') { e.stopPropagation(); closeAddPopover(); }
 });
 
+function deviceActionMessage(message, error = false) {
+  deviceActionStatus.textContent = message;
+  deviceActionStatus.dataset.state = error ? 'error' : 'ok';
+}
+function forgetStoppedDevice(id) {
+  allSims = allSims.filter(s => s.id !== id);
+  const cached = _readSimsCache();
+  if (cached) { try { localStorage.setItem(_SIMS_CACHE, JSON.stringify({ ...cached, sims: allSims })); } catch {} }
+}
+function pendingStopMessage(action) {
+  return `Stop requested for ${action.name}; awaiting confirmation. Refresh devices to check its state.`;
+}
+async function reconcileDeviceAction(action, version) {
+  if (!action || deviceAction !== action || version !== simsLoadVersion) return;
+  if (action.phase === 'pending' && action.platform === 'android') {
+    try {
+      const status = await fetchStopStatus(action.id);
+      if (deviceAction !== action || version !== simsLoadVersion) return;
+      if (status.ok !== true || status.id !== action.id || status.platform !== 'android' || !['stopped', 'pending'].includes(status.state)) return;
+      if (status.state === 'stopped') {
+        action.phase = 'stopped'; forgetStoppedDevice(action.id); renderDeviceList();
+        deviceActionMessage(`Stopped ${action.name}.`);
+      } else deviceActionMessage(pendingStopMessage(action));
+    } catch { /* Failed confirmation must not erase pending status or claim success. */ }
+  } else {
+    // A fresh explicit refresh acknowledges old success/error/warning messages.
+    // Cached data or a refresh started before/during a newer action cannot clear it.
+    deviceAction = null; deviceActionMessage('');
+  }
+}
+async function handleDeviceStop(id) {
+  if (!canStopDevices || stoppingIds.has(id)) return;
+  const device = allSims.find(s => s.id === id);
+  if (!device) return;
+  const sharedApp = device.platform === 'ios' ? '\nSimulator may also quit if no iOS devices or windows remain.' : '';
+  if (!window.confirm(`Stop ${device.name}?\nThis shuts down the simulator. Unsaved app state may be lost.${sharedApp}`)) return;
+  stoppingIds.add(id);
+  const action = { id, name: device.name, platform: device.platform, phase: 'stopping' };
+  deviceAction = action; ++simsLoadVersion;
+  deviceActionMessage(`Stopping ${device.name}…`);
+  // Destroy before POST so an intentional stop cannot become a reconnect loop.
+  // Failure leaves a usable list: the owner can reopen a still-running device.
+  removeSimPanel(id);
+  renderDeviceList();
+  try {
+    const result = await stopSim(id);
+    action.phase = result.state === 'pending' ? 'pending' : 'stopped';
+    if (action.phase === 'stopped') forgetStoppedDevice(id);
+    if (deviceAction === action) deviceActionMessage(action.phase === 'pending' ? pendingStopMessage(action) : (result.warning || `Stopped ${device.name}.${result.simulator_quit_requested ? ' Simulator quit requested.' : ''}`), !!result.warning);
+    renderDeviceList();
+    await loadSims({ reconcileAction: false }); // one refresh, never a retained stop/idle poll
+  } catch (error) {
+    action.phase = 'failed';
+    if (deviceAction === action) deviceActionMessage(`Could not stop ${device.name}: ${error.message || 'Unknown error'}. Refresh devices to check its state.`, true);
+  } finally {
+    stoppingIds.delete(id); renderDeviceList();
+    if (document.activeElement === document.body) (deviceList.querySelector('button.device-item:not(:disabled)') || addSimBtn).focus();
+  }
+}
+
 function renderDeviceList() {
   updateKeyboardPlaceholder();
   $('device-count').textContent = allSims.length;
@@ -453,20 +524,28 @@ function renderDeviceList() {
     return;
   }
   deviceList.innerHTML = bootingRows + sims.map(s => `
+    <div class="device-row" aria-busy="${stoppingIds.has(s.id)}">
     <button type="button" class="device-item${simPanels.has(s.id) ? ' active' : ''}"
-        aria-pressed="${simPanels.has(s.id)}" title="${esc(s.name)}"
+        aria-pressed="${simPanels.has(s.id)}" title="${esc(s.name)}" ${stoppingIds.has(s.id) ? 'disabled' : ''}
         data-udid="${esc(s.id)}" data-name="${esc(s.name)}"
         data-platform="${esc(s.platform)}"
         data-w="${s.width}" data-h="${s.height}">
       <span class="device-icon">${simIcon(s.name)}</span>
       <span class="device-info">
         <span class="device-name">${esc(s.name)}</span>
-        <span class="device-dims">${s.platform === 'android' ? 'Android' : 'iOS'} · ${s.width && s.height ? `${s.width} × ${s.height}` : 'Emulator'}</span>
+        <span class="device-dims">${stoppingIds.has(s.id) ? 'Stopping…' : `${s.platform === 'android' ? 'Android' : 'iOS'} · ${s.width && s.height ? `${s.width} × ${s.height}` : 'Emulator'}`}</span>
       </span>
       ${s.project_app ? '<span class="device-badge" title="Project app installed">★</span>' : ''}
       ${simPanels.has(s.id) ? '<span class="device-open-indicator" aria-hidden="true"></span>' : ''}
-    </button>`).join('') + adbHint;
+    </button>
+    ${canStopDevices ? `<button type="button" class="device-stop-btn" data-stop-id="${esc(s.id)}" title="${stoppingIds.has(s.id) ? 'Stopping…' : 'Stop simulator'}" aria-label="Stop ${esc(s.name)}" ${stoppingIds.has(s.id) ? 'disabled' : ''}>
+      ${stoppingIds.has(s.id) ? '<span class="add-spinner" aria-hidden="true"></span>' : '<svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M10 2v7M5 4.5a7 7 0 1 0 10 0"/></svg>'}
+    </button>` : ''}
+    </div>`).join('') + adbHint;
 
+  deviceList.querySelectorAll('button.device-stop-btn').forEach(el => {
+    el.addEventListener('click', () => handleDeviceStop(el.dataset.stopId));
+  });
   deviceList.querySelectorAll('button.device-item').forEach(el => {
     el.addEventListener('click', () =>
       toggleDevice(
@@ -580,6 +659,14 @@ function addSimPanel(udid, name, w, h, platform) {
     onRotateEnd:         ok => clearPanelProgress(udid, ok ? null : 'Rotate failed'),
     onStats:             stats => updatePanelStats(udid, stats),
     onAccessibility:     message => panel.accessibility?.receive(message),
+    onStopped:           () => {
+      if (simPanels.get(udid) !== panel) return;
+      removeSimPanel(udid);
+      if (!stoppingIds.has(udid)) {
+        deviceAction = { id: udid, name, platform, phase: 'pending' };
+        deviceActionMessage(`Stop requested for ${name}. Refresh devices to check its state.`);
+      }
+    },
   });
   //panel.stream.updateSettings({ data_saver: dsBtn.classList.contains('active') });
   updateStreamVisibility();

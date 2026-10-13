@@ -10,8 +10,12 @@ final class Service {
     let server = HTTPServer()
     private(set) var tls: TLSIdentity?
     private let terminals: TerminalManager
-    private let workers = DispatchQueue(label: "Simwisp.tools", qos: .userInitiated, attributes: .concurrent)
+    private let workers = DispatchQueue(label: "Simwisp.device-actions", qos: .userInitiated)
+    private var stopping = Set<String>() // network queue owns destructive-action admission
+    private let makeCapture: (DeviceWindow) -> WindowCapture
+    private let captureStopTimeout: Double
     private var streams: [String: StreamSession] = [:] // network queue owns registry
+    private var retiring: [String: [StreamSession]] = [:] // disconnected/replaced captures still cleaning up
     private let lifecycle = DispatchGroup()
     private let cookie: String
     private let pairingQueue = DispatchQueue(label: "Simwisp.pairing", qos: .userInitiated)
@@ -21,9 +25,11 @@ final class Service {
     private var usage = Usage() // sampled on the network queue for diagnostics only
     private var panelState: [String: Any] = ["visible": false, "refresh_timer": false, "refreshes": 0]
     var stateChanged: ((String) -> Void)?
-    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory) {
+    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory, devices: Devices? = nil, captureStopTimeout: Double = 20, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
         self.pairingStateURL = pairingStateURL; self.tlsDirectory = tlsDirectory
-        self.settings = settings; devices = Devices(settings: settings); input = DeviceInput(devices: devices)
+        self.settings = settings; self.makeCapture = makeCapture; self.captureStopTimeout = captureStopTimeout
+        let selectedDevices = devices ?? Devices(settings: settings)
+        self.devices = selectedDevices; input = DeviceInput(devices: selectedDevices)
         terminals = TerminalManager(settings: settings, network: server.queue)
         cookie = SHA256.hash(data: Data(("simwisp-session-v1:" + settings.pairingToken).utf8)).map { String(format: "%02x", $0) }.joined()
         server.authorize = { [weak self] request in
@@ -71,13 +77,14 @@ final class Service {
     }
     private func startStream(_ request: HTTPRequest, client: ClientConnection) {
         let id = String(request.path.dropFirst(4))
+        guard !stopping.contains(id) else { client.sendJSON(["type": "device_stopping", "id": id]); client.closeAfterSending(); return }
         guard devices.device(id) != nil else { client.sendJSON(["type": "capture_error", "message": "Unknown device"]); client.close(); return }
         // Preserve Simmer's one-controller-per-device behavior; other devices are independent.
-        if let old = streams.removeValue(forKey: id) { old.stop(); old.client.close() }
-        let session = StreamSession(id: id, client: client, request: request, settings: settings, devices: devices, input: input, queue: server.queue, lifecycle: lifecycle)
+        if let old = streams.removeValue(forKey: id) { retire(old); old.client.close() }
+        let session = StreamSession(id: id, client: client, request: request, settings: settings, devices: devices, input: input, queue: server.queue, lifecycle: lifecycle, makeCapture: makeCapture)
         session.onClose = { [weak self, weak session] in
-            guard let self, self.streams[id] === session else { return }
-            self.streams.removeValue(forKey: id)
+            guard let self, let session, self.streams[id] === session else { return }
+            self.streams.removeValue(forKey: id); self.retire(session)
             self.devices.setStreamingDemand(!self.streams.isEmpty)
         }
         streams[id] = session; devices.setStreamingDemand(true); session.start()
@@ -124,7 +131,7 @@ final class Service {
         if request.method != "GET" && !request.sameOrigin { complete(.json(["error": "Origin denied"], status: 403)); return }
         switch (request.method, request.path) {
         case ("GET", "/api/info"):
-            var info: [String: Any] = ["mode": "fast2 (ScreenCaptureKit + VideoToolbox H.264 + Quartz input)", "video_codec": "h264", "transport": "https", "app": "Simwisp", "version": "0.2.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true]]
+            var info: [String: Any] = ["mode": "fast2 (ScreenCaptureKit + VideoToolbox H.264 + Quartz input)", "video_codec": "h264", "transport": "https", "app": "Simwisp", "version": "0.2.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true, "device_stop": true]]
             if settings.terminalEnabled == true { info["project_dir"] = settings.projectDirectory }
             if let bundle = devices.projectBundleID { info["bundle_id"] = bundle }
             complete(.json(info))
@@ -148,13 +155,78 @@ final class Service {
             guard let avd = dictionary(request.body)["avd"] as? String else { complete(.json(["error": "Missing AVD"], status: 400)); return }; boot(avd, complete: complete)
         default:
             if request.method == "POST", request.path.hasPrefix("/api/boot/") { boot(String(request.path.dropFirst(10)), complete: complete) }
+            else if request.method == "POST", request.path.hasPrefix("/api/stop/") { stopDevice(String(request.path.dropFirst(10)), complete: complete) }
+            else if request.method == "GET", request.path.hasPrefix("/api/stop-status/") { stopStatus(String(request.path.dropFirst("/api/stop-status/".count)), complete: complete) }
             else { complete(.json(["error": "Not found"], status: 404)) }
         }
     }
     private func boot(_ id: String, complete: @escaping (HTTPResponse) -> Void) {
+        guard !stopping.contains(id) else { complete(.json(["error": "This simulator is stopping"], status: 409)); return }
+        devices.control.launches.begin(); lifecycle.enter()
         workers.async {
+            defer { self.devices.control.launches.end(); self.lifecycle.leave() }
             do { try self.devices.boot(id); complete(.json(["ok": true])) }
             catch { complete(.json(["error": error.localizedDescription], status: 409)) }
+        }
+    }
+    private func stopStatus(_ id: String, complete: @escaping (HTTPResponse) -> Void) {
+        guard DeviceControl.validID(id, platform: "android") else { complete(.json(["error": "Invalid emulator identifier"], status: 404)); return }
+        lifecycle.enter()
+        workers.async {
+            defer { self.lifecycle.leave() }
+            do { complete(.json(try self.devices.control.androidStopStatus(id))) }
+            catch { complete(.json(["error": "Could not confirm emulator shutdown. Refresh devices to check again."], status: 503)) }
+        }
+    }
+    private func retire(_ session: StreamSession) {
+        let id = session.id
+        guard !(retiring[id] ?? []).contains(where: { $0 === session }) else { return }
+        retiring[id, default: []].append(session)
+        session.stop {
+            self.retiring[id]?.removeAll { $0 === session }
+            if self.retiring[id]?.isEmpty == true { self.retiring.removeValue(forKey: id) }
+        }
+    }
+    private func stopDevice(_ id: String, complete: @escaping (HTTPResponse) -> Void) {
+        guard let device = devices.device(id), DeviceControl.validID(id, platform: device.platform) else { complete(.json(["error": "Unknown or invalid running simulator"], status: 404)); return }
+        guard stopping.insert(id).inserted else { complete(.json(["error": "This simulator is already stopping"], status: 409)); return }
+        lifecycle.enter()
+        let perform = {
+            self.workers.async {
+                let response: HTTPResponse
+                do { response = .json(try self.devices.control.stop(device)) }
+                catch { response = .json(["error": error.localizedDescription], status: 409) }
+                self.devices.invalidate()
+                self.server.queue.async {
+                    self.stopping.remove(id); complete(response); self.lifecycle.leave()
+                }
+            }
+        }
+        if let session = streams.removeValue(forKey: id) {
+            // An intentional device stop is terminal for existing viewers, not
+            // a lost-connection event that should create a reconnect loop.
+            session.client.sendJSON(["type": "device_stopping", "id": id]); session.client.closeAfterSending()
+            retire(session)
+            devices.setStreamingDemand(!streams.isEmpty)
+        }
+        // The requesting browser closes its view before POST. Its session may
+        // already have left streams, while native cleanup is still outstanding.
+        let barrier = DispatchGroup()
+        for session in retiring[id] ?? [] {
+            barrier.enter(); session.stop { barrier.leave() }
+        }
+        // A hung native startup/stop must not leave admission locked forever,
+        // nor cause a delayed destructive action after a failure was returned.
+        var waiting = true // all accesses on the network queue
+        let timeout = DispatchWorkItem {
+            guard waiting else { return }; waiting = false
+            self.stopping.remove(id)
+            complete(.json(["error": "Capture cleanup is still pending; the device was not shut down. Refresh devices and try again."], status: 409))
+            self.lifecycle.leave()
+        }
+        server.queue.asyncAfter(deadline: .now() + captureStopTimeout, execute: timeout)
+        barrier.notify(queue: server.queue) {
+            guard waiting else { return }; waiting = false; timeout.cancel(); perform()
         }
     }
 }

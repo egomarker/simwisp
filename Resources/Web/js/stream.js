@@ -25,7 +25,7 @@ export class SimStream {
   #latestFrame = null; #renderRAF = 0; #lastRenderedTimestamp = -1;
   #portraitW; #portraitH; #isLandscape = false;
   #onStatus; #onFirstFrame; #onOrientationChange; #onRotateStart; #onRotateEnd;
-  #onStats; #onAccessibility; #statsTimer = null;
+  #onStats; #onAccessibility; #onStopped; #statsTimer = null;
   #stats = { frames: 0, bytes: 0, dropped: 0, lastFrames: 0, lastBytes: 0, fps: 0, bps: 0, avgFrame: 0 };
   #serverStats = { fps: null, quality: null };
 
@@ -43,6 +43,7 @@ export class SimStream {
       onRotateEnd,
       onStats,
       onAccessibility,
+      onStopped,
     } = {}
   ) {
     this.#udid = udid;
@@ -57,6 +58,7 @@ export class SimStream {
     this.#onRotateEnd = onRotateEnd ?? (() => {});
     this.#onStats = onStats ?? (() => {});
     this.#onAccessibility = onAccessibility ?? (() => {});
+    this.#onStopped = onStopped ?? (() => {});
 
     this.settings = { fps, quality, data_saver, dev_w: canvas.width, dev_h: canvas.height };
 
@@ -327,7 +329,9 @@ export class SimStream {
       }
       try {
         const msg = JSON.parse(e.data);
-        if (msg.type === 'video_config') {
+        if (msg.type === 'device_stopping') {
+          this.destroy(); this.#onStopped();
+        } else if (msg.type === 'video_config') {
           this.#configureVideo(msg, ws);
         } else if (msg.type === 'accessibility_status' || msg.type === 'accessibility_event') {
           if (this.settings.accessibility_enabled === true && this.settings.stream_paused !== true) this.#onAccessibility(msg);

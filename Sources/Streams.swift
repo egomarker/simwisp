@@ -8,6 +8,8 @@ final class StreamSession: @unchecked Sendable {
     let input: DeviceInput
     let queue: DispatchQueue
     private let lifecycle: DispatchGroup
+    private let captureLifecycle = DispatchGroup()
+    private let makeCapture: (DeviceWindow) -> WindowCapture
     private let worker: DispatchQueue
     private var timer: DispatchSourceTimer?
     private var capture: WindowCapture?
@@ -38,7 +40,8 @@ final class StreamSession: @unchecked Sendable {
     private let accessibility: AccessibilitySession
     private var started = monotonic()
     var onClose: (() -> Void)?
-    init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup) {
+    init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
+        self.makeCapture = makeCapture
         self.id = id; self.client = client; self.devices = devices; self.input = input; self.queue = queue; self.lifecycle = lifecycle
         flow = StreamFlow(fps: Int(request.query["fps"] ?? "") ?? settings.fps, quality: Int(request.query["quality"] ?? "") ?? settings.quality)
         dataSaver = request.query["data_saver"] == "1"
@@ -150,25 +153,29 @@ final class StreamSession: @unchecked Sendable {
         // Never erase outstanding transport debt on reset; delayed feedback
         // from an older epoch can still retire already-delivered bytes.
     }
+    private func beginCaptureWork() -> () -> Void {
+        let lifecycle = self.lifecycle, captures = captureLifecycle
+        lifecycle.enter(); captures.enter()
+        return { lifecycle.leave(); captures.leave() }
+    }
     private func configure(_ window: DeviceWindow) {
         configuring = true; requestKeyframe()
         let old = capture; capture = nil; geometry = nil; captureHasFrame = false; reconcileAccessibility()
-        let new = WindowCapture(target: window), lifecycle = self.lifecycle
-        lifecycle.enter()
+        let new = makeCapture(window), finish = beginCaptureWork()
         Task { @MainActor [weak self] in
             if let old { await old.stop() }
             do {
                 try await new.start()
-                guard let self else { await new.stop(); lifecycle.leave(); return }
+                guard let self else { await new.stop(); finish(); return }
                 self.queue.async {
                     self.configuring = false
-                    if self.closed { Task { @MainActor in await new.stop(); lifecycle.leave() }; return }
+                    if self.closed { Task { @MainActor in await new.stop(); finish() }; return }
                     self.capture = new; self.geometry = window; self.lastError = nil
-                    lifecycle.leave(); self.reconcileAccessibility(); self.reschedule()
+                    finish(); self.reconcileAccessibility(); self.reschedule()
                 }
             } catch {
-                guard let self else { lifecycle.leave(); return }
-                self.queue.async { self.configuring = false; self.nextFrame = monotonic() + 3; if !self.closed { self.notifyError(error.localizedDescription); self.reschedule() }; lifecycle.leave() }
+                guard let self else { finish(); return }
+                self.queue.async { self.configuring = false; self.nextFrame = monotonic() + 3; if !self.closed { self.notifyError(error.localizedDescription); self.reschedule() }; finish() }
             }
         }
     }
@@ -176,8 +183,8 @@ final class StreamSession: @unchecked Sendable {
         let old = capture; capture = nil; geometry = nil; captureHasFrame = false; requestKeyframe()
         reconcileAccessibility()
         if let old {
-            let lifecycle = self.lifecycle; lifecycle.enter()
-            Task { @MainActor in await old.stop(); lifecycle.leave() }
+            let finish = beginCaptureWork()
+            Task { @MainActor in await old.stop(); finish() }
         }
     }
     private func notifyError(_ message: String) {
@@ -225,9 +232,13 @@ final class StreamSession: @unchecked Sendable {
             }
         }
     }
-    func stop() {
-        guard !closed else { return }; closed = true
-        accessibility.stop()
-        timer?.cancel(); timer = nil; pendingInput.removeAll(); input.cancel(id); releaseCapture(); onClose?(); onClose = nil
+    func stop(completion: @escaping () -> Void = {}) {
+        if !closed {
+            closed = true; accessibility.stop()
+            timer?.cancel(); timer = nil; pendingInput.removeAll(); input.cancel(id); releaseCapture(); onClose?(); onClose = nil
+        }
+        // Await only this device's capture work, including an in-flight configure.
+        // Other simulator captures do not delay or get stopped by this request.
+        captureLifecycle.notify(queue: queue, execute: completion)
     }
 }
