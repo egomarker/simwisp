@@ -17,6 +17,7 @@ trap cleanup EXIT
 sources=();for file in Sources/*.swift;do [[ "$file" == Sources/SimwispApp.swift ]] || sources+=("$file");done
 xcrun swiftc -swift-version 5 -O "${sources[@]}" Tests/Metro/Service/main.swift -o "$root/service"
 cp -R Resources/Web "$root/Web"
+if [[ -n "${METRO_SOURCE_BASELINE:-}" ]]; then cp "$METRO_SOURCE_BASELINE/Resources/Web/js/metro-console.js" "$root/Web/js/metro-console-before.js"; fi
 "$root/service" "$root" > "$root/service.log" 2>&1 & pid=$!
 for ((i=0;i<200;i++));do grep -q 'Isolated Metro service ready' "$root/service.log" && break;kill -0 "$pid" 2>/dev/null || { cat "$root/service.log" >&2;exit 1; };sleep .05;done
 grep -q 'Isolated Metro service ready' "$root/service.log" || { cat "$root/service.log" >&2;exit 1; }

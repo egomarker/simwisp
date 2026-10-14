@@ -1,4 +1,4 @@
-let styles;
+let styles, consoleSerial = 0;
 export function loadConsoleStyles() {
   return styles ||= new Promise((resolve, reject) => {
     const link = document.createElement('link'); link.rel = 'stylesheet'; link.href = '/css/metro-console.css';
@@ -28,7 +28,7 @@ function safeEntry(e) {
 export class MetroConsole {
   buffer = new ConsoleBuffer(); target = null; generation = 0; unread = 0; errors = 0; dropped = 0;
   #ws; #closed = false; #visible = false; #paused = false; #scroll = true; #page = 0; #query = ''; #levels = new Set(['log','info','warn','error']);
-  #anchor = null; #expanded = new Set(); #rowSerial = 0;
+  #anchor = null; #expanded = new Set(); #rowSerial = 0; #id = ++consoleSerial;
   #renderTimer; #noticeTimer; #retryTimer; #connectTimer; #searchTimer; #retry = 0; #lastDrop = 0; #lastSequence = 0; #epoch = 0;
   constructor(element, { deviceId, binding, onStatus = () => {}, onUnread = () => {}, requestRefresh = () => {} }) {
     this.element = element; this.deviceId = deviceId; this.binding = binding; this.onStatus = onStatus; this.onUnread = onUnread; this.requestRefresh = requestRefresh;
@@ -42,7 +42,7 @@ export class MetroConsole {
     this.search.addEventListener('input', () => { clearTimeout(this.#searchTimer); this.#searchTimer = setTimeout(() => { this.#query = this.search.value.slice(0, 256).toLowerCase(); this.#page = 0; this.#anchor = null; this.render(); },150); });
     this.pause = control('Pause','Pause console updates', () => { this.#paused = !this.#paused; this.pause.textContent = this.#paused ? 'Resume' : 'Pause'; this.pause.setAttribute('aria-pressed',String(this.#paused)); if (!this.#paused) this.render(); });
     this.pause.setAttribute('aria-pressed','false');
-    this.toolbar.append(this.search, this.pause, control('Clear','Clear local console',()=>{ this.buffer.clear(); this.dropped = 0; this.unread = 0; this.errors = 0; this.#page = 0; this.#anchor = null; this.#expanded.clear(); this.render(); this.onUnread(0,0); }));
+    this.toolbar.append(this.search, this.pause, control('Clear','Clear local console',()=>{ this.buffer.clear(); this.dropped = 0; this.unread = 0; this.errors = 0; this.#page = 0; this.#anchor = null; this.#expanded.clear(); this.list.replaceChildren(); this.render(); this.onUnread(0,0); }));
     this.auto = control('Auto-scroll','Console auto-scroll',()=>{ this.#scroll = !this.#scroll; if(this.#scroll){this.#page=0;this.#anchor=null;} this.auto.setAttribute('aria-pressed',String(this.#scroll)); this.render(); });this.auto.setAttribute('aria-pressed','true');
     this.toolbar.append(this.auto, control('Retry','Retry console connection',()=>{ this.#retry=0; this.requestRefresh(true); this.reconnect(); }));
     this.state = el('div','console-state','Connecting'); this.state.setAttribute('role','status'); this.state.setAttribute('aria-live','polite');
@@ -87,18 +87,37 @@ export class MetroConsole {
   setVisible(visible){this.#visible=visible;if(!visible){clearTimeout(this.#renderTimer);this.#renderTimer=null;}else{if(!this.#paused){this.unread=0;this.errors=0;this.onUnread(0,0);}this.render();}}
   render(){
     if(this.#closed||!this.#visible||this.#paused)return;
+    // Native toggle events are queued; capture their current state before replacing rows.
+    for(const details of this.list.querySelectorAll('.console-details')){const key=Number(details.parentElement.dataset.sequence);if(details.open)this.#expanded.add(key);else this.#expanded.delete(key);}
+    while(this.#expanded.size>300)this.#expanded.delete(this.#expanded.values().next().value);
     const entries=this.buffer.values.filter(e=>this.#levels.has(e.level)&&(!this.#query||e.text.toLowerCase().includes(this.#query)));
     const pages=Math.max(1,Math.ceil(entries.length/300));this.#page=Math.min(this.#page,pages-1);let end=Math.max(0,entries.length-this.#page*300),start=Math.max(0,end-300);
     if(!this.#scroll&&this.#anchor!=null){const index=entries.findIndex(e=>e.local_key===this.#anchor);if(index>=0){start=index;end=Math.min(entries.length,index+300);this.#page=Math.floor((entries.length-end)/300);}}
     if(!this.#scroll&&entries[start])this.#anchor=entries[start].local_key;
-    const fragment=document.createDocumentFragment();
+    const active=document.activeElement;
+    const focusKey=this.list.contains(active)&&active.matches('.console-source-link, .console-details > summary')?active.closest('.console-row').dataset.sequence:null;
+    const fragment=document.createDocumentFragment();let restoreFocus;
     for(const entry of entries.slice(start,end)){
       const row=el('div','console-row console-'+entry.level);row.dataset.sequence=entry.local_key;
       const head=el('div','console-row-head');const time=el('time','console-time',new Date(entry.timestamp_ms).toLocaleTimeString());head.append(time,el('span','console-level',entry.level),el('span','console-text',entry.text));row.append(head);
-      if(entry.source||entry.stack.length){const details=el('details','console-details');details.open=this.#expanded.has(entry.local_key);details.addEventListener('toggle',()=>{if(details.open){this.#expanded.add(entry.local_key);if(this.#expanded.size>300)this.#expanded.delete(this.#expanded.values().next().value);}else this.#expanded.delete(entry.local_key);});details.append(el('summary','',entry.source?`${entry.source.url}:${(entry.source.line||0)+1}:${(entry.source.column||0)+1}`:'Stack'));details.append(el('pre','',entry.stack.map(f=>`${f.function} (${f.url}:${f.line+1}:${f.column+1})`).join('\n')));row.append(details);}
+      if(entry.source||entry.stack.length){
+        const details=el('details','console-details');details.id=`console-source-${this.#id}-${entry.local_key}`;details.open=this.#expanded.has(entry.local_key);details.hidden=!details.open;
+        details.append(el('summary','',entry.source?`${entry.source.url}:${(entry.source.line||0)+1}:${(entry.source.column||0)+1}`:'Stack'));
+        details.append(el('pre','',entry.stack.map(f=>`${f.function} (${f.url}:${f.line+1}:${f.column+1})`).join('\n')));row.append(details);
+        const summary=details.firstElementChild;
+        const link=el('button','console-source-link',entry.source?`${(entry.source.line||0)+1}:${(entry.source.column||0)+1}`:'Stack');link.type='button';link.hidden=details.open;link.title=summary.textContent;
+        link.setAttribute('aria-label','Show source details '+link.textContent);link.setAttribute('aria-controls',details.id);link.setAttribute('aria-expanded',String(details.open));head.append(link);
+        const sync=()=>{
+          link.hidden=details.open;details.hidden=!details.open;link.setAttribute('aria-expanded',String(details.open));
+          if(details.open){this.#expanded.add(entry.local_key);if(this.#expanded.size>300)this.#expanded.delete(this.#expanded.values().next().value);}else this.#expanded.delete(entry.local_key);
+        };
+        link.addEventListener('click',()=>{details.open=true;sync();summary.focus({preventScroll:true});});
+        details.addEventListener('toggle',()=>{if(this.#closed||!this.list.contains(details))return;const focused=document.activeElement===summary;sync();if(!details.open&&focused)link.focus({preventScroll:true});});
+        if(row.dataset.sequence===focusKey)restoreFocus=details.open?summary:link;
+      }
       fragment.append(row);
     }
-    this.list.replaceChildren(fragment);if(!this.#scroll)this.list.scrollTop=0;this.older.disabled=this.#page>=pages-1;this.newer.disabled=this.#page===0;
+    this.list.replaceChildren(fragment);restoreFocus?.focus({preventScroll:true});if(!this.#scroll)this.list.scrollTop=0;this.older.disabled=this.#page>=pages-1;this.newer.disabled=this.#page===0;
     this.count.textContent=`${entries.length?start+1:0}–${end} / ${entries.length}${this.buffer.dropped+this.dropped?' · Dropped '+(this.buffer.dropped+this.dropped):''}`;
     if(this.#scroll&&this.#page===0)this.list.scrollTop=this.list.scrollHeight;
   }

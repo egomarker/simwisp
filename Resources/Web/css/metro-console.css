@@ -9,6 +9,9 @@
 .console-list { flex:1; min-height:0; overflow:auto; overscroll-behavior:contain; font-family:"SF Mono",Menlo,monospace; }
 .console-row { padding:4px 2px; border-bottom:1px solid var(--border-subtle); overflow-wrap:anywhere; }
 .console-row-head { display:flex; align-items:baseline; gap:6px; }
+.console-source-link { margin-left:auto; flex-shrink:0; font:inherit; font-size:11px; color:var(--accent); background:none; border:0; padding:0; white-space:nowrap; text-decoration:underline; cursor:pointer; }
+.console-source-link:hover { color:var(--accent-hover); }
+.console-source-link:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 .console-time,.console-level { color:var(--text-tertiary); font-size:10px; flex-shrink:0; }
 .console-text { white-space:pre-wrap; min-width:0; color:var(--text-primary); }
 .console-warn .console-level { color:#b5812b; }.console-error .console-level { color:#d45959; }
