@@ -9,7 +9,34 @@ struct Device: Codable {
     var width: Int
     var height: Int
     var project_app = false
+    // Backend-only alias; keep the AVD name/serial and public inventory unchanged.
+    var metroName: String? = nil
+    private enum CodingKeys: String, CodingKey { case id, name, platform, width, height, project_app }
     var json: [String: Any] { ["id": id, "name": name, "platform": platform, "width": width, "height": height, "project_app": project_app] }
+}
+// React Native's Android device label is Build.MODEL + release + SDK_INT,
+// not the emulator's AVD name. Read once per existing tool-cache refresh on the
+// discovery queue; failures create no alias and never retain a previous value.
+enum AndroidMetroIdentity {
+    static let properties = "getprop ro.product.model; getprop ro.build.version.release; getprop ro.build.version.sdk"
+    static func name(_ output: Data) -> String? {
+        guard output.count <= 1024, let text = String(data: output, encoding: .utf8) else { return nil }
+        var lines = text.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n")
+        if lines.last == "" { lines.removeLast() }
+        guard lines.count == 3 else { return nil }
+        let values = lines.map { $0.trimmingCharacters(in: .whitespaces) }
+        guard values.allSatisfy({ !$0.isEmpty && !$0.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) }),
+              values[0].utf8.count <= 128, values[1].utf8.count <= 64, values[2].utf8.count <= 6,
+              values[0].lowercased() != "unknown", values[1].lowercased() != "unknown",
+              values[2].utf8.allSatisfy({ (48...57).contains($0) }), let sdk = Int(values[2]), (1...1000).contains(sdk) else { return nil }
+        return values[0] + " - " + values[1] + " - API " + String(sdk)
+    }
+    static func read(adb: String, serial: String,
+                     run: (String, [String], Double) throws -> CommandResult = { try command($0, $1, timeout: $2) }) -> String? {
+        guard DeviceControl.validID(serial, platform: "android"),
+              let result = try? run(adb, ["-s", serial, "shell", properties], 3), result.status == 0 else { return nil }
+        return name(result.output)
+    }
 }
 struct DeviceWindow: Equatable {
     let id: CGWindowID
@@ -199,7 +226,8 @@ final class Devices {
             let title = (try? command(adb, ["-s", serial, "emu", "avd", "name"], timeout: 3).text.components(separatedBy: .newlines).first) ?? serial
             // Unknown until a matching Quartz window is found. Do not present
             // ADB's physical/override resolution as the streamed window size.
-            return Device(id: serial, name: title.replacingOccurrences(of: "_", with: " "), platform: "android", width: 0, height: 0)
+            return Device(id: serial, name: title.replacingOccurrences(of: "_", with: " "), platform: "android", width: 0, height: 0,
+                          metroName: AndroidMetroIdentity.read(adb: adb, serial: serial))
         }
     }
     func boot(_ id: String) throws {

@@ -13,5 +13,7 @@
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSScreenCaptureUsageDescription</key><string>Simwisp streams the selected simulator and emulator windows to your paired browser.</string>
+<!-- Metro is strictly numeric loopback; HTTPS/WSS browser policy is unchanged. -->
+<key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>

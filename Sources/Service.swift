@@ -10,6 +10,7 @@ final class Service {
     let server = HTTPServer()
     private(set) var tls: TLSIdentity?
     private let terminals: TerminalManager
+    private let metro: MetroConsoleManager
     private let workers = DispatchQueue(label: "Simwisp.device-actions", qos: .userInitiated)
     private var stopping = Set<String>() // network queue owns destructive-action admission
     private let makeCapture: (DeviceWindow) -> WindowCapture
@@ -25,12 +26,13 @@ final class Service {
     private var usage = Usage() // sampled on the network queue for diagnostics only
     private var panelState: [String: Any] = ["visible": false, "refresh_timer": false, "refreshes": 0]
     var stateChanged: ((String) -> Void)?
-    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory, devices: Devices? = nil, captureStopTimeout: Double = 20, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
+    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory, devices: Devices? = nil, metroEndpoint: URL = URL(string: "http://127.0.0.1:8081/json/list")!, captureStopTimeout: Double = 20, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
         self.pairingStateURL = pairingStateURL; self.tlsDirectory = tlsDirectory
         self.settings = settings; self.makeCapture = makeCapture; self.captureStopTimeout = captureStopTimeout
         let selectedDevices = devices ?? Devices(settings: settings)
         self.devices = selectedDevices; input = DeviceInput(devices: selectedDevices)
         terminals = TerminalManager(settings: settings, network: server.queue)
+        metro = MetroConsoleManager(network: server.queue, endpoint: metroEndpoint)
         cookie = SHA256.hash(data: Data(("simwisp-session-v1:" + settings.pairingToken).utf8)).map { String(format: "%02x", $0) }.joined()
         server.authorize = { [weak self] request in
             guard let self, self.authenticated(request) else { return false }
@@ -52,6 +54,7 @@ final class Service {
     func stop(completion: @escaping () -> Void = {}) {
         devices.stop(); lifecycle.enter()
         terminals.stop { self.lifecycle.leave() }
+        lifecycle.enter(); metro.stop { self.lifecycle.leave() }
         lifecycle.enter()
         server.stop { self.pairingQueue.async { self.input.queue.async { self.lifecycle.leave() } } }
         lifecycle.notify(queue: .main, execute: completion)
@@ -67,6 +70,7 @@ final class Service {
     }
     private func upgrade(_ request: HTTPRequest, client: ClientConnection) {
         if request.path == "/ws/pty" { terminals.attach(request, client: client); return }
+        if request.path == "/ws/metro-console" { metro.install(client, allowedDevice: { [weak self] id in self?.streams[id] != nil && self?.stopping.contains(id) == false }); return }
         devices.requestRefresh { [weak self, weak client] in
             guard let self, let client else { return }
             self.server.queue.async {
@@ -131,10 +135,18 @@ final class Service {
         if request.method != "GET" && !request.sameOrigin { complete(.json(["error": "Origin denied"], status: 403)); return }
         switch (request.method, request.path) {
         case ("GET", "/api/info"):
-            var info: [String: Any] = ["mode": "fast2 (ScreenCaptureKit + VideoToolbox H.264 + Quartz input)", "video_codec": "h264", "transport": "https", "app": "Simwisp", "version": "0.2.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true, "device_stop": true]]
+            var info: [String: Any] = ["mode": "fast2 (ScreenCaptureKit + VideoToolbox H.264 + Quartz input)", "video_codec": "h264", "transport": "https", "app": "Simwisp", "version": "0.2.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true, "device_stop": true, "metroConsole": true]]
             if settings.terminalEnabled == true { info["project_dir"] = settings.projectDirectory }
             if let bundle = devices.projectBundleID { info["bundle_id"] = bundle }
             complete(.json(info))
+        case ("GET", "/api/metro/targets"):
+            guard (request.headers["origin"] == nil || request.sameOrigin), request.headers["sec-fetch-site"] != "cross-site" else { complete(.json(["error": "Origin denied"], status: 403)); return }
+            // A same-model emulator need not have an open browser panel. Match
+            // against all running devices so it cannot make a shared alias look
+            // unique. Attachment still requires the selected stream above.
+            metro.discover(devices: devices.list()) { result in
+                switch result { case .success(let value): complete(.json(value)); case .failure: complete(.json(["error": "Metro discovery unavailable"], status: 503)) }
+            }
         case ("GET", "/api/sims"):
             devices.requestRefresh { complete(.json(self.devices.list().map(\.json))) }
         case ("GET", "/api/devices"):
@@ -143,7 +155,8 @@ final class Service {
         case ("GET", "/api/terminals"): terminals.snapshots { complete(.json($0)) }
         case ("GET", "/api/status"):
             usage.sample()
-            complete(.json(["cpu_one_core_percent": usage.cpu, "physical_footprint_bytes": usage.memory, "sessions": streams.count, "capture": CaptureHealth.shared.snapshot, "discovery": devices.diagnostics, "panel": panelState, "terminal": terminals.diagnostics, "lan_sharing": settings.shareLAN]))
+            let status: [String: Any] = ["cpu_one_core_percent": usage.cpu, "physical_footprint_bytes": usage.memory, "sessions": streams.count, "capture": CaptureHealth.shared.snapshot, "discovery": devices.diagnostics, "panel": panelState, "terminal": terminals.diagnostics, "lan_sharing": settings.shareLAN]
+            metro.diagnostics { counts in var value = status; value["metro"] = counts; complete(.json(value)) }
         case ("POST", "/api/request-permissions"):
             let permission = dictionary(request.body)["permission"] as? String
             DispatchQueue.main.async {

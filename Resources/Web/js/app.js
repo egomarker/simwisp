@@ -1,6 +1,7 @@
 import { fetchInfo, fetchSims, fetchAvailableDevices, bootSim, bootAvd, stopSim, fetchStopStatus, requestPermission } from './api.js';
 import { SimStream } from './stream.js';
 import { initTheme } from './theme.js';
+import { MetroDiscovery, consoleIdentity, resolveConsole } from './metro-discovery.js';
 
 initTheme();
 
@@ -68,7 +69,7 @@ function updateViewportVars() {
   app.classList.toggle('keyboard-open', keyboardInset > 60);
 
   requestAnimationFrame(() => {
-    termTabs.find(t => t.id === activeTermTabId)?.terminal.fit();
+    termTabs.find(t => t.id === activeTermTabId)?.controller.fit();
     if (keyboardInset <= 60) simPanels.forEach(p => sizeFrame(p));
   });
 }
@@ -284,6 +285,7 @@ async function loadSims({ reconcileAction = true } = {}) {
     updateModeBadge(info);
     renderPermsWidget(info);
     terminalCapability(info.features?.terminal);
+    metroDiscovery.capability(info.features?.metroConsole);
     canStopDevices = info.features?.device_stop === true;
 
     if (info.bundle_id) {
@@ -680,6 +682,8 @@ function removeSimPanel(udid, { silent = false } = {}) {
   const panel = simPanels.get(udid);
   if (!panel) return;
 
+  metroDiscovery.setActive(udid, false);
+  closeDeviceConsoles(udid);
   panel.accessibility?.setOpen(false);
   panel.stream?.destroy();
   panel.ro?.disconnect();
@@ -825,6 +829,8 @@ function updatePanelStatus(udid, status, message = null) {
   const panel = simPanels.get(udid);
   if (!panel) return;
   const { dotEl, overlayEl } = panel;
+  panel.metroStreaming = ['connected', 'streaming'].includes(status);
+  metroDiscovery.setActive(udid, panel.metroStreaming);
   const active = !document.hidden && !(isMobileViewport() && termOpen) && ['connected', 'streaming'].includes(status);
   panel.accessibility?.setActive(active);
   if (panel.accessibility?.isOpen) panel.stream?.updateSettings({ accessibility_enabled: active, accessibility_subscription: panel.accessibility.subscription });
@@ -959,6 +965,9 @@ function createPill(udid, name, platform) {
     <button class="pill-btn" data-action="close" title="Close ${esc(name)}">
       <svg width="16" height="16" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>
     </button>
+    <button class="pill-btn metro-console-toggle" data-action="metro-console" title="React-Native console" aria-label="React-Native console" aria-pressed="false" hidden style="display:none" tabindex="-1">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><rect x="3.5" y="3" width="17" height="18" rx="3" stroke="currentColor" stroke-width="1.7"/><path d="M7 9l3 3-3 3M12.5 15H17M8 6.5h8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
     </div>`;
   pill.querySelector('.panel-telemetry').title = name;
   pill.querySelector('.panel-actions').setAttribute('aria-label', name + ' controls');
@@ -973,6 +982,7 @@ function createPill(udid, name, platform) {
     setFocusedPanel(udid);
 
     switch (action) {
+      case 'metro-console': openDeviceConsole(udid).catch(() => deviceActionMessage('Console could not load; retry.', true)); break;
       case 'close': removeSimPanel(udid); break;
       case 'rotate': panel?.stream?.send({ type: 'rotate' }); break;
       case 'home':   panel?.stream?.send({ type: 'home' });   break;
@@ -1072,106 +1082,166 @@ let termFontSize = 13;
 try { termFontSize = Math.min(24, Math.max(9, parseInt(localStorage.getItem('termFontSize')) || 13)); } catch {}
 $('font-size-val').textContent = termFontSize;
 
+// Typed developer tabs; PTY controller/protocol remains in terminal.js only.
+const DEV_TABS_KEY = 'simwispDeveloperTabs';
+let developerStyles, consoleModule, consoleLoading, metroDisposed = false, consolesRestored = false;
+let picker = null;
+const METRO_BINDINGS_KEY='simwispMetroBindings';
+let confirmedBindings={};try{const raw=sessionStorage.getItem(METRO_BINDINGS_KEY);if(raw&&raw.length<=65536)confirmedBindings=JSON.parse(raw)||{};}catch{}
+const startupDeveloperState=savedDeveloperTabs();
+const startupActiveDescriptor=startupDeveloperState.tabs?.find(t=>t.id===startupDeveloperState.activeId);
+function restoreActiveDeveloperTab(){const found=termTabs.find(t=>startupActiveDescriptor?.type==='terminal'?t.type==='terminal'&&t.controller?.sessionId===startupActiveDescriptor.sessionId:t.type==='metro-console'&&t.identity===consoleIdentity(startupActiveDescriptor?.deviceId,startupActiveDescriptor?.binding||{}));if(found)activateTermTab(found.id);}
+let pendingTerminalRestore=[];try{pendingTerminalRestore=(JSON.parse(sessionStorage.getItem(TERM_TABS_KEY))||[]).slice(0,8);}catch{}
+const metroDiscovery = new MetroDiscovery(snapshot => {
+  refreshConsoleButtons();
+  for (const tab of termTabs.filter(t => t.type === 'metro-console')) {
+    const target = resolveConsole(tab.binding, snapshot.targets, tab.deviceId);
+    tab.controller?.setTarget(target, snapshot.generation);
+  }
+  if (metroDiscovery.enabled) restoreConsoleTabs();
+});
+function savedDeveloperTabs() {
+  try { const raw = sessionStorage.getItem(DEV_TABS_KEY); if (!raw || raw.length > 65536) return {}; return JSON.parse(raw) || {}; } catch { return {}; }
+}
+function refreshConsoleButtons() {
+  for (const [id,panel] of simPanels) {
+    const b = panel.pillEl.querySelector('[data-action="metro-console"]'); if (!b) continue;
+    const available = metroDiscovery.enabled && metroDiscovery.candidates(id).length > 0;
+    b.hidden = !available; b.style.display = available ? '' : 'none'; b.tabIndex = available ? 0 : -1;
+    const pressed = termTabs.some(t => t.type === 'metro-console' && t.deviceId === id);
+    b.setAttribute('aria-pressed',String(pressed)); b.classList.toggle('active',pressed);
+  }
+  terminalButton.disabled = !terminalEnabled && !termTabs.some(t => t.type === 'metro-console');
+}
 function terminalCapability(enabled) {
   terminalEnabled = !!enabled;
-  terminalButton.disabled = !terminalEnabled;
+  terminalButton.disabled = !terminalEnabled && !termTabs.some(t => t.type === 'metro-console');
   terminalButton.title = terminalEnabled ? 'Open a Mac terminal' : 'Enable Mac terminal access in Simwisp’s menu';
-  if (!terminalEnabled && termTabs.length) {
-    termTabs.forEach(tab => { tab.terminal.destroy(); tab.el.remove(); });
-    termTabs = []; activeTermTabId = null; closeTerminal(); persistTerminalTabs();
-  }
+  if (!terminalEnabled) {pendingTerminalRestore=[];for (const tab of [...termTabs]) if (tab.type === 'terminal') closeTermTab(tab.id);}
+  $('btn-add-term').disabled = !terminalEnabled || termTabs.filter(t=>t.type==='terminal').length >= 8;
 }
 function persistTerminalTabs() {
-  try { sessionStorage.setItem(TERM_TABS_KEY, JSON.stringify(termTabs.map(tab => ({ sessionId: tab.terminal.sessionId, label: tab.label })))); } catch {}
+  try {
+    sessionStorage.setItem(TERM_TABS_KEY, JSON.stringify([...termTabs.filter(t=>t.type==='terminal').map(tab=>({sessionId:tab.controller?.sessionId,label:tab.label})),...pendingTerminalRestore]));
+    sessionStorage.setItem(DEV_TABS_KEY,JSON.stringify({activeId:activeTermTabId,tabs:termTabs.map(tab=>tab.type==='terminal'
+      ? {type:'terminal',id:tab.id,label:tab.label,sessionId:tab.controller?.sessionId}
+      : {type:'metro-console',id:tab.id,label:tab.label,deviceId:tab.deviceId,binding:tab.binding})}));
+  } catch {}
 }
 function activeTerminal() { return termTabs.find(tab => tab.id === activeTermTabId); }
 function updateTerminalStatus() {
   const status = activeTerminal()?.status || 'connecting';
   termStatusDot.className = 'status-dot';
-  if (status === 'connected') termStatusDot.classList.add('connected');
+  if (status === 'connected' || status === 'attached') termStatusDot.classList.add('connected');
   else if (status === 'reconnecting') termStatusDot.classList.add('reconnecting');
-  termStatusDot.title = status; termStatusDot.setAttribute('aria-label', 'Terminal ' + status);
+  termStatusDot.title = status; termStatusDot.setAttribute('aria-label', (activeTerminal()?.type==='metro-console'?'Console ':'Terminal ') + status);
 }
 function renderTermTabs() {
-  termTabsBar.innerHTML = termTabs.map(tab => `<div class="term-tab${tab.id === activeTermTabId ? ' active' : ''}" data-id="${tab.id}" role="tab" tabindex="0" aria-selected="${tab.id === activeTermTabId}"><span class="term-tab-label">${esc(tab.label)}</span><button class="term-tab-close" aria-label="Close ${esc(tab.label)}">✕</button></div>`).join('');
-  termTabsBar.querySelectorAll('.term-tab').forEach(el => {
-    el.addEventListener('click', event => { if (!event.target.closest('.term-tab-close')) activateTermTab(el.dataset.id); });
-    el.addEventListener('keydown', event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activateTermTab(el.dataset.id); } });
-    el.querySelector('.term-tab-close').addEventListener('click', () => closeTermTab(el.dataset.id));
-  });
-  $('btn-add-term').disabled = termTabs.length >= 8;
+  termTabsBar.replaceChildren();termTabsBar.setAttribute('role','tablist');termTabsBar.setAttribute('aria-label','Terminal and console tabs');
+  for (const tab of termTabs) {
+    const el=document.createElement('div');el.className='term-tab'+(tab.id===activeTermTabId?' active':'');el.dataset.id=tab.id;el.dataset.type=tab.type;el.id='developer-tab-'+tab.id;el.setAttribute('aria-controls',tab.id);tab.el.setAttribute('aria-labelledby',el.id);el.setAttribute('role','tab');el.tabIndex=0;el.title=tab.label;el.setAttribute('aria-selected',String(tab.id===activeTermTabId));
+    const label=document.createElement('span');label.className='term-tab-label';label.textContent=tab.label;
+    const badge=document.createElement('span');badge.className='term-tab-badge'+(tab.errors?' has-errors':'');badge.textContent=tab.unread?String(tab.unread):'';
+    const close=document.createElement('button');close.className='term-tab-close';close.textContent='✕';close.setAttribute('aria-label','Close '+tab.label);
+    close.addEventListener('click',e=>{e.stopPropagation();closeTermTab(tab.id);});el.append(label,badge,close);
+    el.addEventListener('click',e=>{if(!e.target.closest('.term-tab-close'))activateTermTab(tab.id);});
+    el.addEventListener('keydown',e=>{if(e.target===close)return;if(e.key==='Enter'||e.key===' '){e.preventDefault();activateTermTab(tab.id);}});
+    termTabsBar.append(el);
+  }
+  $('btn-add-term').disabled=!terminalEnabled||termTabs.filter(t=>t.type==='terminal').length>=8;
 }
-function addTermTab(saved = {}) {
-  if (termTabs.length >= 8) return;
-  const id = 'term-' + (++termSerial);
-  const el = document.createElement('div'); el.className = 'term-pane'; el.id = id; termPanesEl.append(el);
-  const tab = { id, label: saved.label || 'Terminal ' + termSerial, terminal: null, el, status: 'connecting' };
-  termTabs.push(tab);
-  tab.terminal = new SimTerminal(el, {
-    sessionId: saved.sessionId || null,
-    onStatus: status => { tab.status = status; if (activeTermTabId === id) updateTerminalStatus(); },
-    onSession: () => persistTerminalTabs(),
-  });
-  tab.terminal.setFontSize(termFontSize);
-  activateTermTab(id); persistTerminalTabs();
+async function ensureDeveloperStyles() {
+  if(!developerStyles) developerStyles=new Promise((resolve,reject)=>{const link=document.createElement('link');link.rel='stylesheet';link.href='/css/terminal.css';link.onload=resolve;link.onerror=()=>{link.remove();developerStyles=null;reject(Error('Developer panel unavailable'));};document.head.append(link);});
+  await developerStyles;
+  if(!terminalResizeObserver){terminalResizeObserver=new ResizeObserver(()=>{if(termOpen)activeTerminal()?.controller.fit();});terminalResizeObserver.observe(termPanesEl);}
 }
+async function ensureTerminal() {
+  if(!terminalEnabled)return false;
+  if(!terminalLoading)terminalLoading=import('./terminal.js').then(async m=>{await m.loadTerminalAssets();SimTerminal=m.SimTerminal;}).catch(()=>{terminalLoading=null;return false;});
+  await terminalLoading;return !!SimTerminal&&terminalEnabled&&!metroDisposed;
+}
+function tabElement(id){const el=document.createElement('div');el.className='term-pane';el.id=id;el.setAttribute('role','tabpanel');termPanesEl.append(el);return el;}
+function addTermTab(saved={}) {
+  if(!terminalEnabled||!SimTerminal||termTabs.filter(t=>t.type==='terminal').length>=8)return;
+  const id='term-'+(++termSerial),el=tabElement(id);
+  const tab={type:'terminal',id,label:saved.label||'Terminal '+termSerial,controller:null,el,status:'connecting'};termTabs.push(tab);
+  tab.controller=new SimTerminal(el,{sessionId:saved.sessionId||null,onStatus:status=>{tab.status=status;if(activeTermTabId===id)updateTerminalStatus();},onSession:()=>persistTerminalTabs()});
+  tab.controller.setFontSize(termFontSize);activateTermTab(id);persistTerminalTabs();
+}
+function syncConsoleVisibility(){for(const tab of termTabs)if(tab.type==='metro-console')tab.controller?.setVisible(termOpen&&tab.id===activeTermTabId&&!document.hidden);}
 function activateTermTab(id) {
-  activeTermTabId = id;
-  termTabs.forEach(tab => { tab.el.classList.toggle('active', tab.id === id); tab.el.inert = tab.id !== id; });
-  renderTermTabs(); updateTerminalStatus();
-  if (termOpen) { activeTerminal()?.terminal.fit(); activeTerminal()?.terminal.focus(); }
+  activeTermTabId=id;termTabs.forEach(tab=>{tab.el.classList.toggle('active',tab.id===id);tab.el.inert=tab.id!==id;});
+  syncConsoleVisibility();renderTermTabs();updateTerminalStatus();
+  if(termOpen){activeTerminal()?.controller?.fit();activeTerminal()?.controller?.focus();}persistTerminalTabs();
 }
 function closeTermTab(id) {
-  const index = termTabs.findIndex(tab => tab.id === id); if (index < 0) return;
-  const [tab] = termTabs.splice(index, 1); tab.terminal.destroy(); tab.el.remove();
-  if (!termTabs.length) { activeTermTabId = null; termPinned = false; content.classList.remove('pinned-right'); closeTerminal(); }
-  else if (activeTermTabId === id) activateTermTab(termTabs[Math.max(0, index - 1)].id);
-  renderTermTabs(); persistTerminalTabs(); saveSession();
+  const index=termTabs.findIndex(tab=>tab.id===id);if(index<0)return;const [tab]=termTabs.splice(index,1);tab.controller?.destroy();tab.el.remove();
+  if(!termTabs.length){activeTermTabId=null;termPinned=false;content.classList.remove('pinned-right');closeTerminal();}
+  else if(activeTermTabId===id)activateTermTab(termTabs[Math.max(0,index-1)].id);
+  renderTermTabs();refreshConsoleButtons();persistTerminalTabs();saveSession();
+}
+function closeDeviceConsoles(id){for(const tab of [...termTabs])if(tab.type==='metro-console'&&tab.deviceId===id)closeTermTab(tab.id);if(picker?.deviceId===id)picker.close();}
+function revealDeveloperPanel(){
+  termOpen=true;termPanelEl.hidden=false;termPanelEl.inert=false;termPanelEl.classList.remove('closed');content.classList.add('terminal-open');content.classList.toggle('pinned-right',termPinned);
+  terminalButton.classList.add('active');terminalButton.setAttribute('aria-expanded','true');
+  updateViewportVars();updateStreamVisibility();closeMobileSidebar();syncConsoleVisibility();activeTerminal()?.controller?.fit();activeTerminal()?.controller?.focus();saveSession();
 }
 async function openTerminal() {
-  if (!terminalEnabled) return;
-  if (!SimTerminal) {
-    if (!terminalLoading) terminalLoading = import('./terminal.js').then(async module => {
-      await module.loadTerminalAssets(); SimTerminal = module.SimTerminal;
-      terminalResizeObserver = new ResizeObserver(() => { if (termOpen) activeTerminal()?.terminal.fit(); });
-      terminalResizeObserver.observe(termPanesEl);
-    }).catch(error => { terminalLoading = null; console.warn('Simwisp terminal:', error.message); terminalButton.title = 'Terminal could not load; click to retry'; throw error; });
-    try { await terminalLoading; } catch { return; }
-  }
-  if (!terminalEnabled) return;
-  termOpen = true; termPanelEl.hidden = false; termPanelEl.inert = false; termPanelEl.classList.remove('closed');
-  content.classList.add('terminal-open'); content.classList.toggle('pinned-right', termPinned);
-  terminalButton.classList.add('active'); terminalButton.setAttribute('aria-expanded', 'true');
-  if (!termTabs.length) {
-    let saved = [];
-    try { saved = JSON.parse(sessionStorage.getItem(TERM_TABS_KEY)) || []; } catch {}
-    if (saved.length) saved.slice(0, 8).forEach(addTermTab); else addTermTab();
-  }
-  activeTerminal()?.terminal.reconnect();
-  updateViewportVars(); updateStreamVisibility(); closeMobileSidebar();
-  activeTerminal()?.terminal.fit(); activeTerminal()?.terminal.focus(); saveSession();
+  if(!terminalEnabled&&!termTabs.length)return;await ensureDeveloperStyles();if(metroDisposed)return;
+  if(!termTabs.some(t=>t.type==='terminal')&&terminalEnabled){const saved=pendingTerminalRestore;pendingTerminalRestore=[];if(saved.length||!termTabs.length){if(!await ensureTerminal()){pendingTerminalRestore=saved;return;}if(saved.length)saved.forEach(addTermTab);else addTermTab();}}
+  revealDeveloperPanel();activeTerminal()?.controller?.reconnect();
 }
 function closeTerminal() {
-  termOpen = false; termPanelEl.classList.add('closed'); termPanelEl.hidden = true; termPanelEl.inert = true;
-  content.classList.remove('terminal-open'); content.classList.remove('pinned-right');
-  terminalButton.classList.remove('active'); terminalButton.setAttribute('aria-expanded', 'false');
-  updateViewportVars(); updateStreamVisibility(); saveSession();
+  termOpen=false;termPanelEl.classList.add('closed');termPanelEl.hidden=true;termPanelEl.inert=true;content.classList.remove('terminal-open');content.classList.remove('pinned-right');
+  terminalButton.classList.remove('active');terminalButton.setAttribute('aria-expanded','false');syncConsoleVisibility();updateViewportVars();updateStreamVisibility();saveSession();
 }
-terminalButton.addEventListener('click', () => { if (termOpen) closeTerminal(); else openTerminal(); });
-$('btn-close-term').addEventListener('click', closeTerminal);
-$('btn-add-term').addEventListener('click', () => addTermTab());
-$('btn-pin-term').addEventListener('click', () => {
-  termPinned = !termPinned; content.classList.toggle('pinned-right', termPinned);
-  $('btn-pin-term').classList.toggle('active', termPinned); $('btn-pin-term').setAttribute('aria-pressed', String(termPinned));
-  termPanelEl.style.height = ''; termPanelEl.style.width = ''; updateViewportVars(); saveSession();
-});
-function changeTerminalFont(delta) {
-  termFontSize = Math.min(24, Math.max(9, termFontSize + delta)); $('font-size-val').textContent = termFontSize;
-  termTabs.forEach(tab => tab.terminal.setFontSize(termFontSize));
-  try { localStorage.setItem('termFontSize', termFontSize); } catch {}
+async function ensureConsole(){await ensureDeveloperStyles();if(!consoleLoading)consoleLoading=import('./metro-console.js').then(async m=>{await m.loadConsoleStyles();consoleModule=m;}).catch(e=>{consoleLoading=null;throw e;});await consoleLoading;}
+async function addConsoleTab(deviceId,target,saved=null,confirmed=false) {
+  const panel=simPanels.get(deviceId);if(!panel||!metroDiscovery.enabled||metroDisposed)return;
+  const binding=saved?.binding||{key:target.key,target_id:target.target_id,app_id:target.app_id,endpoint:target.endpoint,confirmed};
+  if(confirmed){const identity=consoleIdentity(deviceId,binding);confirmedBindings[identity]=binding;const keys=Object.keys(confirmedBindings);for(const key of keys.slice(0,Math.max(0,keys.length-64)))delete confirmedBindings[key];try{sessionStorage.setItem(METRO_BINDINGS_KEY,JSON.stringify(confirmedBindings));}catch{}}
+  const identity=consoleIdentity(deviceId,binding);let existing=termTabs.find(t=>t.type==='metro-console'&&t.identity===identity);
+  if(existing){if(!saved&&target){existing.binding=binding;existing.controller.setTarget(target,metroDiscovery.snapshot.generation);}activateTermTab(existing.id);if(!saved)revealDeveloperPanel();return;}
+  if(termTabs.filter(t=>t.type==='metro-console').length>=8){deviceActionMessage('Console limit reached (8 tabs).',true);return;}
+  await ensureConsole();if(metroDisposed||simPanels.get(deviceId)!==panel||!metroDiscovery.enabled)return;
+  existing=termTabs.find(t=>t.type==='metro-console'&&t.identity===identity);if(existing){activateTermTab(existing.id);if(!saved)revealDeveloperPanel();return;}
+  if(termTabs.filter(t=>t.type==='metro-console').length>=8)return;
+  const id='console-'+(++termSerial),el=tabElement(id),appName=target?.app_id||target?.title;
+  const tab={type:'metro-console',id,label:saved?.label||'Console · '+(appName?appName+' · ':'')+panel.name,deviceId,binding,identity,el,controller:null,status:'connecting',unread:0,errors:0};termTabs.push(tab);
+  tab.controller=new consoleModule.MetroConsole(el,{deviceId,binding,onStatus:status=>{tab.status=status;if(activeTermTabId===id)updateTerminalStatus();},onUnread:(unread,errors)=>{tab.unread=unread;tab.errors=errors;const badge=termTabsBar.querySelector('[data-id="'+id+'"] .term-tab-badge');if(badge){badge.textContent=unread?String(unread):'';badge.classList.toggle('has-errors',errors>0);}},requestRefresh:user=>metroDiscovery.refresh(user)});
+  tab.controller.setFontSize(termFontSize);tab.controller.setTarget(resolveConsole(binding,metroDiscovery.snapshot.targets,deviceId),metroDiscovery.snapshot.generation);
+  if(!saved){activateTermTab(id);revealDeveloperPanel();}else{tab.el.inert=true;renderTermTabs();}
+  refreshConsoleButtons();persistTerminalTabs();
 }
-$('btn-font-dec').addEventListener('click', () => changeTerminalFont(-1));
-$('btn-font-inc').addEventListener('click', () => changeTerminalFont(1));
+async function openDeviceConsole(id) {
+  const candidates=metroDiscovery.candidates(id);if(!candidates.length)return;
+  const existing=termTabs.find(t=>t.type==='metro-console'&&t.deviceId===id);
+  if(existing&&candidates.length===1){activateTermTab(existing.id);await ensureDeveloperStyles();revealDeveloperPanel();return;}
+  if(candidates.length===1){const known=confirmedBindings[consoleIdentity(id,candidates[0])];const confirmed=known?.confirmed===true&&resolveConsole(known,candidates,id)===candidates[0];if(!candidates[0].requires_confirmation||confirmed){await addConsoleTab(id,candidates[0],null,confirmed);return;}}
+  await ensureConsole();if(metroDisposed||!simPanels.has(id))return;if(picker)picker.close();
+  const dialog=document.createElement('dialog');dialog.className='metro-picker';dialog.deviceId=id;const previous=document.activeElement;
+  const heading=document.createElement('h2');heading.textContent='Choose React Native target';dialog.append(heading);
+  const hint=document.createElement('p');hint.textContent='Select the app running on this device. No target is attached until you choose.';dialog.append(hint);
+  for(const t of candidates){const b=document.createElement('button');b.className='metro-picker-choice';b.textContent=t.app_id||t.title||'React Native';const detail=document.createElement('small');detail.textContent=[t.device_name||'Device unknown',t.runtime,t.endpoint,termTabs.some(tab=>tab.identity===consoleIdentity(id,t))?'Tab already open':''].filter(Boolean).join(' · ');b.append(detail);b.addEventListener('click',()=>{dialog.close();addConsoleTab(id,t,null,true).catch(()=>deviceActionMessage('Console could not load; retry.',true));});dialog.append(b);}
+  const cancel=document.createElement('button');cancel.className='console-control';cancel.textContent='Cancel';cancel.addEventListener('click',()=>dialog.close());dialog.append(cancel);
+  dialog.addEventListener('close',()=>{if(picker===dialog)picker=null;dialog.remove();if(previous?.isConnected)previous.focus();});document.body.append(dialog);picker=dialog;dialog.showModal();cancel.focus();
+}
+async function restoreConsoleTabs() {
+  if(consolesRestored||metroDisposed||!simPanels.size)return;consolesRestored=true;const saved=savedDeveloperTabs();
+  for(const descriptor of (Array.isArray(saved.tabs)?saved.tabs:[]).filter(t=>t.type==='metro-console').slice(0,8)){
+    if(!simPanels.has(descriptor.deviceId)||typeof descriptor.binding?.endpoint!=='string'||typeof descriptor.binding?.target_id!=='string')continue;
+    const binding={key:String(descriptor.binding.key||'').slice(0,256),app_id:String(descriptor.binding.app_id||'').slice(0,512),target_id:descriptor.binding.target_id.slice(0,256),endpoint:descriptor.binding.endpoint.slice(0,128),confirmed:descriptor.binding.confirmed===true};
+    await addConsoleTab(descriptor.deviceId,resolveConsole(binding,metroDiscovery.snapshot.targets,descriptor.deviceId),{label:String(descriptor.label||'Console · React Native').slice(0,1024),binding});
+  }
+  if(termTabs.length){const descriptor=saved.tabs?.find(s=>s.id===saved.activeId);const active=descriptor?.type==='metro-console'?termTabs.find(t=>t.identity===consoleIdentity(descriptor.deviceId,descriptor.binding)):null;activateTermTab((active||termTabs[0]).id);if(restoreSession()?.termOpen)revealDeveloperPanel();}
+}
+terminalButton.addEventListener('click',()=>{if(termOpen)closeTerminal();else openTerminal();});
+$('btn-close-term').addEventListener('click',closeTerminal);
+$('btn-add-term').addEventListener('click',async()=>{if(await ensureTerminal()){await ensureDeveloperStyles();addTermTab();revealDeveloperPanel();}});
+$('btn-pin-term').addEventListener('click',()=>{termPinned=!termPinned;content.classList.toggle('pinned-right',termPinned);$('btn-pin-term').classList.toggle('active',termPinned);$('btn-pin-term').setAttribute('aria-pressed',String(termPinned));termPanelEl.style.height='';termPanelEl.style.width='';updateViewportVars();saveSession();});
+function changeTerminalFont(delta){termFontSize=Math.min(24,Math.max(9,termFontSize+delta));$('font-size-val').textContent=termFontSize;termTabs.forEach(tab=>tab.controller?.setFontSize(termFontSize));try{localStorage.setItem('termFontSize',termFontSize);}catch{}}
+$('btn-font-dec').addEventListener('click',()=>changeTerminalFont(-1));$('btn-font-inc').addEventListener('click',()=>changeTerminalFont(1));
+document.addEventListener('visibilitychange',syncConsoleVisibility);
 let termDrag = null;
 termResizeHandle.addEventListener('pointerdown', event => {
   event.preventDefault(); termResizeHandle.setPointerCapture(event.pointerId);
@@ -1184,7 +1254,7 @@ termResizeHandle.addEventListener('pointermove', event => {
   updateViewportVars();
 });
 ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(name => termResizeHandle.addEventListener(name, () => { termDrag = null; }));
-window.addEventListener('pagehide', () => { simPanels.forEach(p => { p.accessibility?.setOpen(false); p.stream?.destroy(); }); persistTerminalTabs(); termTabs.forEach(tab => tab.terminal.destroy({ terminate: false })); });
+window.addEventListener('pagehide', () => { metroDisposed=true;metroDiscovery.destroy();picker?.close();simPanels.forEach(p=>{p.accessibility?.setOpen(false);p.stream?.destroy();});persistTerminalTabs();termTabs.forEach(tab=>tab.controller?.destroy({terminate:false}));terminalResizeObserver?.disconnect(); });
 window.addEventListener('pageshow', e => { if (e.persisted) location.reload(); });
 
 // ── Session persistence ───────────────────────────────────────────────────────
@@ -1208,7 +1278,7 @@ function restoreSession() {
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 const urlUdid = new URLSearchParams(location.search).get('view');
-loadSims().then(() => {
+loadSims().then(async () => {
   if (urlUdid) {
     const sim = allSims.find(s => s.id === urlUdid);
     if (sim) addSimPanel(sim.id, sim.name, sim.width, sim.height, sim.platform);
@@ -1234,5 +1304,6 @@ loadSims().then(() => {
   }
   termPinned = !!s.termPinned;
   $('btn-pin-term').classList.toggle('active', termPinned);
-  if (s.termOpen && terminalEnabled) openTerminal();
+  if(metroDiscovery.enabled)await restoreConsoleTabs();
+  if (s.termOpen && (terminalEnabled||termTabs.length)) {await openTerminal();restoreActiveDeveloperTab();}
 });
