@@ -88,12 +88,15 @@ enum MetroCodec {
     static func argument(_ value: [String: Any]) -> [String: Any] {
         let kind = text(value["type"], limit: 32)
         var output: [String: Any] = ["type": kind]
+        if let id = MetroObjectCodec.identifier(value["objectId"]) { output["objectId"] = id }
+        for key in ["subtype", "className", "description"] { if value[key] != nil { output[key] = text(value[key], limit: key == "description" ? 4096 : 128) } }
         if let v = value["value"] as? String { output["value"] = text(v, limit: 1024) }
         else if let v = value["value"] as? NSNumber { output["value"] = v.doubleValue.isFinite ? v : NSNull() }
         else if value["value"] is NSNull { output["value"] = NSNull() }
         else { output["value"] = text(value["unserializableValue"] ?? value["description"], limit: 1024) }
         if let preview = value["preview"] as? [String: Any], let properties = preview["properties"] as? [[String: Any]] {
-            output["preview"] = properties.prefix(20).map { ["name": text($0["name"], limit: 80), "value": text($0["value"] ?? $0["type"], limit: 80)] }
+            output["preview"] = properties.prefix(20).map { ["name": text($0["name"], limit: 80), "value": text($0["value"] ?? $0["type"], limit: 80), "type": text($0["type"], limit: 32)] }
+            output["preview_overflow"] = preview["overflow"] as? Bool == true || properties.count > 20
         }
         return output
     }
@@ -107,7 +110,7 @@ enum MetroCodec {
         } else if method == "Runtime.exceptionThrown", let details = p["exceptionDetails"] as? [String: Any] {
             exception = details; level = "error"
             let object = details["exception"] as? [String: Any] ?? [:]
-            args = [["type": "string", "value": text(object["description"] ?? details["text"] ?? "Exception", limit: 32768)]]
+            args = MetroObjectCodec.identifier(object["objectId"]) != nil ? [argument(object)] : [["type": "string", "value": text(object["description"] ?? details["text"] ?? "Exception", limit: 32768)]]
         } else { return nil }
         let descriptions = args.map { arg -> String in
             let v = arg["value"] ?? ""; let plain = v is NSNull ? "null" : String(describing: v)
@@ -149,11 +152,15 @@ final class MetroConsoleManager: NSObject, URLSessionDataDelegate, URLSessionWeb
     // All mutable fields are accessed exclusively on queue, including Task callbacks.
     private final class Upstream: @unchecked Sendable {
         let key: String, url: URL
+        let references = MetroObjectReferences()
+        var propertyCalls: [Int: PropertyCall] = [:], nextCall = 2
         var task: URLSessionWebSocketTask?, token = UUID(), retry: DispatchWorkItem?, enableDeadline: DispatchWorkItem?, retries = 0, sequence: UInt64 = 0, attached = false
         init(_ t: MetroTarget) { key = t.key; url = t.url }
     }
+    private struct PropertyCall { let client: UUID, request: String, token: UUID }
     private final class Subscriber {
         let client: ClientConnection, output = MetroOutput(), key: String, device: String
+        var propertyRequest: String?, propertyDeadline: DispatchSourceTimer?, handles = Set<String>(), handleOrder: [String] = []
         var sequence: UInt64?, sentDropped: UInt64 = 0, deadline: DispatchSourceTimer?, sending = false
         init(_ client: ClientConnection, target: String, device: String) { self.client = client; key = target; self.device = device }
     }
@@ -212,19 +219,20 @@ final class MetroConsoleManager: NSObject, URLSessionDataDelegate, URLSessionWeb
     }
     func install(_ client: ClientConnection, allowedDevice: @escaping (String) -> Bool) {
         // Network-queue message admission is bounded before dispatch to Metro.
-        var pending = false
+        var pending = 0
         client.startTerminalKeepalive()
         client.onBinary = { [weak client] _ in client?.close() }
         client.onMessage = { [weak self, weak client] text in
             guard let self, let client else { return }
-            guard !pending, text.utf8.count <= 4096 else { client.close(); return }; pending = true
+            guard pending < 16, text.utf8.count <= 4096 else { client.close(); return }; pending += 1
             let message = dictionary(Data(text.utf8))
             if message["type"] as? String == "attach", !allowedDevice(message["device_id"] as? String ?? "") { client.sendJSON(["type": "console_error", "code": "target_unavailable", "message": "Stream is not active", "retryable": true]); client.closeAfterSending(); return }
             self.queue.async {
                 // Reopen admission before pumping a reply: a fast peer can ACK
                 // that reply before a trailing reset reaches the network queue.
-                // This bounds admission to one running plus one waiting message.
-                self.network.async { pending = false }
+                // A bounded burst allows coalesced entry/property ACKs from one read;
+                // still never an unbounded dispatch per browser message.
+                self.network.async { pending -= 1 }
                 self.message(message, client: client)
             }
         }
@@ -238,6 +246,38 @@ final class MetroConsoleManager: NSObject, URLSessionDataDelegate, URLSessionWeb
     private func message(_ m: [String: Any], client: ClientConnection) {
         guard !stopping else { network.async { client.close() }; return }
         let kind = m["type"] as? String
+        if kind == "get_properties", let s = subscribers[client.id], Set(m.keys) == Set(["type", "request_id", "object_ref"]),
+           let request = m["request_id"] as? String, !request.isEmpty, request.utf8.count <= 64,
+           let ref = m["object_ref"] as? String, ref.utf8.count <= 64, s.propertyRequest == nil {
+            s.propertyRequest = request
+            if s.propertyDeadline == nil {
+                let deadline = DispatchSource.makeTimerSource(queue: queue)
+                deadline.setEventHandler { [weak self, weak s] in
+                    guard let self, let s, let request = s.propertyRequest else { return }
+                    if let u = self.upstreams[s.key], let call = u.propertyCalls.first(where: { $0.value.client == s.client.id && $0.value.request == request })?.key {
+                        self.propertyFailed(u, call: call, error: "Object inspection timed out")
+                    } else { self.remove(s.client.id); self.network.async { s.client.close() } }
+                }
+                s.propertyDeadline = deadline; deadline.schedule(deadline: .now() + 5); deadline.resume()
+            } else { s.propertyDeadline?.schedule(deadline: .now() + 5) }
+            guard let u = upstreams[s.key], u.attached, let task = u.task, s.handles.contains(ref), let id = u.references.resolve(ref) else {
+                propertyReply(s, request: request, error: "Object reference is no longer available"); return
+            }
+            guard u.propertyCalls.count < 64 else { propertyReply(s, request: request, error: "Object inspection is busy; expand again to retry"); return }
+            let call = u.nextCall; u.nextCall += 1; let token = u.token
+            u.propertyCalls[call] = PropertyCall(client: client.id, request: request, token: token)
+            let payload = String(decoding: jsonData(["id": call, "method": "Runtime.getProperties", "params": ["objectId": id, "ownProperties": true, "accessorPropertiesOnly": false, "generatePreview": true]]), as: UTF8.self)
+            Task { [weak self, weak u] in
+                do { try await task.send(.string(payload)) }
+                catch { self?.queue.async { if let u, u.token == token { self?.propertyFailed(u, call: call, error: "Object inspection failed") } } }
+            }
+            return
+        }
+        if kind == "properties_ack", let s = subscribers[client.id], Set(m.keys) == Set(["type", "request_id"]),
+           let request = m["request_id"] as? String, s.propertyRequest == request {
+            s.propertyRequest = nil; s.propertyDeadline?.schedule(deadline: .distantFuture)
+            network.async { client.sendJSON(["type": "properties_ready", "request_id": request]) }; return
+        }
         if kind == "entry_ack", let s = subscribers[client.id], Set(m.keys).isSubset(of: ["type", "sequence"]), let n = m["sequence"] as? UInt64, n == s.sequence {
             s.sequence = nil; s.deadline?.schedule(deadline: .distantFuture); pump(s); return
         }
@@ -252,12 +292,35 @@ final class MetroConsoleManager: NSObject, URLSessionDataDelegate, URLSessionWeb
         if let u = upstreams[key] { status(s, u.attached ? "attached" : "connecting") }
         else { let u = Upstream(target); upstreams[key] = u; status(s, "connecting"); connect(u) }
     }
+    private func grant(_ s: Subscriber, _ handles: [String]) {
+        for handle in handles where s.handles.insert(handle).inserted {
+            s.handleOrder.append(handle)
+            if s.handleOrder.count > MetroObjectReferences.limit { s.handles.remove(s.handleOrder.removeFirst()) }
+        }
+    }
+    private func propertyReply(_ s: Subscriber, request: String, result: [String: Any] = [:], error: String = "") {
+        guard subscribers[s.client.id] === s, s.propertyRequest == request else { return }
+        s.propertyDeadline?.schedule(deadline: .now() + 10)
+        grant(s, MetroObjectCodec.handles(result))
+        var reply = result; reply["type"] = "properties"; reply["request_id"] = request
+        if !error.isEmpty { reply["error"] = error }
+        network.async { [weak s] in if let s, !s.client.isClosed { s.client.sendJSON(reply) } }
+    }
+    private func propertyFailed(_ u: Upstream, call: Int, error: String) {
+        guard let pending = u.propertyCalls.removeValue(forKey: call), let s = subscribers[pending.client] else { return }
+        propertyReply(s, request: pending.request, error: error)
+    }
+    private func resetObjects(_ u: Upstream) {
+        u.references.clear()
+        for call in Array(u.propertyCalls.keys) { propertyFailed(u, call: call, error: "Object reference is no longer available") }
+        for s in subscribers.values where s.key == u.key { s.handles.removeAll(); s.handleOrder.removeAll() }
+    }
     private func status(_ s: Subscriber, _ state: String, _ message: String = "") {
         network.async { [weak s] in guard let s, !s.client.isClosed else { return }; s.client.sendJSON(["type": "status", "state": state, "message": message]) }
     }
     private func connect(_ u: Upstream) {
         guard !stopping, upstreams[u.key] === u, subscribers.values.contains(where: { $0.key == u.key }) else { return }
-        u.retry?.cancel(); u.retry = nil; u.token = UUID(); u.attached = false
+        u.retry?.cancel(); u.retry = nil; resetObjects(u); u.token = UUID(); u.attached = false
         let task = inspectorSession.webSocketTask(with: u.url); task.maximumMessageSize = 1_048_576; u.task = task
         let token = u.token
         let deadline = DispatchWorkItem { [weak self, weak u] in if let u, !u.attached, u.token == token { self?.failed(u, message: "Metro connection did not become ready") } }
@@ -291,7 +354,17 @@ final class MetroConsoleManager: NSObject, URLSessionDataDelegate, URLSessionWeb
                             if raw["error"] != nil { self.failed(u, message: "Another debugger or runtime refused attachment"); return }
                             u.enableDeadline?.cancel(); u.enableDeadline = nil; u.attached = true; u.retries = 0
                             for s in self.subscribers.values where s.key == u.key { self.status(s, "attached") }
-                        } else if let entry = MetroCodec.entry(raw, sequence: u.sequence + 1) {
+                        } else if let id = raw["id"] as? Int, let pending = u.propertyCalls.removeValue(forKey: id) {
+                            if pending.token == token, let s = self.subscribers[pending.client] {
+                                if raw["error"] != nil { self.propertyReply(s, request: pending.request, error: "Object reference is unavailable or inspection is unsupported") }
+                                else if let result = raw["result"] as? [String: Any], result["result"] is [[String: Any]] {
+                                    self.propertyReply(s, request: pending.request, result: MetroObjectCodec.properties(result, references: u.references))
+                                } else { self.propertyReply(s, request: pending.request, error: "Invalid object properties response") }
+                            }
+                        } else if ["Runtime.executionContextsCleared", "Runtime.executionContextDestroyed"].contains(raw["method"] as? String ?? "") {
+                            self.resetObjects(u)
+                        } else if var entry = MetroCodec.entry(raw, sequence: u.sequence + 1) {
+                            entry["arguments"] = (entry["arguments"] as? [[String: Any]] ?? []).map { u.references.decorate($0) }
                             u.sequence &+= 1
                             for s in self.subscribers.values where s.key == u.key { s.output.append(entry); self.pump(s) }
                         }
@@ -303,13 +376,14 @@ final class MetroConsoleManager: NSObject, URLSessionDataDelegate, URLSessionWeb
     }
     private func failed(_ u: Upstream, message: String = "Runtime disconnected") {
         guard upstreams[u.key] === u, u.retry == nil, !stopping else { return }
-        u.token = UUID(); u.enableDeadline?.cancel(); u.enableDeadline = nil; u.task?.cancel(); u.task = nil; u.attached = false
+        resetObjects(u); u.token = UUID(); u.enableDeadline?.cancel(); u.enableDeadline = nil; u.task?.cancel(); u.task = nil; u.attached = false
         for s in subscribers.values where s.key == u.key { status(s, message == "Runtime disconnected" ? "reconnecting" : "error", message) }
         let work = DispatchWorkItem { [weak self, weak u] in guard let self, let u else { return }; u.retry = nil; self.connect(u) }
         u.retry = work; queue.asyncAfter(deadline: .now() + min(30, pow(2, Double(min(5, u.retries)))), execute: work); u.retries += 1
     }
     private func pump(_ s: Subscriber) {
         guard subscribers[s.client.id] === s, !s.sending, s.sequence == nil, let entry = s.output.take(), let sequence = entry["sequence"] as? UInt64 else { return }
+        grant(s, MetroObjectCodec.handles(entry))
         s.sequence = sequence; s.sending = true
         if s.deadline == nil {
             let t = DispatchSource.makeTimerSource(queue: queue)
@@ -325,7 +399,7 @@ final class MetroConsoleManager: NSObject, URLSessionDataDelegate, URLSessionWeb
         }
     }
     private func terminate(_ key: String) {
-        guard let u = upstreams.removeValue(forKey: key) else { return }; u.token = UUID(); u.enableDeadline?.cancel(); u.enableDeadline = nil; u.retry?.cancel(); u.retry = nil; u.task?.cancel(); u.task = nil
+        guard let u = upstreams.removeValue(forKey: key) else { return }; resetObjects(u); u.token = UUID(); u.enableDeadline?.cancel(); u.enableDeadline = nil; u.retry?.cancel(); u.retry = nil; u.task?.cancel(); u.task = nil
         // Retire any closing/late-opening transports from the old session once
         // no upstream remains. This cannot disturb another attached target.
         if upstreams.isEmpty, !stopping {
@@ -335,7 +409,8 @@ final class MetroConsoleManager: NSObject, URLSessionDataDelegate, URLSessionWeb
         }
     }
     private func remove(_ id: UUID) {
-        guard let s = subscribers.removeValue(forKey: id) else { return }; s.deadline?.cancel(); s.deadline = nil
+        guard let s = subscribers.removeValue(forKey: id) else { return }; s.deadline?.cancel(); s.deadline = nil; s.propertyDeadline?.cancel(); s.propertyDeadline = nil
+        if let u = upstreams[s.key] { for (call, pending) in u.propertyCalls where pending.client == id { u.propertyCalls.removeValue(forKey: call) } }
         if !subscribers.values.contains(where: { $0.key == s.key }) { terminate(s.key) }
     }
     func stop(_ complete: @escaping () -> Void) {
@@ -348,6 +423,7 @@ final class MetroConsoleManager: NSObject, URLSessionDataDelegate, URLSessionWeb
     }
     func diagnostics(_ completion: @escaping ([String: Any]) -> Void) {
         queue.async { completion(["targets": self.targets.count, "upstreams": self.upstreams.count, "subscribers": self.subscribers.count, "discovery_in_flight": self.discovery != nil,
+                                  "object_handles": self.upstreams.values.reduce(0) { $0 + $1.references.count }, "property_requests": self.upstreams.values.reduce(0) { $0 + $1.propertyCalls.count },
                                   "received_entries": self.upstreams.values.reduce(UInt64(0)) { $0 + $1.sequence }, "inflight_entries": self.subscribers.values.filter { $0.sequence != nil }.count,
                                   "pending_entries": self.subscribers.values.reduce(0) { $0 + $1.output.entries.count }, "pending_bytes": self.subscribers.values.reduce(0) { $0 + $1.output.bytes }]) }
     }

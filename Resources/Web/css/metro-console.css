@@ -26,3 +26,18 @@
 .metro-picker-choice { display:block; text-align:left; width:100%; padding:12px; margin:5px 0; background:var(--bg-overlay); border:1px solid var(--border); color:var(--text-primary); border-radius:8px; cursor:pointer; overflow-wrap:anywhere; }
 .metro-picker-choice small { display:block; margin-top:4px; color:var(--text-secondary); }
 @media(max-width:700px){.console-control{min-height:34px;}.console-time{display:none;}.console-toolbar{gap:3px;}.console-search{max-width:none;}}
+/* Object disclosure is independent of the unchanged source/stack disclosure. */
+.console-object { display:inline-block; vertical-align:top; max-width:100%; white-space:normal; }
+.console-object-summary { cursor:pointer; overflow-wrap:anywhere; }
+.console-object-description { color:var(--text-primary); }
+.console-object-preview,.console-object-note,.console-object-info { color:var(--text-secondary); }
+.console-object-info { font-size:10px; }
+.console-object-body { padding:3px 0 3px 16px; font-size:12px; max-width:100%; }
+.console-object-property { overflow-wrap:anywhere; white-space:pre-wrap; }
+.console-object-name { color:var(--accent); }
+.console-object-value { color:var(--text-primary); }
+.console-object-value[data-type=string] { color:#a23c51; }
+.console-object-value[data-type=number],.console-object-value[data-type=boolean] { color:#6652aa; }
+[data-theme=dark] .console-object-value[data-type=string] { color:#b6d891; }
+[data-theme=dark] .console-object-value[data-type=number],[data-theme=dark] .console-object-value[data-type=boolean] { color:#bdadf3; }
+.console-object-pager { display:flex; flex-wrap:wrap; gap:4px; align-items:center; }

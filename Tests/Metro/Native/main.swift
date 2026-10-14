@@ -103,6 +103,25 @@ let big=MetroOutput();for i in 0..<200 {big.append(["sequence":i,"text":String(r
 expect(big.bytes<=1_048_576 && big.dropped>0,"subscriber byte budget1MiB enforced")
 expect(MetroCodec.text(String(repeating:"🙂",count:20000),limit:32768).utf8.count<=32768,"UTF8 scalar truncation respects byte cap")
 expect(!MetroCodec.metadata("id\n\tvalue").contains("\n"),"metadata control characters removed")
+let references = MetroObjectReferences()
+let object = MetroCodec.argument(["type":"object", "objectId":"fixture-private-id", "description":"Object", "preview":["overflow":true,"properties":[["name":"answer","type":"number","value":"42"]]]])
+expect(object["objectId"] as? String == "fixture-private-id", "remote ID preserved internally for native inspection")
+let browserObject = references.decorate(object), handle = browserObject["object_ref"] as! String
+expect(browserObject["objectId"] == nil && handle != "fixture-private-id" && references.resolve(handle) == "fixture-private-id", "opaque browser handle hides private inspector ID")
+expect(references.decorate(object)["object_ref"] as? String == handle, "repeated object ID shares stable scoped handle")
+expect(browserObject["preview_overflow"] as? Bool == true, "preview overflow marker retained")
+expect((browserObject["preview"] as! [[String:String]])[0]["type"] == "number", "preview property type retained")
+for value in ["",String(repeating:"x",count:2049),"id\ncontrol"] { expect(MetroObjectCodec.identifier(value) == nil, "malformed inspector ID not truncated or accepted") }
+let result = MetroObjectCodec.properties(["result":[["name":"child","value":["type":"object","objectId":"nested-id","description":"Object"]],["name":"getter","get":["type":"function","objectId":"getter-id","description":"get value()"]]]], references:references)
+expect(!String(decoding:jsonData(result),as:UTF8.self).contains("objectId"), "property response never exposes raw inspector IDs")
+expect(MetroObjectCodec.handles(result).count == 2, "nested and accessor handles admitted without invoking accessors")
+expect((result["properties"] as! [[String:Any]])[1]["value"] == nil, "accessor descriptor not replaced by evaluated value")
+let bigProps = (0..<1500).map { ["name":"field\($0)","value":["type":"string","value":String(repeating:"x",count:1024)]] as [String:Any] }
+let bounded = MetroObjectCodec.properties(["result":bigProps],references:references)
+expect(jsonData(bounded).count < 131072 && bounded["truncated"] as? Bool == true, "large property responses have explicit bounded truncation")
+for i in 0..<5000 { _ = references.remember("id-\(i)") }
+expect(references.count == 4096 && references.resolve(handle) == nil, "opaque reference registry bounded and oldest references expire")
+references.clear();expect(references.count == 0, "runtime generation reset drops all handles")
 let report:[String:Any]=["passed":true,"checks":checks,"realMetroOrDeviceActions":false]
 if let output=ProcessInfo.processInfo.environment["TEST_OUTPUT"] {try FileManager.default.createDirectory(atPath:output,withIntermediateDirectories:true);try jsonData(report).write(to:URL(fileURLWithPath:output+"/metro-native.json"))}
 print("\(checks) native Metro policy/normalization/buffer checks passed")

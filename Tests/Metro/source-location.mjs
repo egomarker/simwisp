@@ -65,7 +65,7 @@ export async function reviewSourceLocations({root,cdp,evaluate,check,delay,shot}
     await evaluate('window.__sourceLocation.buffer.clear();window.__sourceLocation.buffer.push(window.__sourceLocationEntry);window.__sourceLocation.render()');await delay(80);
     if(baseline) {
       const beforeCSS=fs.readFileSync(baseline+'/Resources/Web/css/metro-console.css','utf8');
-      await verify('all original CSS declarations unchanged',JSON.stringify(fs.readFileSync('Resources/Web/css/metro-console.css','utf8').split('\n').filter(l=>!l.startsWith('.console-source-link')).join('\n')===beforeCSS));
+      await verify('all original CSS declarations unchanged',JSON.stringify(fs.readFileSync('Resources/Web/css/metro-console.css','utf8').startsWith(beforeCSS)));
       for(const theme of ['light','dark'])for(const width of [1440,320]) {
         await cdp('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:false});
         await evaluate(`document.documentElement.dataset.theme=${JSON.stringify(theme)};${details}.open=true;document.activeElement?.blur()`);await delay(80);
