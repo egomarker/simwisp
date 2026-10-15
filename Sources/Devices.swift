@@ -11,8 +11,9 @@ struct Device: Codable {
     var project_app = false
     // Backend-only alias; keep the AVD name/serial and public inventory unchanged.
     var metroName: String? = nil
-    private enum CodingKeys: String, CodingKey { case id, name, platform, width, height, project_app }
-    var json: [String: Any] { ["id": id, "name": name, "platform": platform, "width": width, "height": height, "project_app": project_app] }
+    var avd: String? = nil
+    private enum CodingKeys: String, CodingKey { case id, name, platform, width, height, project_app, avd }
+    var json: [String: Any] { ["id": id, "name": name, "platform": platform, "width": width, "height": height, "project_app": project_app, "avd": avd as Any? ?? NSNull()] }
 }
 // React Native's Android device label is Build.MODEL + release + SDK_INT,
 // not the emulator's AVD name. Read once per existing tool-cache refresh on the
@@ -227,7 +228,7 @@ final class Devices {
             // Unknown until a matching Quartz window is found. Do not present
             // ADB's physical/override resolution as the streamed window size.
             return Device(id: serial, name: title.replacingOccurrences(of: "_", with: " "), platform: "android", width: 0, height: 0,
-                          metroName: AndroidMetroIdentity.read(adb: adb, serial: serial))
+                          metroName: AndroidMetroIdentity.read(adb: adb, serial: serial), avd: title)
         }
     }
     func boot(_ id: String) throws {

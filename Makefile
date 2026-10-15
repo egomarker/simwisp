@@ -74,3 +74,15 @@ install:
 	@exit 1
 clean:
 	rm -rf build
+
+.PHONY: test-android
+test-android:
+	@NODE='$(NODE)' Tests/Android/run.sh
+
+.PHONY: test-android-parity
+test-android-parity:
+	@ANDROID_PARITY=1 NODE='$(NODE)' Tests/Android/run.sh
+
+.PHONY: test-android-performance
+test-android-performance:
+	@ANDROID_PERFORMANCE=1 NODE='$(NODE)' Tests/Android/run.sh

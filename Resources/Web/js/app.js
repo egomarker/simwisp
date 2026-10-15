@@ -1,5 +1,6 @@
 import { fetchInfo, fetchSims, fetchAvailableDevices, bootSim, bootAvd, stopSim, fetchStopStatus, requestPermission } from './api.js';
 import { SimStream } from './stream.js';
+import { AndroidBackends, backendIcon } from './android-backends.js';
 import { initTheme } from './theme.js';
 import { MetroDiscovery, consoleIdentity, resolveConsole } from './metro-discovery.js';
 
@@ -576,6 +577,7 @@ function toggleDevice(udid, name, w, h, platform) {
 function addSimPanel(udid, name, w, h, platform) {
   if (simPanels.has(udid)) { setFocusedPanel(udid); return; }
 
+  if (!(w > 0 && h > 0)) { w = 360; h = 800; } // Headless Android dimensions arrive with the first H.264 session.
   // ── Build DOM ──
   const panelEl = document.createElement('div');
   panelEl.className = 'sim-panel';
@@ -618,11 +620,13 @@ function addSimPanel(udid, name, w, h, platform) {
     overlayEl, pillEl, dotEl, statsEl,
     statusEl: pillEl.querySelector('.panel-status'),
     platform,
-    accessibility: null,
+    accessibility: null, backends: null,
     ro: null, appearMode: 'dark', twoFingerMode: false,
   };
   simPanels.set(udid, panel);
   if (platform === 'android') {
+    const identity = allSims.find(s => s.id === udid)?.avd || name;
+    panel.backends = new AndroidBackends(pillEl.querySelector('.backend-trigger'), name, identity, choices => panel.stream?.switchBackends(choices));
     const button = pillEl.querySelector('[data-action="accessibility"]');
     // Optional assets and pane are created only on an explicit first open.
     const firstOpen = async () => {
@@ -654,6 +658,8 @@ function addSimPanel(udid, name, w, h, platform) {
     fps:     parseInt(fpsSlider.value),
     quality: parseInt(qualSlider.value),
     data_saver: dsBtn.classList.contains('active'),
+    backends: panel.backends?.choices,
+    onBackends: message => panel.backends?.receive(message),
     onStatus:            (s, message) => updatePanelStatus(udid, s, message),
     onFirstFrame:        () => overlayEl.classList.add('hidden'),
     onOrientationChange: () => sizeFrame(panel),
@@ -685,6 +691,7 @@ function removeSimPanel(udid, { silent = false } = {}) {
   metroDiscovery.setActive(udid, false);
   closeDeviceConsoles(udid);
   panel.accessibility?.setOpen(false);
+  panel.backends?.destroy();
   panel.stream?.destroy();
   panel.ro?.disconnect();
   panel.panelEl.remove();
@@ -894,7 +901,7 @@ function updatePanelStats(udid, stats) {
   panel.statsEl.textContent = isMobileViewport()
     ? `${stats.fps}fps ${fmtRateCompact(stats.bps)}`
     : `${stats.fps} fps · ${fmtRate(stats.bps)} · q${quality}`;
-  panel.statsEl.title = `Rendered ${stats.fps} fps. H.264 server target ${serverFps} fps, bitrate quality ${quality}. Avg frame ${Math.round(stats.avgFrame / 1024 || 0)} KB. Dropped ${stats.dropped}.`;
+  panel.statsEl.title = `Rendered ${stats.fps} fps. H.264 server target ${serverFps} fps; sent ${Number.isFinite(stats.serverSentFps) ? stats.serverSentFps.toFixed(1) : "—"} fps, bitrate quality ${quality}. Avg frame ${Math.round(stats.avgFrame / 1024 || 0)} KB. Dropped ${stats.dropped}.`;
 }
 
 function updateStreamVisibility() {
@@ -911,6 +918,7 @@ function createPill(udid, name, platform) {
   pill.className = 'controls-pill';
   pill.innerHTML = `
     <div class="panel-telemetry"><span class="status-dot"></span><span class="panel-status">Connecting</span>
+      ${platform === 'android' ? '<button type="button" class="backend-trigger" title="Android backends" aria-label="Android backends">' + backendIcon + '<span>Backends</span></button>' : ''}
       <span class="stream-stats" title="Stream stats">— fps · — KB/s</span>
     </div>
     <div class="panel-actions" role="group" aria-label="Simulator controls">

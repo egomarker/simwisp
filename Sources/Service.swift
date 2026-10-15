@@ -14,6 +14,7 @@ final class Service {
     private let workers = DispatchQueue(label: "Simwisp.device-actions", qos: .userInitiated)
     private var stopping = Set<String>() // network queue owns destructive-action admission
     private let makeCapture: (DeviceWindow) -> WindowCapture
+    private let scrcpyInstallation: ScrcpySession.Installation
     private let captureStopTimeout: Double
     private var streams: [String: StreamSession] = [:] // network queue owns registry
     private var retiring: [String: [StreamSession]] = [:] // disconnected/replaced captures still cleaning up
@@ -26,11 +27,11 @@ final class Service {
     private var usage = Usage() // sampled on the network queue for diagnostics only
     private var panelState: [String: Any] = ["visible": false, "refresh_timer": false, "refreshes": 0]
     var stateChanged: ((String) -> Void)?
-    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory, devices: Devices? = nil, metroEndpoint: URL = URL(string: "http://127.0.0.1:8081/json/list")!, captureStopTimeout: Double = 20, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
+    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory, devices: Devices? = nil, input: DeviceInput? = nil, metroEndpoint: URL = URL(string: "http://127.0.0.1:8081/json/list")!, captureStopTimeout: Double = 20, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
         self.pairingStateURL = pairingStateURL; self.tlsDirectory = tlsDirectory
-        self.settings = settings; self.makeCapture = makeCapture; self.captureStopTimeout = captureStopTimeout
+        self.settings = settings; self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.captureStopTimeout = captureStopTimeout
         let selectedDevices = devices ?? Devices(settings: settings)
-        self.devices = selectedDevices; input = DeviceInput(devices: selectedDevices)
+        self.devices = selectedDevices; self.input = input ?? DeviceInput(devices: selectedDevices)
         terminals = TerminalManager(settings: settings, network: server.queue)
         metro = MetroConsoleManager(network: server.queue, endpoint: metroEndpoint)
         cookie = SHA256.hash(data: Data(("simwisp-session-v1:" + settings.pairingToken).utf8)).map { String(format: "%02x", $0) }.joined()
@@ -84,14 +85,20 @@ final class Service {
         guard !stopping.contains(id) else { client.sendJSON(["type": "device_stopping", "id": id]); client.closeAfterSending(); return }
         guard devices.device(id) != nil else { client.sendJSON(["type": "capture_error", "message": "Unknown device"]); client.close(); return }
         // Preserve Simmer's one-controller-per-device behavior; other devices are independent.
-        if let old = streams.removeValue(forKey: id) { retire(old); old.client.close() }
-        let session = StreamSession(id: id, client: client, request: request, settings: settings, devices: devices, input: input, queue: server.queue, lifecycle: lifecycle, makeCapture: makeCapture)
+        let previous = streams.removeValue(forKey: id)
+        let waitForBackend = previous?.usesScrcpy == true
+        if let old = previous { retire(old); old.client.close() }
+        let session = StreamSession(id: id, client: client, request: request, settings: settings, devices: devices, input: input, queue: server.queue, lifecycle: lifecycle, scrcpyInstallation: scrcpyInstallation, makeCapture: makeCapture)
         session.onClose = { [weak self, weak session] in
             guard let self, let session, self.streams[id] === session else { return }
             self.streams.removeValue(forKey: id); self.retire(session)
             self.devices.setStreamingDemand(!self.streams.isEmpty)
         }
-        streams[id] = session; devices.setStreamingDemand(true); session.start()
+        streams[id] = session; devices.setStreamingDemand(true)
+        client.onClose = { [weak session] in session?.stop() }
+        if let old = previous, waitForBackend { old.stop { [weak self, weak session] in
+            guard let self, let session, self.streams[id] === session, !client.isClosed else { return };session.start()
+        } } else { session.start() }
     }
     private func route(_ request: HTTPRequest, complete: @escaping (HTTPResponse) -> Void) {
         if request.path == "/simwisp-ca.cer", request.method == "GET", let tls {
@@ -135,7 +142,7 @@ final class Service {
         if request.method != "GET" && !request.sameOrigin { complete(.json(["error": "Origin denied"], status: 403)); return }
         switch (request.method, request.path) {
         case ("GET", "/api/info"):
-            var info: [String: Any] = ["mode": "fast2 (ScreenCaptureKit + VideoToolbox H.264 + Quartz input)", "video_codec": "h264", "transport": "https", "app": "Simwisp", "version": "0.2.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true, "device_stop": true, "metroConsole": true]]
+            var info: [String: Any] = ["mode": "fast2 (ScreenCaptureKit / scrcpy H.264; Quartz / scrcpy input)", "video_codec": "h264", "transport": "https", "app": "Simwisp", "version": "0.2.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true, "device_stop": true, "metroConsole": true, "androidBackends": true]]
             if settings.terminalEnabled == true { info["project_dir"] = settings.projectDirectory }
             if let bundle = devices.projectBundleID { info["bundle_id"] = bundle }
             complete(.json(info))

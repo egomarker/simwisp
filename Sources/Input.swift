@@ -42,7 +42,8 @@ final class DeviceInput {
         yOffset: CGFloat
     )?
     private var adbInputSizes: [String: (checked: Double, width: Int, height: Int)] = [:]
-    init(devices: Devices) { self.devices = devices }
+    private let handlerOverride: (([String: Any], String) throws -> [String: Any]?)?
+    init(devices: Devices, handler: (([String: Any], String) throws -> [String: Any]?)? = nil) { self.devices = devices; handlerOverride = handler }
     func cancel(_ id: String) {
         queue.async {
             if let state = self.gesture, state.id == id { self.mouse(.leftMouseUp, state.point); self.gesture = nil }
@@ -148,6 +149,7 @@ final class DeviceInput {
         }
     }
     private func handle(_ m: [String: Any], id: String) throws -> [String: Any]? {
+        if let handlerOverride { return try handlerOverride(m, id) }
         guard let type = m["type"] as? String, let device = devices.device(id) else { throw WispError("Device is not available") }
         let android = device.platform == "android"
         let window = devices.window(id)

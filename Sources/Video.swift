@@ -2,6 +2,17 @@ import Foundation
 import VideoToolbox
 import CoreImage
 
+// Shared by Mac-window encoding and the Android encoder launch budget.
+// Callers supply content pixels; odd 4:2:0 dimensions include the same padding.
+enum H264VideoPolicy {
+    static func bitRate(width: Int, height: Int, quality: Int) -> Int {
+        let w = (width + 1) & ~1, h = (height + 1) & ~1
+        let area = Double(w * h) / (1080 * 1920)
+        let q = min(95, max(1, quality))
+        return Int(max(500_000, min(40_000_000, (2_000_000 + Double(q) / 95 * 18_000_000) * area)))
+    }
+}
+
 struct H264Frame {
     let payload: Data
     let description: Data
@@ -79,8 +90,7 @@ final class H264Encoder {
         if quality != previousQuality || fps != previousFPS {
             // Preserve the existing 1–95 control; it now selects a resolution-
             // scaled bitrate, not JPEG compression. A 1080p portrait at q20 is ~6 Mbps.
-            let area = Double(codedWidth * codedHeight) / (1080 * 1920)
-            let rate = Int(max(500_000, min(40_000_000, (2_000_000 + Double(quality) / 95 * 18_000_000) * area)))
+            let rate = H264VideoPolicy.bitRate(width: width, height: height, quality: quality)
             try property(kVTCompressionPropertyKey_AverageBitRate, rate as CFNumber)
             try property(kVTCompressionPropertyKey_ExpectedFrameRate, fps as CFNumber)
             previousQuality = quality; previousFPS = fps

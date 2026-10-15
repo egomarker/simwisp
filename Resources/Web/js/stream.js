@@ -25,9 +25,9 @@ export class SimStream {
   #latestFrame = null; #renderRAF = 0; #lastRenderedTimestamp = -1;
   #portraitW; #portraitH; #isLandscape = false;
   #onStatus; #onFirstFrame; #onOrientationChange; #onRotateStart; #onRotateEnd;
-  #onStats; #onAccessibility; #onStopped; #statsTimer = null;
+  #onStats; #onAccessibility; #onStopped; #onBackends; #cancelPointer = () => {}; #statsTimer = null;
   #stats = { frames: 0, bytes: 0, dropped: 0, lastFrames: 0, lastBytes: 0, fps: 0, bps: 0, avgFrame: 0 };
-  #serverStats = { fps: null, quality: null };
+  #serverStats = { fps: null, sentFps: null, quality: null };
 
   constructor(
     udid,
@@ -36,6 +36,7 @@ export class SimStream {
       fps = 60,
       quality = 20,
       data_saver = false,
+      backends, onBackends,
       onStatus,
       onFirstFrame,
       onOrientationChange,
@@ -59,8 +60,10 @@ export class SimStream {
     this.#onStats = onStats ?? (() => {});
     this.#onAccessibility = onAccessibility ?? (() => {});
     this.#onStopped = onStopped ?? (() => {});
+    this.#onBackends = onBackends ?? (() => {});
 
     this.settings = { fps, quality, data_saver, dev_w: canvas.width, dev_h: canvas.height };
+    if (backends) Object.assign(this.settings, { capture_backend: backends.capture, input_backend: backends.input });
 
     this.#setupPointer();
     this.#connect();
@@ -79,11 +82,19 @@ export class SimStream {
     this.send({ type: 'settings', ...patch });
   }
 
+  switchBackends(choices) {
+    this.#cancelPointer();
+    Object.assign(this.settings, { capture_backend: choices.capture, input_backend: choices.input });
+    // Reconnect only this device. Native retirement releases input and joins the
+    // old server before the replacement starts; old socket callbacks are ignored.
+    this.#connect();
+  }
+
   setTwoFinger(enabled) {
     this.#twoFinger = Boolean(enabled);
   }
   destroy() {
-    this.#destroyed = true; this.#resetDecoder();
+    this.#cancelPointer(); this.#destroyed = true; this.#resetDecoder();
     clearTimeout(this.#noFrameTimer);
     clearTimeout(this.#connectTimer);
     clearTimeout(this.#reconnectTimer);
@@ -294,7 +305,7 @@ export class SimStream {
     this.#firstFrame = false; this.#captureUnavailable = false; this.#liveTouch = false;
     this.#onStatus('connecting');
     const ws = new WebSocket(
-      `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/${this.#udid}?fps=${this.settings.fps}&quality=${this.settings.quality}&w=${this.#portraitW}&h=${this.#portraitH}&data_saver=${this.settings.data_saver ? 1 : 0}`
+      `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/${this.#udid}?fps=${this.settings.fps}&quality=${this.settings.quality}&w=${this.#portraitW}&h=${this.#portraitH}&data_saver=${this.settings.data_saver ? 1 : 0}${this.settings.capture_backend ? '&capture_backend=' + encodeURIComponent(this.settings.capture_backend) + '&input_backend=' + encodeURIComponent(this.settings.input_backend) : ''}`
     );
     this.#ws = ws; ws.binaryType = 'arraybuffer';
     this.#connectTimer = setTimeout(() => {
@@ -331,6 +342,8 @@ export class SimStream {
         const msg = JSON.parse(e.data);
         if (msg.type === 'device_stopping') {
           this.destroy(); this.#onStopped();
+        } else if (msg.type === 'android_backends') {
+          this.#onBackends(msg);
         } else if (msg.type === 'video_config') {
           this.#configureVideo(msg, ws);
         } else if (msg.type === 'accessibility_status' || msg.type === 'accessibility_event') {
@@ -350,7 +363,7 @@ export class SimStream {
         } else if (msg.type === 'rotate_failed') {
           this.#onRotateEnd(false);
         } else if (msg.type === 'server_stats') {
-          this.#serverStats = { fps: msg.fps ?? null, quality: msg.quality ?? null };
+          this.#serverStats = { fps: msg.fps ?? null, sentFps: msg.sent_fps ?? null, quality: msg.quality ?? null };
         }
       } catch (error) { console.warn('Simwisp video message:', error); }
     };
@@ -364,7 +377,7 @@ export class SimStream {
       this.#stats.lastFrames = this.#stats.frames; this.#stats.lastBytes = this.#stats.bytes;
       this.#stats.fps = frames; this.#stats.bps = bytes;
       this.#stats.avgFrame = frames ? bytes / frames : this.#stats.avgFrame;
-      this.#onStats({ fps: this.#stats.fps, bps: this.#stats.bps, avgFrame: this.#stats.avgFrame, dropped: this.#stats.dropped, serverFps: this.#serverStats.fps, serverQuality: this.#serverStats.quality, codec: 'h264' });
+      this.#onStats({ fps: this.#stats.fps, bps: this.#stats.bps, avgFrame: this.#stats.avgFrame, dropped: this.#stats.dropped, serverFps: this.#serverStats.fps, serverSentFps: this.#serverStats.sentFps, serverQuality: this.#serverStats.quality, codec: 'h264' });
     }, 1000);
   }
 
@@ -419,7 +432,7 @@ export class SimStream {
 
       if (twoFingerGesture) {
         // This deliberately sends no Quartz events while the finger moves.
-        // Perform one compat-style ADB swipe when the browser finger lifts.
+        // Perform one swipe through the selected input backend on finger lift.
         if (!cancelled && origin &&
             Math.hypot(end.x - origin.x, end.y - origin.y) >= DRAG_THRESHOLD) {
           this.send({
@@ -457,6 +470,11 @@ export class SimStream {
       }
     };
 
+    this.#cancelPointer = () => {
+      const id = activePointer; activePointer = null; origin = null; live = false; twoFingerGesture = false; dragging = false; pending = null; lastSent = null;
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      if (id !== null && canvas.hasPointerCapture(id)) canvas.releasePointerCapture(id);
+    };
     canvas.addEventListener('pointerdown', e => {
       if (activePointer !== null || e.isPrimary === false) return;
       e.preventDefault();

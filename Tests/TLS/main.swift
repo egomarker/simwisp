@@ -3,7 +3,8 @@ import Darwin
 let root = URL(fileURLWithPath: CommandLine.arguments[1])
 var settings = Settings(); settings.port = 45152; settings.shareLAN = false
 settings.projectDirectory = root.path; settings.pairingToken = "isolated-tls-link-credential"; settings.terminalEnabled = false
-let service = Service(settings: settings, pairingStateURL: root.appendingPathComponent("pairing-state.json"), tlsDirectory: root.appendingPathComponent("tls"))
+let devices = Devices(settings:settings, discovery:{([],[],[:])})
+let service = Service(settings: settings, pairingStateURL: root.appendingPathComponent("pairing-state.json"), tlsDirectory: root.appendingPathComponent("tls"), devices: devices)
 service.stateChanged = { state in
     if state == "Running" { print("Isolated production TLS service ready"); fflush(stdout) }
     else { log(state); exit(1) }
