@@ -9,6 +9,7 @@ SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 .PHONY: build check test test-pairing test-accessibility test-input test-capture test-device-control test-video test-sps test-stream-flow test-decoder test-tls test-browser-accessibility test-browser-device-control test-metro-native test-metro-console run clean install
 build:
 	@mkdir -p '$(APP)/Contents/MacOS' '$(APP)/Contents/Resources'
+	@scripts/build-android-jpeg.sh '$(APP)/Contents/Resources/simwisp-jpeg.jar'
 	xcrun clang -O2 -Wall -Wextra -Werror -isysroot '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/TerminalHost.c -o '$(APP)/Contents/MacOS/SimwispShell'
 	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 $(SOURCES) -o '$(APP)/Contents/MacOS/Simwisp'
 	@cp Resources/Info.plist '$(APP)/Contents/Info.plist'
@@ -86,3 +87,7 @@ test-android-parity:
 .PHONY: test-android-performance
 test-android-performance:
 	@ANDROID_PERFORMANCE=1 NODE='$(NODE)' Tests/Android/run.sh
+
+.PHONY: test-android-jpeg
+test-android-jpeg:
+	@ANDROID_JPEG=1 NODE='$(NODE)' Tests/Android/run.sh

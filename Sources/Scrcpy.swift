@@ -106,7 +106,7 @@ final class ScrcpySession: @unchecked Sendable {
     }
     var state: (ready: Bool, error: String?, size: (Int,Int), finished: Bool, connected: Bool, installed: Bool) { lock.withLock { (ready && !stopping, failure, size, finished, everReady, installed) } }
     var hasFrame: Bool { lock.withLock { buffer.count > 0 } }
-    var diagnostics: [String: Any] { lock.withLock { ["source_frames": receivedFrames, "source_video_bytes": receivedBytes, "source_keyframe_bytes": keyframeBytes, "video_width": size.0, "video_height": size.1, "target_width": videoSize.width, "target_height": videoSize.height, "max_size": videoSize.maxSize, "target_bitrate_bps": videoSize.bitRate(quality: quality), "requested_qp_max": (video && quality == 1 ? 40 as Any : NSNull()), "format_shaping_disabled": (video ? shapingDisabled as Any : NSNull()), "queued_frames": buffer.count, "dropped_frames": buffer.dropped, "reset_requests": resetRequests, "generation": buffer.generation, "last_frame_age_ms": lastFrameAt.map { max(0, (monotonic() - $0) * 1000) } as Any? ?? NSNull()] } }
+    var diagnostics: [String: Any] { lock.withLock { ["source_frames": receivedFrames, "source_video_bytes": receivedBytes, "source_keyframe_bytes": keyframeBytes, "video_width": size.0, "video_height": size.1, "target_width": videoSize.width, "target_height": videoSize.height, "max_size": videoSize.maxSize, "target_bitrate_bps": videoSize.bitRate(quality: quality), "requested_qp_max": (video && quality == 1 ? 44 as Any : NSNull()), "requested_bitrate_mode": (video && quality == 1 ? 2 as Any : NSNull()), "format_shaping_disabled": (video ? shapingDisabled as Any : NSNull()), "queued_frames": buffer.count, "dropped_frames": buffer.dropped, "reset_requests": resetRequests, "generation": buffer.generation, "last_frame_age_ms": lastFrameAt.map { max(0, (monotonic() - $0) * 1000) } as Any? ?? NSNull()] } }
     var inputDiagnostics: [String: Any] { lock.withLock {
         ["width": size.0, "height": size.1, "geometry_refreshes": physicalRefreshes,
          "geometry_refresh_pending": physicalRefreshing, "geometry_refresh_error": physicalError as Any? ?? NSNull()]
@@ -122,8 +122,9 @@ final class ScrcpySession: @unchecked Sendable {
     }
     static func arguments(version: String, scid: String, jar: String, video: Bool, controls: Bool, fps: Int, quality: Int, videoSize: ScrcpyVideoSize = .headless) -> [String] {
         let rate=videoSize.bitRate(quality:quality)
-        // This is an I/P quantizer ceiling, not fixed QP. Keep default bitrate mode (no CBR).
-        let codecOptions="profile=1,max-bframes=0,i-frame-interval=1" + (video && quality == 1 ? ",video-qp-i-max=40,video-qp-p-max=40" : "")
+        // Quality1 requests normal MediaCodec CBR (2), not frame-dropping CBR (3).
+        // I/P QP is a ceiling, not fixed QP; other qualities retain their default mode.
+        let codecOptions="profile=1,max-bframes=0,i-frame-interval=1" + (video && quality == 1 ? ",bitrate-mode=2,video-qp-i-max=44,video-qp-p-max=44" : "")
         // Keep control enabled internally for RESET_VIDEO even with Current input.
         return ["shell","CLASSPATH="+jar,"app_process","/","com.genymobile.scrcpy.Server",version,"scid="+scid,"tunnel_forward=true","audio=false","video=\(video)","control=true","send_device_meta=false","send_dummy_byte=true","send_stream_meta=true","send_frame_meta=true","clipboard_autosync=false","power_on=false","cleanup=true","video_codec=h264","video_codec_options="+codecOptions,"max_size=\(videoSize.maxSize)","max_fps=\(min(60,max(1,fps)))","video_bit_rate=\(rate)","log_level=warn"]
     }

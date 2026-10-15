@@ -1,10 +1,10 @@
-const MODES = ['auto', 'scrcpy', 'current'];
+const MODES = { capture: ['auto', 'scrcpy', 'current', 'jpeg'], input: ['auto', 'scrcpy', 'current'] };
 const PREFIX = 'simwisp.android-backends.v1:';
 let openMenu = null;
 const icon = content => `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${content}</svg>`;
 export const backendIcon = icon('<path d="M4 7h4m4 0h8M4 17h8m4 0h4"/><circle cx="10" cy="7" r="2"/><circle cx="14" cy="17" r="2"/>');
 export function backendChoice(value) {
-  return { capture: MODES.includes(value?.capture) ? value.capture : 'auto', input: MODES.includes(value?.input) ? value.input : 'auto' };
+  return { capture: MODES.capture.includes(value?.capture) ? value.capture : 'auto', input: MODES.input.includes(value?.input) ? value.input : 'auto' };
 }
 // Browser-local, stable AVD identity: neither credentials nor reusable ADB serials.
 export class AndroidBackends {
@@ -18,8 +18,8 @@ export class AndroidBackends {
     menu.className = 'backend-popover'; menu.hidden = true; menu.setAttribute('role', 'dialog'); menu.setAttribute('aria-label', 'Android backends');
     menu.id = `android-backends-${++AndroidBackends.nextID}`;
     trigger.setAttribute('aria-controls', menu.id); trigger.setAttribute('aria-haspopup', 'dialog'); trigger.setAttribute('aria-expanded', 'false');
-    const field = (kind, title, symbol, labels) => `<section class="backend-field"><div class="backend-field-heading"><span class="backend-field-label">${symbol}${title}</span><span class="backend-effective" data-effective="${kind}" aria-live="polite"></span></div><div class="backend-options" role="radiogroup" aria-label="${title} backend">${MODES.map((mode, i) => `<button type="button" role="radio" aria-checked="false" tabindex="-1" data-kind="${kind}" data-choice="${mode}">${labels[i]}</button>`).join('')}</div></section>`;
-    menu.innerHTML = `<header class="backend-header"><div><h2>Android backends</h2><p class="backend-device"></p></div><button class="backend-close" type="button" aria-label="Close Android backends">${icon('<path d="m7 7 10 10M17 7 7 17"/>')}</button></header><div class="backend-availability"><span class="availability-dot"></span><span class="backend-availability-text"></span><span class="availability-caption">On this Mac</span></div><div class="backend-warning" role="status" hidden></div>${field('capture', 'Capture', icon('<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/>'), ['Auto', 'scrcpy', 'Mac window'])}${field('input', 'Input', icon('<path d="m6 3 12 10-6 1-3 6-3-17Z"/>'), ['Auto', 'scrcpy', 'Current'])}<p class="backend-explainer">Auto prefers scrcpy and falls back to the current method.</p><footer class="backend-footer">${icon('<rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 18h4"/>')}<span>Only affects this emulator</span></footer>`;
+    const field = (kind, title, symbol, labels) => `<section class="backend-field"><div class="backend-field-heading"><span class="backend-field-label">${symbol}${title}</span><span class="backend-effective" data-effective="${kind}" aria-live="polite"></span></div><div class="backend-options" role="radiogroup" aria-label="${title} backend">${MODES[kind].map((mode, i) => `<button type="button" role="radio" aria-checked="false" tabindex="-1" data-kind="${kind}" data-choice="${mode}">${labels[i]}</button>`).join('')}</div></section>`;
+    menu.innerHTML = `<header class="backend-header"><div><h2>Android backends</h2><p class="backend-device"></p></div><button class="backend-close" type="button" aria-label="Close Android backends">${icon('<path d="m7 7 10 10M17 7 7 17"/>')}</button></header><div class="backend-availability"><span class="availability-dot"></span><span class="backend-availability-text"></span><span class="availability-caption">On this Mac</span></div><div class="backend-warning" role="status" hidden></div>${field('capture', 'Capture', icon('<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/>'), ['Auto', 'scrcpy', 'Mac window', 'JPEG'])}${field('input', 'Input', icon('<path d="m6 3 12 10-6 1-3 6-3-17Z"/>'), ['Auto', 'scrcpy', 'Current'])}<p class="backend-explainer">Auto prefers scrcpy and falls back to the current method. JPEG is manual-only: emulator JPEG70 → Mac H.264.</p><footer class="backend-footer">${icon('<rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 18h4"/>')}<span>Only affects this emulator</span></footer>`;
     menu.querySelector('.backend-device').textContent = name;
     document.body.append(menu);
     const listen = (node, type, handler, options) => { node.addEventListener(type, handler, options); this.#listeners.push(() => node.removeEventListener(type, handler, options)); };
@@ -29,7 +29,7 @@ export class AndroidBackends {
     listen(menu, 'keydown', e => {
       const b = e.target.closest('[data-choice]'); if (!b || !['ArrowLeft','ArrowRight','Home','End'].includes(e.key)) return;
       e.preventDefault(); const buttons = [...menu.querySelectorAll(`[data-kind="${b.dataset.kind}"]`)]; const i = buttons.indexOf(b);
-      const next = e.key === 'Home' ? 0 : e.key === 'End' ? 2 : (i + (e.key === 'ArrowRight' ? 1 : 2)) % 3;
+      const count = buttons.length, next = e.key === 'Home' ? 0 : e.key === 'End' ? count - 1 : (i + (e.key === 'ArrowRight' ? 1 : count - 1)) % count;
       buttons[next].click(); buttons[next].focus({ preventScroll: true });
     });
     listen(document, 'keydown', e => { if (e.key === 'Escape' && !menu.hidden) { e.preventDefault(); this.open(false, true); } });
@@ -43,7 +43,7 @@ export class AndroidBackends {
   static nextID = 0;
   get choices() { return { ...this.#choice }; }
   #select(kind, mode) {
-    if (this.#disposed || !['capture','input'].includes(kind) || !MODES.includes(mode) || this.#choice[kind] === mode) return;
+    if (this.#disposed || !['capture','input'].includes(kind) || !MODES[kind].includes(mode) || this.#choice[kind] === mode) return;
     this.#choice[kind] = mode;
     try { localStorage.setItem(this.#key, JSON.stringify(this.#choice)); } catch { /* Private browsing/full storage: still switch this session. */ }
     this.#state = { effective_capture: 'starting', effective_input: 'starting', available: false, reason: null };
@@ -54,21 +54,22 @@ export class AndroidBackends {
     // Stale configuration messages must not undo a just-selected preference.
     if (value.capture !== this.#choice.capture || value.input !== this.#choice.input) return;
     const allowed = ['starting','current','scrcpy','unavailable'];
-    if (!allowed.includes(value.effective_capture) || !allowed.includes(value.effective_input)) return;
-    this.#state = { effective_capture: value.effective_capture, effective_input: value.effective_input, available: typeof value.available === 'boolean' ? value.available : null, reason: typeof value.reason === 'string' ? value.reason.slice(0, 1000) : null };
+    if (![...allowed,'jpeg'].includes(value.effective_capture) || !allowed.includes(value.effective_input)) return;
+    this.#state = { jpeg_available: typeof value.jpeg_available === 'boolean' ? value.jpeg_available : null, effective_capture: value.effective_capture, effective_input: value.effective_input, available: typeof value.available === 'boolean' ? value.available : null, reason: typeof value.reason === 'string' ? value.reason.slice(0, 1000) : null };
     this.#render();
   }
   #render() {
     const m = this.#menu, s = this.#state, starting = [s.effective_capture,s.effective_input].includes('starting');
-    m.classList.toggle('unavailable', !s.available && !starting);
-    m.querySelector('.backend-availability-text').textContent = starting ? 'Checking scrcpy…' : s.available === null ? 'Checking installation…' : s.available ? 'scrcpy available' : 'scrcpy unavailable';
+    const jpeg = this.#choice.capture === 'jpeg', available = jpeg ? s.jpeg_available : s.available;
+    m.classList.toggle('unavailable', available === false && !starting);
+    m.querySelector('.backend-availability-text').textContent = jpeg ? available === true ? 'Emulator JPEG available' : available === false ? 'Emulator JPEG unavailable' : 'Checking emulator JPEG…' : starting ? 'Checking scrcpy…' : s.available === null ? 'Checking installation…' : s.available ? 'scrcpy available' : 'scrcpy unavailable';
     for (const kind of ['capture','input']) {
       const value = s[`effective_${kind}`], badge = m.querySelector(`[data-effective="${kind}"]`);
-      badge.textContent = value === 'scrcpy' ? 'Using scrcpy' : value === 'current' ? kind === 'capture' ? 'Using Mac window' : 'Using current' : value === 'unavailable' ? 'Unavailable' : 'Starting…';
+      badge.textContent = value === 'jpeg' ? 'Using JPEG70 → H.264' : value === 'scrcpy' ? 'Using scrcpy' : value === 'current' ? kind === 'capture' ? 'Using Mac window' : 'Using current' : value === 'unavailable' ? 'Unavailable' : 'Starting…';
       badge.className = 'backend-effective' + (value === 'current' || value === 'starting' ? ' current' : value === 'unavailable' ? ' error' : '');
       for (const b of m.querySelectorAll(`[data-kind="${kind}"]`)) {
         const selected = b.dataset.choice === this.#choice[kind]; b.setAttribute('aria-checked', String(selected)); b.tabIndex = selected ? 0 : -1;
-        b.title = b.dataset.choice === 'current' ? kind === 'capture' ? 'ScreenCaptureKit window capture' : 'Mac mouse events + existing ADB commands' : b.dataset.choice === 'auto' ? 'Prefer compatible scrcpy; otherwise use the current method' : 'Always use scrcpy; report errors instead of falling back';
+        b.title = b.dataset.choice === 'jpeg' ? 'Manual-only Android emulator JPEG quality70, decoded and encoded with Mac VideoToolbox; Android14+ required' : b.dataset.choice === 'current' ? kind === 'capture' ? 'ScreenCaptureKit window capture' : 'Mac mouse events + existing ADB commands' : b.dataset.choice === 'auto' ? 'Prefer compatible scrcpy; otherwise use the current method' : 'Always use scrcpy; report errors instead of falling back';
       }
     }
     const warning = m.querySelector('.backend-warning'); warning.hidden = !s.reason; warning.textContent = s.reason || '';

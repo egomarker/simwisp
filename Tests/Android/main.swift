@@ -23,6 +23,7 @@ for i in 0..<30 {
     frames.append(["key":f.keyframe,"payload":annex(f.payload).map{String(format:"%02x",$0)}.joined()])
 }
 encoder.close();try jsonData(["config":config.map{String(format:"%02x",$0)}.joined(),"frames":frames]).write(to:root.appendingPathComponent("video.json"))
+try makeJPEGFixtures(root)
 try? fm.removeItem(at:root.appendingPathComponent("peer.json"))
 let peer=Process();peer.executableURL=URL(fileURLWithPath:node);peer.arguments=[script,root.path,"peer"];peer.standardOutput=FileHandle.nullDevice;peer.standardError=FileHandle.standardError;try peer.run()
 func wait(_ label:String,_ test:()->Bool)throws{let end=monotonic()+10;while monotonic()<end{if test(){return};Thread.sleep(forTimeInterval:0.01)};throw WispError("Timeout: "+label)}
@@ -64,7 +65,7 @@ if CommandLine.arguments.contains("--serve") {
         @MainActor func stopCapture()async throws{}
         @MainActor func removeStreamOutput(_ output:any SCStreamOutput,type:SCStreamOutputType)throws{}
     }
-    let service=Service(settings:settings,pairingStateURL:root.appendingPathComponent("pairing-state.json"),tlsDirectory:root.appendingPathComponent("tls"),devices:devices,input:fakeInput,metroEndpoint:URL(string:"http://127.0.0.1:45154/fixture/empty-metro")!,scrcpyInstallation:{if fm.fileExists(atPath:root.appendingPathComponent("unavailable").path){throw WispError("scrcpy fixture unavailable <img src=x onerror=bad>")};return try installation()},makeCapture:{w in WindowCapture(target:w,makeStream:{c in FakeStream(c,sample!)})})
+    let service=Service(settings:settings,pairingStateURL:root.appendingPathComponent("pairing-state.json"),tlsDirectory:root.appendingPathComponent("tls"),devices:devices,input:fakeInput,metroEndpoint:URL(string:"http://127.0.0.1:45154/fixture/empty-metro")!,scrcpyInstallation:{if fm.fileExists(atPath:root.appendingPathComponent("unavailable").path){throw WispError("scrcpy fixture unavailable <img src=x onerror=bad>")};return try installation()},jpegInstallation:{if fm.fileExists(atPath:root.appendingPathComponent("jpeg-unavailable").path){throw WispError("JPEG fixture unavailable <img src=x onerror=bad>")};return jar.path},makeCapture:{w in WindowCapture(target:w,makeStream:{c in FakeStream(c,sample!)})})
     service.stateChanged={state in if state=="Running"{print("Isolated Android service ready");fflush(stdout)}}
     try service.start();let signal=DispatchSource.makeSignalSource(signal:SIGTERM,queue:.main);Darwin.signal(SIGTERM,SIG_IGN);signal.setEventHandler{service.stop{peer.terminate();peer.waitUntilExit();exit(0)}};signal.resume();dispatchMain()
 }
@@ -80,24 +81,25 @@ for (w,h) in [(1,1),(320,640),(411,914),(480,960),(1080,1920),(1920,1080),(8192,
         let expected=Int(max(500_000,min(40_000_000,(2_000_000+Double(q)/95*18_000_000)*area)))
         expect(H264VideoPolicy.bitRate(width:w,height:h,quality:q)==expected,"legacy Mac-window bitrate curve")
         if let size=ScrcpyVideoSize(width:w,height:h) {
-            let scrcpyExpected = q == 1 ? 800_000 : expected
+            let scrcpyExpected = q == 1 ? 200_000 : expected
             expect(size.bitRate(quality:q)==scrcpyExpected,"scrcpy shared curve with explicit quality1 trial")
             let args=ScrcpySession.arguments(version:ScrcpyWire.version,scid:"00000001",jar:"fixture.jar",video:true,controls:false,fps:60,quality:q,videoSize:size)
             expect(args.contains("max_size=\(max(w,h))") && args.contains("video_bit_rate=\(scrcpyExpected)"),"pixel/bitrate budget reaches the server options")
-            let codec="video_codec_options=profile=1,max-bframes=0,i-frame-interval=1" + (q == 1 ? ",video-qp-i-max=40,video-qp-p-max=40" : "")
-            expect(args.contains(codec) && !args.contains(where:{$0.contains("bitrate-mode=")}),"QP40 ceiling only for quality1; no CBR and unchanged Baseline/no-B/GOP")
+            let codec="video_codec_options=profile=1,max-bframes=0,i-frame-interval=1" + (q == 1 ? ",bitrate-mode=2,video-qp-i-max=44,video-qp-p-max=44" : "")
+            expect(args.contains(codec),"normal CBR2/QP44 only at quality1; other modes/Baseline/no-B/GOP unchanged")
         }
     }
 }
 let portrait=ScrcpyVideoSize(width:411,height:914)!
 expect(portrait==ScrcpyVideoSize(width:914,height:411),"rotation keeps the same pixel budget")
-expect(portrait.bitRate(quality:1)==800_000 && portrait.maxSize==914,"owner quality1 trial uses914px/800kbps")
-expect(H264VideoPolicy.bitRate(width:411,height:914,quality:1)==500_000,"800kbps/QP40 scrcpy trial does not change Mac-window bitrate")
+expect(portrait.bitRate(quality:1)==200_000 && portrait.maxSize==914,"owner quality1 trial uses914px/200kbps")
+expect(H264VideoPolicy.bitRate(width:411,height:914,quality:1)==500_000,"200kbps/QP44 scrcpy trial does not change Mac-window bitrate")
 let controlOnlyArgs=ScrcpySession.arguments(version:ScrcpyWire.version,scid:"00000001",jar:"fixture.jar",video:false,controls:true,fps:60,quality:1,videoSize:portrait)
 expect(controlOnlyArgs.contains("video=false") && controlOnlyArgs.contains("video_codec_options=profile=1,max-bframes=0,i-frame-interval=1"),"control-only input never requests video QP limits")
+expect(!controlOnlyArgs.contains{$0.contains("bitrate-mode=") || $0.contains("repeat-previous-frame-after")},"control-only requests neither bitrate mode nor repeat option")
 for (w,h) in [(0,800),(-1,800),(1,1),(8193,800),(Int.max,800)] { expect(ScrcpyVideoSize(width:w,height:h)==nil,"malformed size cannot reach encoder arguments") }
 expect(ScrcpyVideoSize.headless.width==360 && ScrcpyVideoSize.headless.height==800,"headless fallback matches existing UI")
-for c in AndroidBackendMode.allCases{for i in AndroidBackendMode.allCases{let v=AndroidBackendChoice(capture:c.rawValue,input:i.rawValue);expect(v.capture==c && v.input==i,"independent selections")}}
+for c in AndroidBackendMode.allCases{for i in AndroidBackendMode.allCases{let v=AndroidBackendChoice(capture:c.rawValue,input:i.rawValue);expect(v.capture.rawValue==c.rawValue && v.input==i,"independent selections")}}
 expect(AndroidBackendChoice(capture:"bad",input:"bad")==AndroidBackendChoice(),"invalid preferences default safely")
 var header=Data();header.scrcpyAppend(UInt32(1)<<31);header.scrcpyAppend(UInt32(320));header.scrcpyAppend(UInt32(640))
 if case .session(let w,let h)=try ScrcpyWire.header(header){expect(w==320 && h==640,"5.x session metadata")}else{fatalError("session flag")}
@@ -147,7 +149,7 @@ for video in [true,false]{
         expect(write != nil && read != nil && launch != nil && write! < read! && read! < launch!,"setprop and readback precede encoder launch")
         expect(s.diagnostics["format_shaping_disabled"] as? Bool == true,"property verification is observable, not an actual bitrate claim")
     } else { expect(s.diagnostics["format_shaping_disabled"] is NSNull,"control-only never claims to have changed shaping") }
-    expect(s.diagnostics["requested_qp_max"] is NSNull,"default quality/control-only diagnostics do not pretend to know actual QP")
+    expect(s.diagnostics["requested_qp_max"] is NSNull && s.diagnostics["requested_bitrate_mode"] is NSNull,"default quality/control-only diagnostics claim neither QP nor mode override")
     if video{var frame:H264Frame?;try wait("direct H.264 frame"){frame=s.takeFrame();return frame != nil};expect(frame!.keyframe && frame!.width==320 && frame!.description.count>7,"Annex-B passes native AVCC pipeline");var offset=0;while offset<frame!.payload.count{let n=Int(frame!.payload.scrcpyUInt(offset,4));let kind=frame!.payload[offset+4]&31;expect(kind != 7 && kind != 8,"original in-band parameter sets cannot override low-reorder avcC");offset+=4+n}}
     expect(try s.perform(["type":"touch_down","x":0.2,"y":0.3]),"direct touch down");expect(try s.perform(["type":"touch_move","x":0.4,"y":0.5]),"direct touch move");expect(try s.perform(["type":"touch_up","x":0.4,"y":0.5]),"direct touch up")
     for type in ["home","back","menu","app_switcher","key","text"]{expect(try s.perform(["type":type,"key":"enter","text":"hello"]),"persistent control \(type)")}
@@ -252,3 +254,4 @@ expect(events.filter{$0["kind"] as? String=="command"}.allSatisfy{let a=$0["args
 expect(!events.contains{($0["args"] as? [String])?.contains("kill-server")==true},"no global ADB shutdown")
 try jsonData(["checks":checks,"real_device_actions":false,"real_capture":false,"real_input":false]).write(to:root.appendingPathComponent("native-review.json"))
 print("Android backend native checks: \(checks) passed")
+try runJPEGTests(root:root,adb:adb,jar:jar)

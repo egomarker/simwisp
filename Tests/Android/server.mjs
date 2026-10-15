@@ -6,7 +6,27 @@ const record = v => fs.appendFileSync(root+'/events.ndjson',JSON.stringify({at_m
 if(role==='cli'){
   if(args[0]!=='-s'||!/^emulator-\d+$/.test(args[1]))throw Error('Unscoped fixture ADB');
   record({kind:'command',args});const cmd=args.slice(2);
-  if(cmd[0]==='forward'&&cmd[1]==='tcp:0')console.log(JSON.parse(fs.readFileSync(root+'/peer.json')).port);
+  if(cmd[0]==='exec-out'){
+    if(cmd.length!==4||cmd[1]!=='sh'||cmd[2]!=='-c'||!cmd[3].startsWith("CLASSPATH='")||!cmd[3].includes(' exec app_process / --nice-name='))throw Error('Invalid ADB helper command string / double quoting');
+    record({kind:'jpeg_process',pid:process.pid});
+    const fixture=JSON.parse(fs.readFileSync(root+'/jpeg.json','utf8'));let sequence=0,timer,next=performance.now();
+    process.stdout.on('error',()=>process.exit(0));
+    const send=()=>{
+      const mode=fs.existsSync(root+'/jpeg-mode.json')?JSON.parse(fs.readFileSync(root+'/jpeg-mode.json','utf8')):{};
+      if(mode.stall){timer=setTimeout(send,50);return}
+      const fail=mode.failure;if(fail==='eof')process.exit(0);
+      if(fail==='error'){const e=Buffer.from('JPEG failure <img src=x>\n'),h=Buffer.alloc(8);h.write('SWE1');h.writeUInt32BE(e.length,4);process.stdout.write(Buffer.concat([h,e]));process.exitCode=2;return}
+      const landscape=mode.rotation||fs.existsSync(root+'/jpeg-rotation');
+      const bytes=mode.corrupt?Buffer.from([255,216,255,217]):Buffer.from(landscape?fixture.landscape:fixture.portrait[mode.static?0:sequence%fixture.portrait.length],'base64');
+      const h=Buffer.alloc(32);h.write(fail==='magic'?'BAD!':'SWJ1');h.writeUInt32BE(fail==='length'?8388609:bytes.length,4);
+      h.writeBigUInt64BE(fail==='sequence'?0n:fail==='duplicate'?1n:BigInt(++sequence),8);
+      h.writeBigUInt64BE(fail==='timestamp'?0n:fail==='regression'?1000n-BigInt(sequence):process.hrtime.bigint(),16);
+      h.writeUInt32BE(fail==='dimensions'?8193:landscape?640:320,24);h.writeUInt32BE(landscape?320:640,28);
+      const p=Buffer.concat([h,bytes]);process.stdout.write(p.subarray(0,3));process.stdout.write(p.subarray(3,19));process.stdout.write(p.subarray(19));
+      next+=1000/(mode.fps??60);timer=setTimeout(send,Math.max(0,next-performance.now()));
+    };send();process.on('SIGTERM',()=>{clearTimeout(timer);process.exit(0)});
+  }
+  else if(cmd[0]==='forward'&&cmd[1]==='tcp:0')console.log(JSON.parse(fs.readFileSync(root+'/peer.json')).port);
   else if(cmd[0]==='forward'&&cmd[1]==='--remove'){try{fs.unlinkSync(root+'/options.json')}catch{}}
   else if(cmd.join(' ')==='shell setprop debug.stagefright.enableshaping 0'){}
   else if(cmd.join(' ')==='shell getprop debug.stagefright.enableshaping')console.log('0');

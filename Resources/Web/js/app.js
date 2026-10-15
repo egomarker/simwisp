@@ -881,15 +881,16 @@ function clearPanelProgress(udid, errorMessage = null) {
   }
 }
 
+// Rate labels use SI units: KB=1000 bytes, MB=1000000 bytes.
 function fmtRate(bytesPerSecond) {
-  if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / 1024 / 1024).toFixed(1)} MB/s`;
-  if (bytesPerSecond >= 1024) return `${Math.round(bytesPerSecond / 1024)} KB/s`;
+  if (bytesPerSecond >= 1000 * 1000) return `${(bytesPerSecond / 1000 / 1000).toFixed(1)} MB/s`;
+  if (bytesPerSecond >= 1000) return `${Math.round(bytesPerSecond / 1000)} KB/s`;
   return `${Math.round(bytesPerSecond)} B/s`;
 }
 
 function fmtRateCompact(bytesPerSecond) {
-  if (bytesPerSecond >= 1024 * 1024) return `${(bytesPerSecond / 1024 / 1024).toFixed(1)}M`;
-  if (bytesPerSecond >= 1024) return `${Math.round(bytesPerSecond / 1024)}K`;
+  if (bytesPerSecond >= 1000 * 1000) return `${(bytesPerSecond / 1000 / 1000).toFixed(1)}M`;
+  if (bytesPerSecond >= 1000) return `${Math.round(bytesPerSecond / 1000)}K`;
   return `${Math.round(bytesPerSecond)}B`;
 }
 
@@ -898,10 +899,11 @@ function updatePanelStats(udid, stats) {
   if (!panel?.statsEl) return;
   const quality = stats.serverQuality ?? parseInt(qualSlider.value);
   const serverFps = stats.serverFps ?? parseInt(fpsSlider.value);
+  const renderedFps = Number.isFinite(stats.fps) ? Math.round(stats.fps) : "—";
   panel.statsEl.textContent = isMobileViewport()
-    ? `${stats.fps}fps ${fmtRateCompact(stats.bps)}`
-    : `${stats.fps} fps · ${fmtRate(stats.bps)} · q${quality}`;
-  panel.statsEl.title = `Rendered ${stats.fps} fps. H.264 server target ${serverFps} fps; sent ${Number.isFinite(stats.serverSentFps) ? stats.serverSentFps.toFixed(1) : "—"} fps, bitrate quality ${quality}. Avg frame ${Math.round(stats.avgFrame / 1024 || 0)} KB. Dropped ${stats.dropped}.`;
+    ? `${renderedFps}fps ${fmtRateCompact(stats.bps)}`
+    : `${renderedFps} fps · ${fmtRate(stats.bps)} · q${quality}`;
+  panel.statsEl.title = `Rendered ${Number.isFinite(stats.fps) ? stats.fps.toFixed(1) : "—"} fps. H.264 server target ${serverFps} fps; sent ${Number.isFinite(stats.serverSentFps) ? stats.serverSentFps.toFixed(1) : "—"} fps, bitrate quality ${quality}. Avg frame ${Math.round(stats.avgFrame / 1000 || 0)} KB. Dropped ${stats.dropped}. Video receive ${Math.round(stats.bps)} B/s over ${Number.isFinite(stats.intervalSeconds) ? stats.intervalSeconds.toFixed(2) : "—"}s; includes24-byte frame headers, excludes WebSocket/TLS overhead. KB=1000B.`;
 }
 
 function updateStreamVisibility() {

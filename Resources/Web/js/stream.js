@@ -26,7 +26,7 @@ export class SimStream {
   #portraitW; #portraitH; #isLandscape = false;
   #onStatus; #onFirstFrame; #onOrientationChange; #onRotateStart; #onRotateEnd;
   #onStats; #onAccessibility; #onStopped; #onBackends; #cancelPointer = () => {}; #statsTimer = null;
-  #stats = { frames: 0, bytes: 0, dropped: 0, lastFrames: 0, lastBytes: 0, fps: 0, bps: 0, avgFrame: 0 };
+  #stats = { frames: 0, bytes: 0, dropped: 0, lastFrames: 0, lastBytes: 0, lastAt: 0, fps: 0, bps: 0, avgFrame: 0 };
   #serverStats = { fps: null, sentFps: null, quality: null };
 
   constructor(
@@ -372,12 +372,18 @@ export class SimStream {
       if (this.#ws?.readyState === WebSocket.OPEN && this.#lastMessageAt > 0 && Date.now() - this.#lastMessageAt > WATCHDOG_STALE) this.#connect();
     }, WATCHDOG_POLL);
     clearInterval(this.#statsTimer);
+    // A reconnect starts a fresh rate window; old partial-window bytes/frames
+    // must not be charged to the new connection's first sample.
+    this.#stats.lastFrames = this.#stats.frames; this.#stats.lastBytes = this.#stats.bytes; this.#stats.lastAt = performance.now();
     this.#statsTimer = setInterval(() => {
+      const now = performance.now(), elapsed = (now - this.#stats.lastAt) / 1000;
+      if (!Number.isFinite(elapsed) || elapsed <= 0) return;
       const frames = this.#stats.frames - this.#stats.lastFrames, bytes = this.#stats.bytes - this.#stats.lastBytes;
-      this.#stats.lastFrames = this.#stats.frames; this.#stats.lastBytes = this.#stats.bytes;
-      this.#stats.fps = frames; this.#stats.bps = bytes;
+      this.#stats.lastFrames = this.#stats.frames; this.#stats.lastBytes = this.#stats.bytes; this.#stats.lastAt = now;
+      // Browser timers can be delayed/throttled: a tick is not necessarily1s.
+      this.#stats.fps = frames / elapsed; this.#stats.bps = bytes / elapsed;
       this.#stats.avgFrame = frames ? bytes / frames : this.#stats.avgFrame;
-      this.#onStats({ fps: this.#stats.fps, bps: this.#stats.bps, avgFrame: this.#stats.avgFrame, dropped: this.#stats.dropped, serverFps: this.#serverStats.fps, serverSentFps: this.#serverStats.sentFps, serverQuality: this.#serverStats.quality, codec: 'h264' });
+      this.#onStats({ fps: this.#stats.fps, bps: this.#stats.bps, intervalSeconds: elapsed, intervalBytes: bytes, receivedBytes: this.#stats.bytes, avgFrame: this.#stats.avgFrame, dropped: this.#stats.dropped, serverFps: this.#serverStats.fps, serverSentFps: this.#serverStats.sentFps, serverQuality: this.#serverStats.quality, codec: 'h264' });
     }, 1000);
   }
 

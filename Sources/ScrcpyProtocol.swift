@@ -4,11 +4,13 @@ import CoreMedia
 // Private wire protocol, deliberately pinned to the installed/tested server tag.
 // v5 adds session packets and moves CONFIG/KEY to bits 62/61 (not older scrcpy framing).
 enum AndroidBackendMode: String, CaseIterable { case auto, scrcpy, current }
+// JPEG is capture-only and deliberately excluded from Auto/input resolution.
+enum AndroidCaptureMode: String, CaseIterable { case auto, scrcpy, current, jpeg }
 struct AndroidBackendChoice: Equatable {
-    var capture: AndroidBackendMode = .auto
+    var capture: AndroidCaptureMode = .auto
     var input: AndroidBackendMode = .auto
     init(capture: String? = nil, input: String? = nil) {
-        self.capture = AndroidBackendMode(rawValue: capture ?? "auto") ?? .auto
+        self.capture = AndroidCaptureMode(rawValue: capture ?? "auto") ?? .auto
         self.input = AndroidBackendMode(rawValue: input ?? "auto") ?? .auto
     }
 }
@@ -24,9 +26,9 @@ struct ScrcpyVideoSize: Equatable {
     }
     var maxSize: Int { height }
     func bitRate(quality: Int) -> Int {
-        // Owner-requested800kbps/maxQP40 experiment at the current quality1 setting.
+        // Owner-requested200kbps/maxQP44 experiment at the current quality1 setting.
         // Other qualities retain the shared Mac-window curve; Mac is unchanged.
-        quality == 1 ? 800_000 : H264VideoPolicy.bitRate(width:width,height:height,quality:quality)
+        quality == 1 ? 200_000 : H264VideoPolicy.bitRate(width:width,height:height,quality:quality)
     }
 }
 

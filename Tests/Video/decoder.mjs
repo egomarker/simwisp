@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import vm from 'node:vm';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -201,6 +202,47 @@ try {
   const sockets = WS.all.length; globalThis.isSecureContext = false; t = start();
   check('Insecure context never opens socket', WS.all.length === sockets && t.statuses.at(-1)[0] === 'unsupported'); destroy(t); globalThis.isSecureContext = true;
   globalThis.VideoDecoder = undefined; t = start(); check('Missing WebCodecs actionable', t.statuses.at(-1)[0] === 'unsupported'); destroy(t); globalThis.VideoDecoder = Decoder;
+
+  // Rate accounting uses actual monotonic elapsed time, not interval tick count.
+  const tickStats = ms => { now += ms; const timer=[...timers.values()].find(t=>t.repeat===1000); if(!timer)throw Error('No stats timer');timer.at=now+1000;timer.fn(); };
+  let rates=[];
+  for(const capture of ['scrcpy','current']) {
+    rates=[];t=start({backends:{capture,input:'scrcpy'},onStats:s=>rates.push(s)});t.ws.open();t.stream.updateSettings({stream_paused:true});
+    for(let id=1;id<=10;id++)t.ws.receive(packet({id,time:id*16667,size:10240}));
+    tickStats(2000);let rate=rates.at(-1);
+    check(capture+' delayed2s window is51200B/s, not102400',rate.bps===51200&&rate.intervalBytes===102400&&rate.intervalSeconds===2&&rate.receivedBytes===102400);
+    check(capture+' paused receive bytes are not rendered frames',rate.fps===0);
+    t.ws.receive(JSON.stringify({type:'server_stats',fps:60,quality:1}));tickStats(1000);
+    check(capture+' idle/JSON-only interval reports0videoB/s',rates.at(-1).bps===0&&rates.at(-1).receivedBytes===102400);
+    t.ws.receive(packet({id:11,size:25000}));tickStats(500);
+    check(capture+' short500ms interval normalizes to50000B/s',rates.at(-1).bps===50000&&rates.at(-1).intervalSeconds===.5);
+    destroy(t);
+  }
+  rates=[];t=start({onStats:s=>rates.push(s)});t.ws.open();t.stream.updateSettings({stream_paused:true});t.ws.receive(packet({size:50000}));
+  tickStats(0);check('zero-duration stats callback emits no invalid rate',rates.length===0);
+  const savedNow=now;now=NaN;[...timers.values()].find(t=>t.repeat===1000).fn();now=savedNow;
+  check('non-finite clock callback emits no invalid rate',rates.length===0);
+  tickStats(1000);check('ignored callback does not lose pending receive bytes',rates.at(-1).bps===50000);destroy(t);
+  rates=[];t=start({backends:{capture:'scrcpy',input:'scrcpy'},onStats:s=>rates.push(s)});t.ws.open();t.stream.updateSettings({stream_paused:true});
+  t.ws.receive(packet({size:100000}));now+=500;const oldWS=t.ws;t.stream.switchBackends({capture:'current',input:'scrcpy'});const newWS=WS.all.at(-1);newWS.open();
+  oldWS.receive(packet({size:500000}));newWS.receive(packet({size:50000}));tickStats(1000);
+  check('reconnect/backend switch rate excludes old partial-window bytes',rates.at(-1).bps===50000&&rates.at(-1).intervalBytes===50000);
+  check('stale socket ignored while cumulative receive count is retained',rates.at(-1).receivedBytes===150000);destroy(t);
+  rates=[];t=start({onStats:s=>rates.push(s)});t.ws.open();t.ws.receive(cfg());await flush();d=Decoder.all.at(-1);
+  t.ws.receive(packet({size:1000}));d.deliver(16667);render();t.ws.receive(packet({id:2,time:33334,key:false,size:1000}));d.deliver(33334);render();
+  tickStats(2000);check('rendered FPS uses elapsed time without changing real draw count',rates.at(-1).fps===1&&t.canvas.draws.length===2&&rates.at(-1).bps===1000);destroy(t);
+  rates=[];t=start({onStats:s=>rates.push(s)});t.ws.open();t.stream.updateSettings({stream_paused:true});t.ws.receive(packet({size:28}));t.ws.receive(JSON.stringify({type:'frame_heartbeat'}));tickStats(1000);
+  check('rate includes24-byte video header exactly once, not JSON',rates.at(-1).bps===28&&rates.at(-1).intervalBytes===28);destroy(t);
+  const uiSource=fs.readFileSync('Resources/Web/js/app.js','utf8'),uiStart=uiSource.indexOf('function fmtRate(bytesPerSecond)'),uiEnd=uiSource.indexOf('\nfunction updateStreamVisibility()',uiStart);
+  let mobile=false;const ratePanel={statsEl:{}},ui=vm.runInNewContext(uiSource.slice(uiStart,uiEnd)+';({fmtRate,fmtRateCompact,updatePanelStats})',{simPanels:new Map([['fixture',ratePanel]]),qualSlider:{value:'1'},fpsSlider:{value:'60'},isMobileViewport:()=>mobile});
+  for(const [bytes,text,compact] of [[0,'0 B/s','0B'],[999,'999 B/s','999B'],[1000,'1 KB/s','1K'],[50000,'50 KB/s','50K'],[1000000,'1.0 MB/s','1.0M']]) {
+    check('SI full rate label '+bytes,ui.fmtRate(bytes)===text);check('SI compact rate label '+bytes,ui.fmtRateCompact(bytes)===compact);
+  }
+  const displayStats={fps:59.6,bps:50000,avgFrame:1000,dropped:0,intervalSeconds:2,serverFps:60,serverSentFps:60,serverQuality:1};ui.updatePanelStats('fixture',displayStats);
+  check('desktop stats round fractional normalized FPS and use SI KB/s',ratePanel.statsEl.textContent==='60 fps · 50 KB/s · q1');
+  check('rate tooltip describes raw B/s, elapsed window and byte scope',ratePanel.statsEl.title.includes('50000 B/s over 2.00s')&&ratePanel.statsEl.title.includes('KB=1000B')&&ratePanel.statsEl.title.includes('excludes WebSocket/TLS'));
+  mobile=true;ui.updatePanelStats('fixture',displayStats);check('compact stats avoid raw fractional FPS',ratePanel.statsEl.textContent==='60fps 50K');
+
   check('Every created decoder closed', Decoder.all.every(d => d.state === 'closed'));
   check('Every delivered VideoFrame closed exactly once', frames.every(f => f.closed));
   check('No streaming ACK emitted anywhere', WS.all.every(w => !w.messages.some(m => m.type === 'frame_ack')));
