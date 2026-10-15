@@ -2,13 +2,21 @@
 import fs from 'node:fs';
 import net from 'node:net';
 const [root,role,...args]=process.argv.slice(2);
-const record = v => fs.appendFileSync(root+'/events.ndjson',JSON.stringify(v)+'\n');
+const record = v => fs.appendFileSync(root+'/events.ndjson',JSON.stringify({at_ms:Number(process.hrtime.bigint())/1e6,...v})+'\n');
 if(role==='cli'){
   if(args[0]!=='-s'||!/^emulator-\d+$/.test(args[1]))throw Error('Unscoped fixture ADB');
   record({kind:'command',args});const cmd=args.slice(2);
   if(cmd[0]==='forward'&&cmd[1]==='tcp:0')console.log(JSON.parse(fs.readFileSync(root+'/peer.json')).port);
   else if(cmd[0]==='forward'&&cmd[1]==='--remove'){try{fs.unlinkSync(root+'/options.json')}catch{}}
-  else if(cmd[0]==='shell'&&cmd[1]==='dumpsys')console.log('mOverrideDisplayInfo=DisplayInfo{"fixture", displayId 0, real 320 x 640, rotation 0}');
+  else if(cmd.join(' ')==='shell setprop debug.stagefright.enableshaping 0'){}
+  else if(cmd.join(' ')==='shell getprop debug.stagefright.enableshaping')console.log('0');
+  else if(cmd.join(' ')==='shell dumpsys display'){
+    const display=fs.existsSync(root+'/display.json')?JSON.parse(fs.readFileSync(root+'/display.json','utf8')):{};
+    record({kind:'geometry_query',width:display.width??320,height:display.height??640,delay_ms:display.delay_ms??0});
+    if(display.delay_ms)await new Promise(r=>setTimeout(r,display.delay_ms));
+    if(display.fail)process.exit(1);
+    console.log('mOverrideDisplayInfo=DisplayInfo{"fixture", displayId 0, real '+(display.width??320)+' x '+(display.height??640)+', rotation 0}');
+  }
   else if(cmd.includes('com.genymobile.scrcpy.Server')){
     fs.writeFileSync(root+'/options.json',JSON.stringify({video:cmd.includes('video=true')}));record({kind:'process',pid:process.pid});
     setInterval(()=>{},1000);

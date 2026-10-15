@@ -79,6 +79,7 @@ final class ScrcpySession: @unchecked Sendable {
     typealias Installation = () throws -> ScrcpyInstallation
     private let lock = NSLock(), inputLock = NSLock()
     private let worker = DispatchQueue(label: "Simwisp.scrcpy", qos: .userInitiated)
+    private let geometryWorker = DispatchQueue(label: "Simwisp.scrcpy-geometry", qos: .userInitiated)
     private let network: DispatchQueue
     private let lifecycle: DispatchGroup
     private let run: (String, [String], Double) throws -> CommandResult
@@ -90,7 +91,10 @@ final class ScrcpySession: @unchecked Sendable {
     private var cancelled = false, stopping = false, ready = false, finished = false, everReady = false, installed = false
     private let work = DispatchGroup()
     private var failure: String?, buffer = ScrcpyFrames(), sockets: [ScrcpySocket] = []
-    private var control: ScrcpySocket?, size = (0,0), physicalChecked = 0.0
+    private var control: ScrcpySocket?, size = (0,0)
+    private var physicalRevision: UInt64 = 0, physicalRefreshing = false
+    private var physicalRefreshes = 0, physicalError: String?
+    private var shapingDisabled = false
     private var pressed: (Double, Double)?, gestureSize = (0,0), secondFinger = false
     private var noticePending = false, lastReset = -Double.infinity
     private var receivedFrames = 0, resetRequests = 0
@@ -102,7 +106,11 @@ final class ScrcpySession: @unchecked Sendable {
     }
     var state: (ready: Bool, error: String?, size: (Int,Int), finished: Bool, connected: Bool, installed: Bool) { lock.withLock { (ready && !stopping, failure, size, finished, everReady, installed) } }
     var hasFrame: Bool { lock.withLock { buffer.count > 0 } }
-    var diagnostics: [String: Any] { lock.withLock { ["source_frames": receivedFrames, "source_video_bytes": receivedBytes, "source_keyframe_bytes": keyframeBytes, "video_width": size.0, "video_height": size.1, "target_width": videoSize.width, "target_height": videoSize.height, "max_size": videoSize.maxSize, "target_bitrate_bps": videoSize.bitRate(quality: quality), "queued_frames": buffer.count, "dropped_frames": buffer.dropped, "reset_requests": resetRequests, "generation": buffer.generation, "last_frame_age_ms": lastFrameAt.map { max(0, (monotonic() - $0) * 1000) } as Any? ?? NSNull()] } }
+    var diagnostics: [String: Any] { lock.withLock { ["source_frames": receivedFrames, "source_video_bytes": receivedBytes, "source_keyframe_bytes": keyframeBytes, "video_width": size.0, "video_height": size.1, "target_width": videoSize.width, "target_height": videoSize.height, "max_size": videoSize.maxSize, "target_bitrate_bps": videoSize.bitRate(quality: quality), "requested_qp_max": (video && quality == 1 ? 40 as Any : NSNull()), "format_shaping_disabled": (video ? shapingDisabled as Any : NSNull()), "queued_frames": buffer.count, "dropped_frames": buffer.dropped, "reset_requests": resetRequests, "generation": buffer.generation, "last_frame_age_ms": lastFrameAt.map { max(0, (monotonic() - $0) * 1000) } as Any? ?? NSNull()] } }
+    var inputDiagnostics: [String: Any] { lock.withLock {
+        ["width": size.0, "height": size.1, "geometry_refreshes": physicalRefreshes,
+         "geometry_refresh_pending": physicalRefreshing, "geometry_refresh_error": physicalError as Any? ?? NSNull()]
+    } }
     private func notify() {
         let emit = lock.withLock { () -> Bool in if noticePending || cancelled { return false };noticePending=true;return true }
         if emit { network.async { [weak self] in guard let self else{return};self.lock.withLock{self.noticePending=false};if !self.lock.withLock({self.cancelled || self.stopping}){self.onChange?()} } }
@@ -114,8 +122,10 @@ final class ScrcpySession: @unchecked Sendable {
     }
     static func arguments(version: String, scid: String, jar: String, video: Bool, controls: Bool, fps: Int, quality: Int, videoSize: ScrcpyVideoSize = .headless) -> [String] {
         let rate=videoSize.bitRate(quality:quality)
+        // This is an I/P quantizer ceiling, not fixed QP. Keep default bitrate mode (no CBR).
+        let codecOptions="profile=1,max-bframes=0,i-frame-interval=1" + (video && quality == 1 ? ",video-qp-i-max=40,video-qp-p-max=40" : "")
         // Keep control enabled internally for RESET_VIDEO even with Current input.
-        return ["shell","CLASSPATH="+jar,"app_process","/","com.genymobile.scrcpy.Server",version,"scid="+scid,"tunnel_forward=true","audio=false","video=\(video)","control=true","send_device_meta=false","send_dummy_byte=true","send_stream_meta=true","send_frame_meta=true","clipboard_autosync=false","power_on=false","cleanup=true","video_codec=h264","video_codec_options=profile=1,max-bframes=0,i-frame-interval=1","max_size=\(videoSize.maxSize)","max_fps=\(min(60,max(1,fps)))","video_bit_rate=\(rate)","log_level=warn"]
+        return ["shell","CLASSPATH="+jar,"app_process","/","com.genymobile.scrcpy.Server",version,"scid="+scid,"tunnel_forward=true","audio=false","video=\(video)","control=true","send_device_meta=false","send_dummy_byte=true","send_stream_meta=true","send_frame_meta=true","clipboard_autosync=false","power_on=false","cleanup=true","video_codec=h264","video_codec_options="+codecOptions,"max_size=\(videoSize.maxSize)","max_fps=\(min(60,max(1,fps)))","video_bit_rate=\(rate)","log_level=warn"]
     }
     func start() {
         lifecycle.enter(); work.enter()
@@ -136,6 +146,17 @@ final class ScrcpySession: @unchecked Sendable {
                 guard DeviceControl.validID(serial,platform:"android") else{throw WispError("Invalid Android serial")}
                 guard video || controls else{throw WispError("No scrcpy demand")}
                 let install=try installation();guard install.version==ScrcpyWire.version else{throw WispError("Unsupported scrcpy protocol")};lock.withLock{installed=true}
+                // Android's VBR quality floor otherwise rewrites the requested bitrate/QP.
+                // This property is device-wide, survives session cleanup, and may require
+                // a debuggable emulator. Fail visibly instead of silently using shaping.
+                if video {
+                    do {
+                        _ = try tool(["shell","setprop","debug.stagefright.enableshaping","0"])
+                        let value = try tool(["shell","getprop","debug.stagefright.enableshaping"]).text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard value == "0" else { throw WispError("Property readback was not 0") }
+                        lock.withLock { shapingDisabled = true }
+                    } catch { throw WispError("Cannot disable Android VBR format shaping (debug.stagefright.enableshaping); scrcpy capture was not started") }
+                }
                 let scid=String(format:"%08x",UInt32.random(in:1...0x7fff_ffff)),remote="/data/local/tmp/simwisp-scrcpy-"+scid+".jar"
                 jar=remote;_ = try tool(["push",install.server,remote],timeout:8)
                 let f=try tool(["forward","tcp:0","localabstract:scrcpy_"+scid]).text.trimmingCharacters(in:.whitespacesAndNewlines)
@@ -204,9 +225,47 @@ final class ScrcpySession: @unchecked Sendable {
         let c=lock.withLock{() -> ScrcpySocket? in guard video,!cancelled,monotonic()-lastReset>0.5 else{return nil};lastReset=monotonic();buffer.reset();resetRequests += 1;return control}
         if let c { try? c.send(Data([17])) }
     }
-    func invalidatePhysicalSize() { lock.withLock { physicalChecked=0 } }
-    func refreshPhysicalSize() throws {
-        let result=try tool(["shell","dumpsys","display"]);let d=try ScrcpyWire.displaySize(result.text);lock.withLock{size=d;physicalChecked=monotonic()}
+    private func readPhysicalSize() throws -> (Int, Int) {
+        lock.withLock { physicalRefreshes += 1 }
+        return try ScrcpyWire.displaySize(tool(["shell","dumpsys","display"]).text)
+    }
+    // Initial lookup is on the startup worker, before input becomes ready.
+    private func refreshPhysicalSize() throws {
+        let dimensions = try readPhysicalSize()
+        lock.withLock { size = dimensions; physicalError = nil }
+    }
+    // No TTL and no gesture-time tool calls. Debounce/coalesce explicit changes
+    // on a separate worker; never hold inputLock while querying or publishing.
+    func invalidatePhysicalSize() {
+        let begin = lock.withLock { () -> Bool in
+            guard !video, controls, ready, !cancelled, !stopping, !finished else { return false }
+            physicalRevision &+= 1
+            guard !physicalRefreshing else { return false }
+            physicalRefreshing = true; work.enter(); lifecycle.enter(); return true
+        }
+        if begin { geometryWorker.asyncAfter(deadline: .now() + 0.15) { [self] in
+            defer { lifecycle.leave(); work.leave() }
+            while true {
+                let revision = lock.withLock { () -> UInt64? in
+                    guard !cancelled, !stopping, !finished else { physicalRefreshing = false; return nil }
+                    return physicalRevision
+                }
+                guard let revision else { return }
+                let result = Result { try readPhysicalSize() }
+                let again = lock.withLock { () -> Bool in
+                    guard !cancelled, !stopping, !finished else { physicalRefreshing = false; return false }
+                    // A newer rotation/resolution notification supersedes this result.
+                    guard revision == physicalRevision else { return true }
+                    switch result {
+                    case .success(let dimensions): size = dimensions; physicalError = nil
+                    case .failure(let error): physicalError = error.localizedDescription
+                    }
+                    physicalRefreshing = false; return false
+                }
+                if !again { notify(); return }
+                Thread.sleep(forTimeInterval: 0.15)
+            }
+        } }
     }
     func perform(_ m:[String:Any]) throws -> Bool {
         try inputLock.withLock {
@@ -226,7 +285,8 @@ final class ScrcpySession: @unchecked Sendable {
             }
             switch type {
             case "touch_down","tap","drag","accessibility_swipe":
-                try up();if !video && lock.withLock({monotonic()-physicalChecked>1}){try refreshPhysicalSize()};gestureSize=lock.withLock{size}
+                // One validated snapshot for DOWN, every MOVE, both fingers, and UP.
+                try up();gestureSize=lock.withLock{size}
                 let x=n(type=="touch_down" || type=="tap" ? "x":"x1"),y=n(type=="touch_down" || type=="tap" ? "y":"y1");try touch(0,x,y);pressed=(x,y)
                 if type=="accessibility_swipe"{secondFinger=true;do{try touch(0,x,y,true)}catch{try? up();throw error}}
                 if type=="tap"{try up()}
@@ -235,7 +295,7 @@ final class ScrcpySession: @unchecked Sendable {
                 }
             case "touch_move":if pressed != nil{try touch(2,n("x"),n("y"));pressed=(n("x"),n("y"))}
             case "touch_up":if pressed != nil{pressed=(n("x"),n("y"));try up()}
-            case "rotate":try up();try c.send(Data([11]));lock.withLock{physicalChecked=0}
+            case "rotate":try up();try c.send(Data([11]));invalidatePhysicalSize()
             case "text":
                 let text=m["text"] as? String ?? "";guard text.utf8.count<=16_384 else{throw WispError("Text is too long")};var part=""
                 for ch in text { if part.utf8.count+String(ch).utf8.count>300{try c.send(ScrcpyWire.text(part));part=""};guard String(ch).utf8.count<=300 else{throw WispError("Text grapheme is too long")};part.append(ch) };if !part.isEmpty{try c.send(ScrcpyWire.text(part))}

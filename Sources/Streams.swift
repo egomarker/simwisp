@@ -21,6 +21,7 @@ final class StreamSession: @unchecked Sendable {
     private var backendAvailable: Bool?
     private var backendProbePending = false
     private var lastVideoSize = (0,0)
+    private var inputSizeHint = (0,0)
     private var backendReason: String?
     private var backendStarted = 0.0
     private var scrcpyFPS = 0, scrcpyQuality = 0
@@ -71,6 +72,7 @@ final class StreamSession: @unchecked Sendable {
         self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation
         backendChoice = AndroidBackendChoice(capture: request.query["capture_backend"], input: request.query["input_backend"])
         initialScrcpySize = ScrcpyVideoSize(width:Int(request.query["w"] ?? "") ?? 0,height:Int(request.query["h"] ?? "") ?? 0) ?? .headless
+        if let w=Int(request.query["w"] ?? ""), let h=Int(request.query["h"] ?? ""), (1...8192).contains(w), (1...8192).contains(h) { inputSizeHint=(w,h) }
         self.id = id; self.client = client; self.devices = devices; self.input = input; self.queue = queue; self.lifecycle = lifecycle
         flow = StreamFlow(fps: Int(request.query["fps"] ?? "") ?? settings.fps, quality: Int(request.query["quality"] ?? "") ?? settings.quality)
         dataSaver = request.query["data_saver"] == "1"
@@ -96,7 +98,7 @@ final class StreamSession: @unchecked Sendable {
         timer.setEventHandler { [weak self] in self?.tick() }; timer.resume(); self.timer = timer
     }
     var snapshot: [String: Any] {
-        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (captureHasFrame ? "Streaming" : "Starting")), "uptime": Int(monotonic() - started), "capture_counters": effectiveCapture == "scrcpy" ? (scrcpy?.diagnostics ?? [:]) : (capture?.counters ?? [:]), "sent_fps": sentFPS, "target_fps": flow.targetFPS, "last_encode_ms": lastEncodeMS, "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending, "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS, "accessibility": accessibility.snapshot, "android_backends": isAndroid ? backendSnapshot : [:]]
+        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (captureHasFrame ? "Streaming" : "Starting")), "uptime": Int(monotonic() - started), "capture_counters": effectiveCapture == "scrcpy" ? (scrcpy?.diagnostics ?? [:]) : (capture?.counters ?? [:]), "input_counters": effectiveInput == "scrcpy" ? (scrcpy?.inputDiagnostics ?? [:]) : [:], "sent_fps": sentFPS, "target_fps": flow.targetFPS, "last_encode_ms": lastEncodeMS, "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending, "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS, "accessibility": accessibility.snapshot, "android_backends": isAndroid ? backendSnapshot : [:]]
     }
     // One-shot deadlines avoid quantizing 16.67 ms frames onto 16 ms polling
     // ticks. Local encode/write completions wake it; receiver RTT never gates
@@ -356,7 +358,16 @@ final class StreamSession: @unchecked Sendable {
             guard let feedback = StreamFeedback(data) else { return }
             _ = flow.feedback(feedback, currentEpoch: videoEpoch, now: monotonic())
         } else if type == "settings" {
-            if data["dev_w"] != nil || data["dev_h"] != nil { scrcpy?.invalidatePhysicalSize() }
+            // Browser/capture dimensions are a change hint, never Android's touch
+            // space. Replayed settings/decoder notifications must not query ADB.
+            if let w=(data["dev_w"] as? NSNumber)?.doubleValue, let h=(data["dev_h"] as? NSNumber)?.doubleValue,
+               w.isFinite, h.isFinite, w.rounded()==w, h.rounded()==h, (1...8192).contains(w), (1...8192).contains(h) {
+                let next=(Int(w),Int(h))
+                if next != inputSizeHint {
+                    let known=inputSizeHint.0>0;inputSizeHint=next
+                    if known { scrcpy?.invalidatePhysicalSize() }
+                }
+            }
             let f = (data["fps"] as? NSNumber).flatMap { $0.doubleValue.isFinite ? Int(clamp($0.doubleValue, 1, 60)) : nil }
             let q = (data["quality"] as? NSNumber).flatMap { $0.doubleValue.isFinite ? Int(clamp($0.doubleValue, 1, 95)) : nil }
             if f != nil || q != nil {
@@ -397,7 +408,17 @@ final class StreamSession: @unchecked Sendable {
                 };return
             }
         }
-        if data["type"] as? String == "rotate" { scrcpy?.invalidatePhysicalSize() }
+        if data["type"] as? String == "rotate", let source=scrcpy {
+            // The emulator-skin command is asynchronous: query only AFTER it
+            // completes, not before rotation has actually changed the display.
+            let legacyInput=input, deviceID=id
+            nativeInputWorker.async {
+                source.cancelGesture()
+                legacyInput.perform(data, id:deviceID) { response in
+                    source.invalidatePhysicalSize(); completion(response)
+                }
+            };return
+        }
         input.perform(data, id:id, completion:completion)
     }
     func stop(completion: @escaping () -> Void = {}) {

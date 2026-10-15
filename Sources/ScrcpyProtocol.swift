@@ -24,9 +24,9 @@ struct ScrcpyVideoSize: Equatable {
     }
     var maxSize: Int { height }
     func bitRate(quality: Int) -> Int {
-        // Owner-requested250kbps experiment at the current quality1 setting.
+        // Owner-requested800kbps/maxQP40 experiment at the current quality1 setting.
         // Other qualities retain the shared Mac-window curve; Mac is unchanged.
-        quality == 1 ? 250_000 : H264VideoPolicy.bitRate(width:width,height:height,quality:quality)
+        quality == 1 ? 800_000 : H264VideoPolicy.bitRate(width:width,height:height,quality:quality)
     }
 }
 
