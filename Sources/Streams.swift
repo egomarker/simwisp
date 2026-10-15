@@ -230,8 +230,11 @@ final class StreamSession: @unchecked Sendable {
         lastStats=now;lastStatsFrames=frameCount
         client.sendJSON(["type":"server_stats","codec":"h264","fps":fps,"target_fps":flow.targetFPS,"sent_fps":sentFPS,"quality":quality,"frame_id":frameCount])
     }
-    private func requestKeyframe() {
-        videoEpoch &+= 1; forceKeyframe = true
+    // An IDR refreshes references inside the SAME encoder/decoder. Advance
+    // the epoch only for a real source discontinuity or decoder recovery.
+    private func requestKeyframe(newEpoch: Bool = false) {
+        if newEpoch { videoEpoch &+= 1 }
+        forceKeyframe = true
         scrcpy?.requestKeyframe()
         // Never erase outstanding transport debt on reset; delayed feedback
         // from an older epoch can still retire already-delivered bytes.
@@ -242,7 +245,7 @@ final class StreamSession: @unchecked Sendable {
         return { lifecycle.leave(); captures.leave() }
     }
     private func configure(_ window: DeviceWindow) {
-        configuring = true; requestKeyframe()
+        configuring = true; requestKeyframe(newEpoch: true)
         let old = capture; capture = nil; geometry = nil; captureHasFrame = false; reconcileAccessibility()
         let new = makeCapture(window), finish = beginCaptureWork()
         Task { @MainActor [weak self] in
@@ -263,7 +266,7 @@ final class StreamSession: @unchecked Sendable {
         }
     }
     private func releaseCapture() {
-        let old = capture; capture = nil; geometry = nil; captureHasFrame = false; requestKeyframe()
+        let old = capture; capture = nil; geometry = nil; captureHasFrame = false; requestKeyframe(newEpoch: true)
         reconcileAccessibility()
         if let old {
             let finish = beginCaptureWork()
@@ -374,9 +377,11 @@ final class StreamSession: @unchecked Sendable {
             if min(AndroidJPEGWire.maxEdge,desired.maxSize)==source.maxSize { pendingScrcpySize=nil }
             else if pendingScrcpySize != desired { pendingScrcpySize=desired;scrcpySizeChangedAt=now }
             let resized=pendingScrcpySize != nil && now-scrcpySizeChangedAt>=0.35
-            let fpsChanged=source.fps != flow.fps && ((backendSettingsAt>0 && now>=backendSettingsAt) || now-backendStarted>5)
-            if resized || fpsChanged {
-                pendingScrcpySize=nil;backendSettingsAt=0;requestKeyframe();releaseJPEG();return false
+            // Keep the producer at the USER cap. Network adaptation only changes
+            // local encode pacing/bitrate, never the persistent mirror/cache.
+            let requestedFPSChanged=source.fps != flow.targetFPS && backendSettingsAt>0 && now>=backendSettingsAt
+            if resized || requestedFPSChanged {
+                pendingScrcpySize=nil;backendSettingsAt=0;requestKeyframe(newEpoch: true);releaseJPEG();return false
             }
             guard source.state.ready else { return false }
             if jpegAvailable != true { jpegAvailable=true;effectiveCapture="jpeg";publishBackends() }
@@ -387,8 +392,8 @@ final class StreamSession: @unchecked Sendable {
             backendReason="Android SDK adb is unavailable";publishBackends();return true
         }
         if capture != nil { releaseCapture() }
-        backendStarted=monotonic();jpegAvailable=nil;requestKeyframe()
-        let source=AndroidJPEGSession(adb:adb,serial:id,fps:flow.fps,maxSize:desiredScrcpySize().maxSize,network:queue,lifecycle:lifecycle,installation:jpegInstallation)
+        backendStarted=monotonic();jpegAvailable=nil;requestKeyframe(newEpoch: true)
+        let source=AndroidJPEGSession(adb:adb,serial:id,fps:flow.targetFPS,maxSize:desiredScrcpySize().maxSize,network:queue,lifecycle:lifecycle,installation:jpegInstallation)
         jpeg=source;jpegFinish=beginCaptureWork()
         source.onChange={ [weak self,weak source] in guard let self,let source,!self.closed,self.jpeg === source else { return };self.tick() }
         source.start();publishBackends();return false
@@ -436,7 +441,9 @@ final class StreamSession: @unchecked Sendable {
         } else if type == "video_keyframe" {
             if let epoch = data["epoch"] as? NSNumber, epoch.doubleValue != Double(videoEpoch) { return }
             if data["overloaded"] as? Bool == true { flow.congested(now: monotonic()) }
-            requestKeyframe()
+            // The browser has already discarded its decoder and awaits a NEW
+            // epoch. Routine server-side IDRs must not enter this hard path.
+            requestKeyframe(newEpoch: true)
         } else if type == "video_feedback" {
             guard let feedback = StreamFeedback(data) else { return }
             _ = flow.feedback(feedback, currentEpoch: videoEpoch, now: monotonic())
@@ -459,7 +466,7 @@ final class StreamSession: @unchecked Sendable {
                 if changed { backendSettingsAt = monotonic() + 0.35 }
             }
             if let value = data["data_saver"] as? Bool, value != dataSaver { dataSaver = value; requestKeyframe() }
-            if let value = data["stream_paused"] as? Bool, value != paused { paused = value; requestKeyframe(); if isAndroid { resetAndroid() } }
+            if let value = data["stream_paused"] as? Bool, value != paused { paused = value; requestKeyframe(newEpoch: true); if isAndroid { resetAndroid() } }
             if let value = data["accessibility_enabled"] as? Bool { accessibility.update(paneOpen: value, streamActive: value && accessibilityStreamReady, subscription: data["accessibility_subscription"] as? Int) }
         } else {
             guard DeviceInput.supportedTypes.contains(type) else { return }

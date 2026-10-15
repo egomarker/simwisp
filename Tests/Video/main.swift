@@ -10,6 +10,8 @@ func expect(_ condition: @autoclosure () -> Bool, _ name: String) {
 }
 let root = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+expect(H264VideoPolicy.maxKeyFrameInterval == 3600, "shared native automatic GOP frame bound")
+expect(H264VideoPolicy.maxKeyFrameIntervalDuration == 0, "no short wall-clock IDR cap")
 let encoder = try H264Encoder(width: 405, height: 901)
 let color = CIImage(color: CIColor(red: 0.15, green: 0.70, blue: 0.25)).cropped(to: CGRect(x: 0, y: 0, width: 405, height: 901))
 var frames: [H264Frame] = []

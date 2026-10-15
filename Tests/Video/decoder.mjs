@@ -111,6 +111,20 @@ try {
   const held = replacement.deliver(16667); destroy(t); check('Destroy closes frame waiting for rendering', held.closed);
   const late = replacement.deliver(16667); check('Destroyed decoder output always closes', late.closed);
 
+  // A server reference refresh is an IDR in the same epoch, NOT a decoder
+  // replacement. Keep pending outputs and normal receipts across such IDRs.
+  t = start(); t.ws.open(); t.ws.receive(cfg()); t.ws.receive(packet()); await flush(); d = Decoder.all.at(-1);
+  const retained = d.deliver(16667), decoderCountBeforeIDRs = Decoder.all.length;
+  for (let id = 2; id <= 5; id++) {
+    t.ws.receive(cfg()); t.ws.receive(packet({ id, time: id * 16667, key: true })); await flush();
+    check('Same-epoch reference refresh preserves configured decoder', Decoder.all.length === decoderCountBeforeIDRs && d.state === 'configured');
+  }
+  check('Same-epoch IDRs do not discard a pending decoded output', !retained.closed && requests(t).length === 0 && d.chunks.length === 5);
+  render(); check('Retained output still renders after soft IDRs', retained.closed && t.canvas.draws.length === 1);
+  const finalIDR = d.deliver(83335); render(); advance(250);
+  check('Soft IDRs retain receipt continuity and final render', finalIDR.closed && feedback(t).at(-1).epoch === 1 && feedback(t).at(-1).frame_id === 5 && t.canvas.draws.at(-1) === 83335);
+  destroy(t);
+
   // Multiple packets can arrive while asynchronous support probing is pending.
   let resolve; Decoder.probe = new Promise(r => resolve = r);
   t = start(); t.ws.open(); t.ws.receive(cfg()); t.ws.receive(packet());

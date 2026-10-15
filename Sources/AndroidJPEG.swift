@@ -54,7 +54,7 @@ final class AndroidJPEGSession: @unchecked Sendable {
     // only inspect cachedAvailable under lock; no second unbounded image queue.
     private var cached:(image:CIImage,bytes:Data,width:Int,height:Int)?
     private var cachedAvailable=false
-    private var decoded:UInt64=0,cachedEncodes:UInt64=0
+    private var decoded:UInt64=0,cachedEncodes:UInt64=0,encoderCreations:UInt64=0
     private var heartbeatAt:Double?,transportAt:Double?
     private var dimensions=(0,0),lastAt:Double?,hardware=false
     var onChange:(()->Void)?
@@ -70,7 +70,7 @@ final class AndroidJPEGSession: @unchecked Sendable {
     func canEncode(dataSaver:Bool,forceKeyframe:Bool)->Bool {
         lock.withLock{sourceAliveLocked && (latest != nil || (cachedAvailable && (!dataSaver || forceKeyframe)))}
     }
-    var diagnostics:[String:Any] { lock.withLock{["source_mode":"persistent_imagereader","source_heartbeats":heartbeats,"last_heartbeat_age_ms":heartbeatAt.map{max(0,(monotonic()-$0)*1000)} as Any? ?? NSNull(),"source_frames":received,"source_jpeg_bytes":receivedBytes,"jpeg_quality":AndroidJPEGWire.quality,"video_width":dimensions.0,"video_height":dimensions.1,"max_size":maxSize,"source_fps_limit":fps,"queued_frames":latest == nil ? 0:1,"dropped_frames":dropped,"h264_encodes":encoded,"jpeg_decodes":decoded,"cached_image_encodes":cachedEncodes,"cached_image_available":cachedAvailable && sourceAliveLocked,"hardware_encoder":hardware,"last_frame_age_ms":lastAt.map{max(0,(monotonic()-$0)*1000)} as Any? ?? NSNull()]} }
+    var diagnostics:[String:Any] { lock.withLock{["source_mode":"persistent_imagereader","source_heartbeats":heartbeats,"last_heartbeat_age_ms":heartbeatAt.map{max(0,(monotonic()-$0)*1000)} as Any? ?? NSNull(),"source_frames":received,"source_jpeg_bytes":receivedBytes,"jpeg_quality":AndroidJPEGWire.quality,"video_width":dimensions.0,"video_height":dimensions.1,"max_size":maxSize,"source_fps_limit":fps,"queued_frames":latest == nil ? 0:1,"dropped_frames":dropped,"h264_encodes":encoded,"encoder_creations":encoderCreations,"jpeg_decodes":decoded,"cached_image_encodes":cachedEncodes,"cached_image_available":cachedAvailable && sourceAliveLocked,"hardware_encoder":hardware,"last_frame_age_ms":lastAt.map{max(0,(monotonic()-$0)*1000)} as Any? ?? NSNull()]} }
     private var isCancelled:Bool { lock.withLock{cancelled} }
     private func notify() {
         let emit=lock.withLock{()->Bool in if cancelled || noticePending{return false};noticePending=true;return true}
@@ -183,7 +183,10 @@ final class AndroidJPEGSession: @unchecked Sendable {
                 if dataSaver && previous==cached.bytes && !forceKeyframe{return nil}
                 guard lock.withLock({sourceAliveLocked}) else{return nil}
                 let resized=encoder?.width != cached.width || encoder?.height != cached.height
-                if resized {encoder?.close();encoder=try H264Encoder(width:cached.width,height:cached.height)}
+                if resized {
+                    encoder?.close();encoder=try H264Encoder(width:cached.width,height:cached.height)
+                    lock.withLock{encoderCreations &+= 1}
+                }
                 // This is a NEW encode with NEW PTS/reference state, never an
                 // old encoded H264 packet or another decode of cached JPEGs.
                 let result=try encoder!.encode(cached.image,quality:quality,fps:fps,forceKeyframe:forceKeyframe || resized)

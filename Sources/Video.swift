@@ -5,6 +5,11 @@ import CoreImage
 // Shared by Mac-window encoding and the Android encoder launch budget.
 // Callers supply content pixels; odd 4:2:0 dimensions include the same padding.
 enum H264VideoPolicy {
+    // Frequent IDRs discard static-image refinement at a constrained bitrate.
+    // Bound automatic refresh by frame count (~60s at60FPS), not a1s timer.
+    // Startup/source changes/decoder or transport recovery still force an IDR.
+    static let maxKeyFrameInterval = 3600
+    static let maxKeyFrameIntervalDuration = 0 // Zero disables the time cap.
     static func bitRate(width: Int, height: Int, quality: Int) -> Int {
         let w = (width + 1) & ~1, h = (height + 1) & ~1
         let area = Double(w * h) / (1080 * 1920)
@@ -71,8 +76,8 @@ final class H264Encoder {
             try property(kVTCompressionPropertyKey_RealTime, true as CFBoolean)
             try property(kVTCompressionPropertyKey_AllowFrameReordering, false as CFBoolean)
             try property(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel)
-            try property(kVTCompressionPropertyKey_MaxKeyFrameInterval, 60 as CFNumber)
-            try property(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, 1 as CFNumber)
+            try property(kVTCompressionPropertyKey_MaxKeyFrameInterval, H264VideoPolicy.maxKeyFrameInterval as CFNumber)
+            try property(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, H264VideoPolicy.maxKeyFrameIntervalDuration as CFNumber)
             try property(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2)
             try property(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_sRGB)
             try property(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2)

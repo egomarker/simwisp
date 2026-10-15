@@ -68,6 +68,7 @@ func runJPEGTests(root:URL,adb:URL,jar:URL)throws {
     let first=try source.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:false)
     check(first?.keyframe==true && first?.width==320 && first?.height==640,"new JPEG encoder creates real bounded Baseline H264 IDR")
     check(first!.description[1]==66 && !first!.payload.isEmpty,"existing VideoToolbox encoder, not JPEG sent to browser")
+    check(source.diagnostics["encoder_creations"] as? UInt64==1,"initial JPEG image creates exactly one native encoder")
     try wait("new static capture"){source.hasFrame}
     check(try source.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:true)==nil,"Data saver skips identical newly captured JPEG")
     try wait("keyframe sample"){source.hasFrame}
@@ -78,6 +79,7 @@ func runJPEGTests(root:URL,adb:URL,jar:URL)throws {
     try option(["rotation":true,"fps":60]);try wait("rotated metadata"){source.diagnostics["video_width"] as? Int==640}
     let rotated=try source.h264(quality:20,fps:60,forceKeyframe:false,dataSaver:false)
     check(rotated?.keyframe==true && rotated?.width==640 && rotated?.height==320,"rotation rebuilds encoder with IDR and exact JPEG dimensions")
+    check(source.diagnostics["encoder_creations"] as? UInt64==2,"actual geometry change creates a replacement encoder")
     try option(["stall":true]);Thread.sleep(forTimeInterval:0.75)
     let decodeBeforeRepeat=source.diagnostics["jpeg_decodes"] as! UInt64
     let repeated=try source.h264(quality:1,fps:60,forceKeyframe:true,dataSaver:false)
@@ -122,6 +124,18 @@ func runJPEGTests(root:URL,adb:URL,jar:URL)throws {
     }
     check(idle.diagnostics["jpeg_decodes"] as? UInt64==idleDecodes && idle.diagnostics["source_frames"] as? UInt64==idleFrames,"continuous cached encoding never invents JPEG captures/decodes")
     check(idle.diagnostics["h264_encodes"] as? UInt64==idleEncoded+61 && (idle.diagnostics["cached_image_encodes"] as? UInt64 ?? 0)>=61,"actual cached-image encodes counted separately")
+    // Changing output pacing must retain decoded pixels, the native encoder
+    // and its monotonic PTS, even while the producer supplies only heartbeats.
+    let continuityEncoders=idle.diagnostics["encoder_creations"] as! UInt64
+    for outputFPS in [48,38,30,32,34,36,38,40,42,44,46,48,50,52,54,56,58,60] {
+        for _ in 0..<3 {
+            let frame=try idle.h264(quality:1,fps:outputFPS,forceKeyframe:false,dataSaver:false)
+            check(frame != nil && frame!.timestamp>lastPTS,"adaptive output pacing retains a monotonic native encoder timeline")
+            lastPTS=frame!.timestamp
+        }
+    }
+    check(idle.diagnostics["encoder_creations"] as? UInt64==continuityEncoders && continuityEncoders==1,"adaptive output FPS never recreates the native encoder")
+    check(idle.diagnostics["jpeg_decodes"] as? UInt64==idleDecodes && idle.diagnostics["source_frames"] as? UInt64==idleFrames,"adaptive pacing retains the same decoded image without new JPEG work")
     check(try idle.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:true)==nil,"Data saver ON immediately suppresses unchanged decoded image")
     check(try idle.h264(quality:95,fps:60,forceKeyframe:true,dataSaver:true)?.keyframe==true,"explicit recovery under Data saver can re-encode current image")
     check(try idle.h264(quality:95,fps:60,forceKeyframe:false,dataSaver:true)==nil,"Data saver sleeps again after explicit IDR")

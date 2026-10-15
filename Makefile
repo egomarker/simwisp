@@ -6,7 +6,7 @@ TEST_BUILD ?= build/tests
 ARCH := $(shell uname -m)
 SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 
-.PHONY: build check test test-pairing test-accessibility test-input test-capture test-device-control test-video test-sps test-stream-flow test-decoder test-tls test-browser-accessibility test-browser-device-control test-metro-native test-metro-console run clean install
+.PHONY: build check test test-pairing test-accessibility test-input test-capture test-device-control test-video test-video-quality test-sps test-stream-flow test-decoder test-tls test-browser-accessibility test-browser-device-control test-metro-native test-metro-console run clean install
 build:
 	@mkdir -p '$(APP)/Contents/MacOS' '$(APP)/Contents/Resources'
 	@scripts/build-android-jpeg.sh '$(APP)/Contents/Resources/simwisp-jpeg.jar'
@@ -56,6 +56,14 @@ test-video: test-sps
 	 xcrun swiftc -swift-version 5 -O -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/H264SPS.swift Sources/Video.swift Sources/TLS.swift Sources/DeviceControl.swift Sources/Devices.swift Sources/Capture.swift Tests/Video/main.swift -o "$$root/video-tests"; \
 	 "$$root/video-tests" "$$root/results"; \
 	 if [[ -n "$${TEST_OUTPUT:-}" ]]; then mkdir -p "$$TEST_OUTPUT"; cp "$$root/results/video-review.json" "$$TEST_OUTPUT/"; fi
+# Opt-in real-codec fidelity regression. Use4200 static frames to cross the
+# automatic3600-frame boundary (about2.5min total for both capture paths).
+VIDEO_QUALITY_SOURCE ?= Sources/Video.swift
+test-video-quality:
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-video-quality-tests.XXXXXX); \
+	 trap 'status=$$?; if [[ -n "$${TEST_OUTPUT:-}" && -d "$$root/results" ]]; then mkdir -p "$$TEST_OUTPUT"; cp "$$root"/results/*.json "$$TEST_OUTPUT/"; fi; rm -rf "$$root"; exit $$status' EXIT; \
+	 xcrun swiftc -swift-version 5 -O -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/H264SPS.swift '$(VIDEO_QUALITY_SOURCE)' Sources/DeviceControl.swift Sources/Devices.swift Sources/Capture.swift Tests/Video/Quality/main.swift -o "$$root/quality-tests"; \
+	 mkdir -p "$$root/results"; "$$root/quality-tests" "$$root/results"
 test-stream-flow:
 	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-flow-tests.XXXXXX); trap 'rm -rf "$$root"' EXIT; \
 	 xcrun swiftc -swift-version 5 -O Sources/StreamFlow.swift Tests/Streaming/main.swift -o "$$root/flow-tests"; \
