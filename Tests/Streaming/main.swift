@@ -87,6 +87,30 @@ for (key, bad) in [("epoch", -1 as Any), ("epoch", 4_294_967_296), ("frame_id", 
 }
 var missing = valid; missing.removeValue(forKey: "frame_id")
 check("incomplete telemetry rejected", StreamFeedback(missing) == nil)
+// JPEG-only local encoding: timer lateness must not compound into <55FPS.
+// Existing default-policy checks above continue to cover Mac/scrcpy behavior.
+for fps in [1,15,30,60] {
+    var paced=StreamFlow(fps:fps,quality:20)
+    let period=1/Double(fps),start=1.0,jitter=period/20
+    check("JPEG first cadence admission",paced.beginFrame(now:start,maintainCadence:true))
+    var previous=start
+    for _ in 0..<600 {
+        let due=paced.nextFrame+jitter
+        check("JPEG early callback leaves slot available",!paced.beginFrame(now:paced.nextFrame-period/10,maintainCadence:true))
+        check("JPEG jittered deadline admitted",paced.beginFrame(now:due,maintainCadence:true))
+        check("JPEG no immediate repeat or burst",!paced.beginFrame(now:due,maintainCadence:true) && due-previous>=period*0.75)
+        previous=due
+    }
+    check("JPEG scheduler jitter does not accumulate",abs(paced.nextFrame-(start+601*period))<0.00001)
+    for gap in [period/3,period,5.0] {
+        let late=paced.nextFrame+gap
+        check("JPEG missed deadline rebases once",paced.beginFrame(now:late,maintainCadence:true) && abs(paced.nextFrame-late-period)<0.00001)
+        check("JPEG missed intervals never replayed",!paced.beginFrame(now:late+period/2,maintainCadence:true))
+    }
+    let deadline=paced.nextFrame
+    _ = paced.recordSend(epoch:1,id:1,bytes:StreamFlow.maxBytes,now:deadline)
+    check("JPEG full transport cannot spend encoder deadline",!paced.beginFrame(now:deadline,maintainCadence:true) && paced.nextFrame==deadline)
+}
 let result: [String: Any] = ["passed": true, "checks": checks, "simulated_rtt_ms": [40,100,400], "real_network": false, "real_capture": false, "real_input": false]
 if let output = ProcessInfo.processInfo.environment["TEST_OUTPUT"] {
     try FileManager.default.createDirectory(atPath: output, withIntermediateDirectories: true)

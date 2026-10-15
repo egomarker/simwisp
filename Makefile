@@ -88,6 +88,10 @@ test-android-parity:
 test-android-performance:
 	@ANDROID_PERFORMANCE=1 NODE='$(NODE)' Tests/Android/run.sh
 
+.PHONY: test-android-jpeg-surface
+test-android-jpeg-surface:
+	@Tests/Android/run-surface.sh
+
 .PHONY: test-android-jpeg
-test-android-jpeg:
+test-android-jpeg: test-android-jpeg-surface
 	@ANDROID_JPEG=1 NODE='$(NODE)' Tests/Android/run.sh

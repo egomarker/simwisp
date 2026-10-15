@@ -9,15 +9,23 @@ if(role==='cli'){
   if(cmd[0]==='exec-out'){
     if(cmd.length!==4||cmd[1]!=='sh'||cmd[2]!=='-c'||!cmd[3].startsWith("CLASSPATH='")||!cmd[3].includes(' exec app_process / --nice-name='))throw Error('Invalid ADB helper command string / double quoting');
     record({kind:'jpeg_process',pid:process.pid});
-    const fixture=JSON.parse(fs.readFileSync(root+'/jpeg.json','utf8'));let sequence=0,timer,next=performance.now();
+    const fixture=JSON.parse(fs.readFileSync(root+'/jpeg.json','utf8'));let sequence=0,timer,next=performance.now(),wasIdle=false;
     process.stdout.on('error',()=>process.exit(0));
     const send=()=>{
       const mode=fs.existsSync(root+'/jpeg-mode.json')?JSON.parse(fs.readFileSync(root+'/jpeg-mode.json','utf8')):{};
       if(mode.stall){timer=setTimeout(send,50);return}
       const fail=mode.failure;if(fail==='eof')process.exit(0);
+      if(mode.heartbeat || fail?.startsWith('heartbeat-')){
+        wasIdle=true;
+        const h=Buffer.alloc(16);h.write('SWH1');h.writeUInt32BE(fail==='heartbeat-length'?9:8,4);
+        h.writeBigUInt64BE(fail==='heartbeat-zero'?0n:fail==='heartbeat-duplicate'?1n:process.hrtime.bigint(),8);
+        process.stdout.write(h.subarray(0,3));process.stdout.write(h.subarray(3,11));process.stdout.write(h.subarray(11));
+        timer=setTimeout(send,mode.heartbeat?500:50);return;
+      }
       if(fail==='error'){const e=Buffer.from('JPEG failure <img src=x>\n'),h=Buffer.alloc(8);h.write('SWE1');h.writeUInt32BE(e.length,4);process.stdout.write(Buffer.concat([h,e]));process.exitCode=2;return}
+      if(wasIdle){next=performance.now();wasIdle=false} // no synthetic catch-up burst on wake
       const landscape=mode.rotation||fs.existsSync(root+'/jpeg-rotation');
-      const bytes=mode.corrupt?Buffer.from([255,216,255,217]):Buffer.from(landscape?fixture.landscape:fixture.portrait[mode.static?0:sequence%fixture.portrait.length],'base64');
+      const bytes=mode.corrupt?Buffer.from([255,216,255,217]):Buffer.from(landscape?fixture.landscape:fixture.portrait[mode.static?(mode.index??0):sequence%fixture.portrait.length],'base64');
       const h=Buffer.alloc(32);h.write(fail==='magic'?'BAD!':'SWJ1');h.writeUInt32BE(fail==='length'?8388609:bytes.length,4);
       h.writeBigUInt64BE(fail==='sequence'?0n:fail==='duplicate'?1n:BigInt(++sequence),8);
       h.writeBigUInt64BE(fail==='timestamp'?0n:fail==='regression'?1000n-BigInt(sequence):process.hrtime.bigint(),16);

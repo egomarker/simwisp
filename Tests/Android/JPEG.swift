@@ -41,6 +41,14 @@ func runJPEGTests(root:URL,adb:URL,jar:URL)throws {
     func header(_ length:UInt32=100,_ sequence:UInt64=1,_ time:UInt64=1,_ w:UInt32=320,_ h:UInt32=640)->Data{var d=Data("SWJ1".utf8);d.scrcpyAppend(length);d.scrcpyAppend(sequence);d.scrcpyAppend(time);d.scrcpyAppend(w);d.scrcpyAppend(h);return d}
     for n in [0,7,31,33]{reject("short JPEG header"){_ = try AndroidJPEGWire.header(Data(repeating:0,count:n))}}
     for d in [header(0),header(8_388_609),header(100,0),header(100,1,0),header(100,1,1,0),header(100,1,1,4097),header(100,1,1,320,4097)]{reject("JPEG allocation bounds"){_ = try AndroidJPEGWire.header(d)}}
+    var hb=Data("SWH1".utf8);hb.scrcpyAppend(UInt32(8));var hbTime=Data();hbTime.scrcpyAppend(UInt64(20))
+    check(try AndroidJPEGWire.heartbeat(hb,hbTime,after:19)==20,"bounded heartbeat has independent monotonic liveness timestamp")
+    reject("heartbeat duplicate"){_ = try AndroidJPEGWire.heartbeat(hb,hbTime,after:20)}
+    reject("heartbeat regression"){_ = try AndroidJPEGWire.heartbeat(hb,hbTime,after:21)}
+    reject("heartbeat short payload"){_ = try AndroidJPEGWire.heartbeat(hb,hbTime.dropLast(),after:0)}
+    reject("heartbeat long payload"){_ = try AndroidJPEGWire.heartbeat(hb,hbTime+Data([0]),after:0)}
+    var badHB=hb;badHB[7]=9;reject("heartbeat length"){_ = try AndroidJPEGWire.heartbeat(badHB,hbTime,after:0)}
+    badHB=hb;badHB[0]=0;reject("heartbeat magic"){_ = try AndroidJPEGWire.heartbeat(badHB,hbTime,after:0)}
     let valid=try AndroidJPEGWire.header(header());check(valid.width==320 && valid.height==640 && valid.sequence==1,"SWJ1 network byte order")
     check(AndroidBackendChoice(capture:"jpeg",input:"jpeg").capture == .jpeg && AndroidBackendChoice(capture:"jpeg",input:"jpeg").input == .auto,"JPEG is capture-only, not an input mode")
     check(AndroidBackendChoice().capture == .auto && AndroidBackendChoice().input == .auto,"Auto remains default")
@@ -71,7 +79,13 @@ func runJPEGTests(root:URL,adb:URL,jar:URL)throws {
     let rotated=try source.h264(quality:20,fps:60,forceKeyframe:false,dataSaver:false)
     check(rotated?.keyframe==true && rotated?.width==640 && rotated?.height==320,"rotation rebuilds encoder with IDR and exact JPEG dimensions")
     try option(["stall":true]);Thread.sleep(forTimeInterval:0.75)
-    check(try source.h264(quality:1,fps:60,forceKeyframe:true,dataSaver:false)==nil,"source silence never encodes an obsolete pending JPEG")
+    let decodeBeforeRepeat=source.diagnostics["jpeg_decodes"] as! UInt64
+    let repeated=try source.h264(quality:1,fps:60,forceKeyframe:true,dataSaver:false)
+    check(repeated?.keyframe==true && repeated?.width==640 && repeated!.timestamp>rotated!.timestamp,"healthy source keeps newest decoded pixels usable between updates")
+    check(source.diagnostics["jpeg_decodes"] as? UInt64==decodeBeforeRepeat,"re-encoding does not decode the old JPEG again")
+    try option(["failure":"error"]);try wait("cached source error"){source.state.error != nil}
+    check(!source.canEncode(dataSaver:false,forceKeyframe:true) && !source.hasFrame,"source failure invalidates cached encode eligibility")
+    check(try source.h264(quality:1,fps:60,forceKeyframe:true,dataSaver:false)==nil,"failed source cannot silently freeze on cached pixels")
     source.stop();check(life.wait(timeout:.now()+6) == .success,"stop joins reader, process, guest cleanup and encoder")
     check(source.state.finished && !source.hasFrame && !source.state.ready,"late source callbacks cannot resurrect stopped capture")
     check(try source.h264(quality:1,fps:60,forceKeyframe:true,dataSaver:false)==nil,"closed helper cannot encode cached frames")
@@ -79,12 +93,61 @@ func runJPEGTests(root:URL,adb:URL,jar:URL)throws {
     check(commands.filter{$0.contains("exec-out")}.count==1,"start is idempotent")
     check(commands.contains{$0.contains(where:{$0.contains("/proc/$p/cmdline") && $0.contains("kill -TERM")})},"cleanup checks exact owned process identity before signal")
     check(commands.allSatisfy{$0.first=="-s" && $0[1]=="emulator-5554" && !$0.contains("setprop") && !$0.contains("forward") && !$0.contains("kill-server")},"JPEG never touches global ADB, forwards, shaping or other serials")
-    for scenario in ["magic","length","dimensions","sequence","timestamp","duplicate","regression","error","eof"] {
+    for scenario in ["magic","length","dimensions","sequence","timestamp","duplicate","regression","error","eof","heartbeat-length","heartbeat-zero","heartbeat-duplicate"] {
         try option(["failure":scenario])
         let l=DispatchGroup(),s=AndroidJPEGSession(adb:adb.path,serial:"emulator-5554",fps:60,maxSize:640,network:network,lifecycle:l,installation:{jar.path})
         s.start();try wait("malformed "+scenario){s.state.error != nil}
         check(s.state.error?.isEmpty==false,"malformed/error/EOF is visible: "+scenario);s.stop();check(l.wait(timeout:.now()+6) == .success,"failure joins owned process: "+scenario)
     }
+    try option(["static":true]);let idleLife=DispatchGroup(),idle=AndroidJPEGSession(adb:adb.path,serial:"emulator-5554",fps:60,maxSize:640,network:network,lifecycle:idleLife,installation:{jar.path})
+    idle.start();try wait("idle initial image"){idle.state.ready}
+    _ = try idle.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:false)
+    try option(["heartbeat":true]);try wait("idle heartbeat"){(idle.diagnostics["source_heartbeats"] as? UInt64 ?? 0)>0}
+    // Decode the last pre-heartbeat image before measuring cache-only cadence.
+    _ = try idle.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:false)
+    let idleFrames=idle.diagnostics["source_frames"] as! UInt64
+    Thread.sleep(forTimeInterval:8.3)
+    check(idle.state.ready && idle.state.error==nil && !idle.state.finished,"heartbeats keep an idle mirror connected beyond eight-second frame timeout")
+    check(idle.diagnostics["source_frames"] as? UInt64==idleFrames && !idle.hasFrame,"heartbeats never count as fresh frames")
+    check((idle.diagnostics["last_frame_age_ms"] as? Double ?? 0)>8000,"heartbeats do not refresh source frame age")
+    let idleDecodes=idle.diagnostics["jpeg_decodes"] as! UInt64,idleEncoded=idle.diagnostics["h264_encodes"] as! UInt64
+    check(idle.canEncode(dataSaver:false,forceKeyframe:false) && !idle.canEncode(dataSaver:true,forceKeyframe:false),"only Data saver may idle when decoded pixels and healthy heartbeats exist")
+    let cachedIDR=try idle.h264(quality:1,fps:60,forceKeyframe:true,dataSaver:false)
+    check(cachedIDR?.keyframe==true,"cached decoded image supplies a NEW IDR after long idle")
+    var lastPTS=cachedIDR!.timestamp
+    for _ in 0..<60 {
+        let frame=try idle.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:false)
+        check(frame != nil && frame!.timestamp>lastPTS && frame!.width==320,"each cached image submission yields a new completed H264 access unit/PTS")
+        lastPTS=frame!.timestamp
+    }
+    check(idle.diagnostics["jpeg_decodes"] as? UInt64==idleDecodes && idle.diagnostics["source_frames"] as? UInt64==idleFrames,"continuous cached encoding never invents JPEG captures/decodes")
+    check(idle.diagnostics["h264_encodes"] as? UInt64==idleEncoded+61 && (idle.diagnostics["cached_image_encodes"] as? UInt64 ?? 0)>=61,"actual cached-image encodes counted separately")
+    check(try idle.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:true)==nil,"Data saver ON immediately suppresses unchanged decoded image")
+    check(try idle.h264(quality:95,fps:60,forceKeyframe:true,dataSaver:true)?.keyframe==true,"explicit recovery under Data saver can re-encode current image")
+    check(try idle.h264(quality:95,fps:60,forceKeyframe:false,dataSaver:true)==nil,"Data saver sleeps again after explicit IDR")
+    check(try idle.h264(quality:95,fps:30,forceKeyframe:false,dataSaver:false) != nil,"Data saver OFF resumes using cached image without a source update")
+    try option(["rotation":true]);try wait("fresh producer wakes after idle"){idle.hasFrame}
+    check(try idle.h264(quality:1,fps:60,forceKeyframe:true,dataSaver:false)?.width==640,"first fresh rotated image after idle encodes normally")
+    try option(["heartbeat":true]);let idleStop=monotonic();idle.stop();check(idleLife.wait(timeout:.now()+6) == .success && monotonic()-idleStop<2,"idle teardown joins heartbeat reader promptly")
+    let emptyLife=DispatchGroup(),empty=AndroidJPEGSession(adb:adb.path,serial:"emulator-5554",fps:60,maxSize:640,network:network,lifecycle:emptyLife,installation:{jar.path})
+    empty.start();try wait("heartbeat before image"){(empty.diagnostics["source_heartbeats"] as? UInt64 ?? 0)>0}
+    check(!empty.state.ready && !empty.hasFrame && !empty.canEncode(dataSaver:false,forceKeyframe:true),"heartbeat alone cannot mark capture ready or invent cached pixels")
+    check(try empty.h264(quality:1,fps:60,forceKeyframe:true,dataSaver:false)==nil,"a replacement session cannot inherit an old session image")
+    empty.stop();check(emptyLife.wait(timeout:.now()+6) == .success,"startup heartbeat-only source joins")
+    try option(["static":true]);let corruptedLife=DispatchGroup(),corrupted=AndroidJPEGSession(adb:adb.path,serial:"emulator-5554",fps:60,maxSize:640,network:network,lifecycle:corruptedLife,installation:{jar.path})
+    corrupted.start();try wait("corrupt-after-cache initial"){corrupted.hasFrame}
+    _ = try corrupted.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:false)
+    let beforeCorrupt=corrupted.diagnostics["source_frames"] as! UInt64
+    try option(["corrupt":true]);try wait("corrupt latest pending"){corrupted.hasFrame && (corrupted.diagnostics["source_frames"] as? UInt64 ?? 0)>=beforeCorrupt+3}
+    reject("new corrupt JPEG after good cache"){_ = try corrupted.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:false)}
+    check(corrupted.state.error != nil && !corrupted.canEncode(dataSaver:false,forceKeyframe:true),"corrupt replacement latches error rather than repeating older image")
+    corrupted.stop();check(corruptedLife.wait(timeout:.now()+6) == .success,"corrupt replacement cleanup joins")
+    try option(["static":true]);let lostLife=DispatchGroup(),lost=AndroidJPEGSession(adb:adb.path,serial:"emulator-5554",fps:60,maxSize:640,network:network,lifecycle:lostLife,installation:{jar.path})
+    lost.start();try wait("transport-loss initial"){lost.hasFrame};_ = try lost.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:false)
+    try option(["stall":true]);try wait("transport deadline invalidates cache"){lost.state.error != nil}
+    let lostFrame=try lost.h264(quality:1,fps:60,forceKeyframe:true,dataSaver:false)
+    check(!lost.canEncode(dataSaver:false,forceKeyframe:true) && lostFrame==nil,"no infinite cache streaming after lost helper liveness")
+    lost.stop();check(lostLife.wait(timeout:.now()+6) == .success,"lost transport cleanup joins")
     try option(["stall":true]);let stalledLife=DispatchGroup(),stalled=AndroidJPEGSession(adb:adb.path,serial:"emulator-5554",fps:60,maxSize:640,network:network,lifecycle:stalledLife,installation:{jar.path})
     let stalls=events().filter{$0["kind"] as? String=="jpeg_process"}.count;stalled.start();try wait("stalled reader"){events().filter{$0["kind"] as? String=="jpeg_process"}.count>stalls}
     let stopAt=monotonic();stalled.stop();check(stalledLife.wait(timeout:.now()+6) == .success && monotonic()-stopAt<2,"cancellation interrupts a silent frame read without eight-second timeout")

@@ -2,5 +2,7 @@ Simwisp emulator JPEG helper
 The reflective DisplayControl / system-server loader is adapted from scrcpy 5.0.1,
 Copyright (C) 2018-2026 Genymobile, licensed under the Apache License, Version 2.0.
 https://github.com/Genymobile/scrcpy/blob/v5.0.1/server/src/main/java/com/genymobile/scrcpy/wrappers/DisplayControl.java
+The DisplayManager static virtual-display mirroring call follows scrcpy 5.0.1:
+https://github.com/Genymobile/scrcpy/blob/v5.0.1/server/src/main/java/com/genymobile/scrcpy/wrappers/DisplayManager.java
 Other Simwisp code remains under the project's license. This helper does not use
 scrcpy's Android MediaCodec video encoder. Capture excludes secure/protected layers.

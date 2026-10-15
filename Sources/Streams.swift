@@ -104,7 +104,7 @@ final class StreamSession: @unchecked Sendable {
         timer.setEventHandler { [weak self] in self?.tick() }; timer.resume(); self.timer = timer
     }
     var snapshot: [String: Any] {
-        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (captureHasFrame ? "Streaming" : "Starting")), "uptime": Int(monotonic() - started), "capture_counters": effectiveCapture == "scrcpy" ? (scrcpy?.diagnostics ?? [:]) : effectiveCapture == "jpeg" ? (jpeg?.diagnostics ?? [:]) : (capture?.counters ?? [:]), "input_counters": effectiveInput == "scrcpy" ? (scrcpy?.inputDiagnostics ?? [:]) : [:], "sent_fps": sentFPS, "target_fps": flow.targetFPS, "last_encode_ms": lastEncodeMS, "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending, "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS, "accessibility": accessibility.snapshot, "android_backends": isAndroid ? backendSnapshot : [:]]
+        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "data_saver": dataSaver, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (captureHasFrame ? "Streaming" : "Starting")), "uptime": Int(monotonic() - started), "capture_counters": effectiveCapture == "scrcpy" ? (scrcpy?.diagnostics ?? [:]) : effectiveCapture == "jpeg" ? (jpeg?.diagnostics ?? [:]) : (capture?.counters ?? [:]), "input_counters": effectiveInput == "scrcpy" ? (scrcpy?.inputDiagnostics ?? [:]) : [:], "sent_fps": sentFPS, "target_fps": flow.targetFPS, "last_encode_ms": lastEncodeMS, "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending, "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS, "accessibility": accessibility.snapshot, "android_backends": isAndroid ? backendSnapshot : [:]]
     }
     // One-shot deadlines avoid quantizing 16.67 ms frames onto 16 ms polling
     // ticks. Local encode/write completions wake it; receiver RTT never gates
@@ -114,10 +114,16 @@ final class StreamSession: @unchecked Sendable {
         let now = monotonic()
         var deadline = now + 0.25
         if videoReady && !paused && !configuring && !encoding && !sending && flow.hasCapacity {
-            if (effectiveCapture == "scrcpy" || effectiveCapture == "jpeg") && backendResolved {
-                // Push source: scrcpy already paces encoded frames. Wake only
-                // for an available AU; never spend a pull-encoder deadline.
-                if (effectiveCapture == "scrcpy" ? scrcpy?.hasFrame : jpeg?.hasFrame) == true { deadline = now }
+            if effectiveCapture == "scrcpy" && backendResolved {
+                // scrcpy pushes already encoded AUs; do not pace them twice.
+                if scrcpy?.hasFrame == true { deadline = now }
+            } else if effectiveCapture == "jpeg" && backendResolved {
+                // JPEG source updates are event-driven; the Mac encoder has
+                // its own cadence, just like Mac-window capture. Data saver
+                // can sleep until new pixels or an explicit IDR are needed.
+                if jpeg?.canEncode(dataSaver:dataSaver,forceKeyframe:forceKeyframe) == true {
+                    deadline = min(deadline, max(now, flow.nextFrame))
+                }
             } else { deadline = min(deadline, max(now, max(nextFrame, flow.nextFrame))) }
         }
         timer?.schedule(deadline: .now() + max(0.0001, deadline - now), leeway: .microseconds(100))
@@ -388,10 +394,12 @@ final class StreamSession: @unchecked Sendable {
         source.start();publishBackends();return false
     }
     private func encodeJPEG() {
-        guard !encoding,!sending,!paused,let source=jpeg,source.hasFrame else { return }
-        guard flow.hasCapacity else { flow.congested(now:monotonic());return }
-        // The guest already paces fresh captures. No second beginFrame deadline:
-        // one encode/write at a time, with a single replaceable latest JPEG.
+        guard !encoding,!sending,!paused,let source=jpeg,source.canEncode(dataSaver:dataSaver,forceKeyframe:forceKeyframe) else { return }
+        let now=monotonic()
+        guard flow.hasCapacity else { flow.congested(now:now);return }
+        // Admit only real encode work, before consuming the latest source slot.
+        // No arrival can bypass this cadence or cause an empty catch-up burst.
+        guard flow.beginFrame(now:now,maintainCadence:true) else { return }
         encoding=true
         let q=quality,f=fps,key=forceKeyframe,saver=dataSaver,epoch=videoEpoch
         worker.async { [weak self] in

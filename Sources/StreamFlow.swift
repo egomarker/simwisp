@@ -51,10 +51,13 @@ struct StreamFlow {
         if let quality { targetQuality = min(95, max(1, quality)); self.quality = targetQuality }
         healthySince = nil; nextFrame = min(nextFrame, now + 1 / Double(self.fps))
     }
-    mutating func beginFrame(now: Double) -> Bool {
+    mutating func beginFrame(now: Double, maintainCadence: Bool = false) -> Bool {
         guard now >= nextFrame, hasCapacity else { return false }
-        // Missed deadlines are skipped, never replayed in a catch-up burst.
-        nextFrame = now + 1 / Double(fps)
+        let period = 1 / Double(fps)
+        // JPEG's local encoder must not accumulate small timer-wakeup delays
+        // on every frame. Keep that phase only for <1/4-frame jitter; larger
+        // misses rebase without catch-up bursts. Other callers are unchanged.
+        nextFrame = maintainCadence && nextFrame > 0 && now - nextFrame < period / 4 ? nextFrame + period : now + period
         return true
     }
     func canSend(bytes: Int) -> Bool {

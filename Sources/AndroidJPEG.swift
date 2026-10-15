@@ -17,6 +17,10 @@ enum AndroidJPEGWire {
         guard (4...maxBytes).contains(n),s>0,t>0,(8...maxEdge).contains(w),(8...maxEdge).contains(h) else { throw WispError("Emulator JPEG frame exceeds bounds") }
         return Header(length:n,sequence:s,capturedNS:t,width:w,height:h)
     }
+    static func heartbeat(_ prefix:Data,_ payload:Data,after:UInt64)throws->UInt64 {
+        guard prefix.count==8,prefix.prefix(4)==Data("SWH1".utf8),prefix.scrcpyUInt(4,4)==8,payload.count==8 else{throw WispError("Invalid emulator JPEG heartbeat")}
+        let time=payload.scrcpyUInt(0,8);guard time>after else{throw WispError("Stale emulator JPEG heartbeat")};return time
+    }
     static func image(_ f: AndroidJPEGFrame) throws -> CIImage {
         let b=f.bytes
         guard (4...maxBytes).contains(b.count),b.prefix(2)==Data([255,216]),b.suffix(2)==Data([255,217]),
@@ -45,15 +49,28 @@ final class AndroidJPEGSession: @unchecked Sendable {
     private let installation:Installation,run:(String,[String],Double)throws->CommandResult
     private var started=false,cancelled=false,finished=false,ready=false,noticePending=false
     private var failure:String?,latest:AndroidJPEGFrame?,previous:Data?,encoder:H264Encoder?
-    private var received:UInt64=0,receivedBytes:UInt64=0,dropped:UInt64=0,encoded:UInt64=0
+    private var received:UInt64=0,receivedBytes:UInt64=0,dropped:UInt64=0,encoded:UInt64=0,heartbeats:UInt64=0
+    // Decoded pixels/bytes and the encoder are confined to encodeLock. Readers
+    // only inspect cachedAvailable under lock; no second unbounded image queue.
+    private var cached:(image:CIImage,bytes:Data,width:Int,height:Int)?
+    private var cachedAvailable=false
+    private var decoded:UInt64=0,cachedEncodes:UInt64=0
+    private var heartbeatAt:Double?,transportAt:Double?
     private var dimensions=(0,0),lastAt:Double?,hardware=false
     var onChange:(()->Void)?
     init(adb:String,serial:String,fps:Int,maxSize:Int,network:DispatchQueue,lifecycle:DispatchGroup,installation:@escaping Installation=AndroidJPEGSession.bundledJar,run:@escaping(String,[String],Double)throws->CommandResult={try command($0,$1,timeout:$2)}) {
         self.adb=adb;self.serial=serial;self.fps=min(60,max(1,fps));self.maxSize=min(AndroidJPEGWire.maxEdge,max(8,maxSize));self.network=network;self.lifecycle=lifecycle;self.installation=installation;self.run=run
     }
     var state:(ready:Bool,error:String?,finished:Bool) { lock.withLock{(ready && !cancelled,failure,finished)} }
-    var hasFrame:Bool { lock.withLock{!cancelled && failure==nil && latest != nil} }
-    var diagnostics:[String:Any] { lock.withLock{["source_frames":received,"source_jpeg_bytes":receivedBytes,"jpeg_quality":AndroidJPEGWire.quality,"video_width":dimensions.0,"video_height":dimensions.1,"max_size":maxSize,"source_fps_limit":fps,"queued_frames":latest == nil ? 0:1,"dropped_frames":dropped,"h264_encodes":encoded,"hardware_encoder":hardware,"last_frame_age_ms":lastAt.map{max(0,(monotonic()-$0)*1000)} as Any? ?? NSNull()]} }
+    // Source freshness is deliberately distinct from local encode eligibility.
+    private var sourceAliveLocked:Bool {
+        !cancelled && !finished && ready && failure==nil && transportAt.map{monotonic()-$0<8} == true
+    }
+    var hasFrame:Bool { lock.withLock{sourceAliveLocked && latest != nil} }
+    func canEncode(dataSaver:Bool,forceKeyframe:Bool)->Bool {
+        lock.withLock{sourceAliveLocked && (latest != nil || (cachedAvailable && (!dataSaver || forceKeyframe)))}
+    }
+    var diagnostics:[String:Any] { lock.withLock{["source_mode":"persistent_imagereader","source_heartbeats":heartbeats,"last_heartbeat_age_ms":heartbeatAt.map{max(0,(monotonic()-$0)*1000)} as Any? ?? NSNull(),"source_frames":received,"source_jpeg_bytes":receivedBytes,"jpeg_quality":AndroidJPEGWire.quality,"video_width":dimensions.0,"video_height":dimensions.1,"max_size":maxSize,"source_fps_limit":fps,"queued_frames":latest == nil ? 0:1,"dropped_frames":dropped,"h264_encodes":encoded,"jpeg_decodes":decoded,"cached_image_encodes":cachedEncodes,"cached_image_available":cachedAvailable && sourceAliveLocked,"hardware_encoder":hardware,"last_frame_age_ms":lastAt.map{max(0,(monotonic()-$0)*1000)} as Any? ?? NSNull()]} }
     private var isCancelled:Bool { lock.withLock{cancelled} }
     private func notify() {
         let emit=lock.withLock{()->Bool in if cancelled || noticePending{return false};noticePending=true;return true}
@@ -82,14 +99,14 @@ final class AndroidJPEGSession: @unchecked Sendable {
             var directory:String?,process:Process?,pipe:Pipe?
             let token=UUID().uuidString.replacingOccurrences(of:"-",with:"").lowercased(),name="simwisp-jpeg-"+token
             defer {
-                lock.withLock{ready=false;latest=nil}
+                lock.withLock{ready=false;latest=nil;cachedAvailable=false;transportAt=nil}
                 if let directory { _ = try? run(adb,["-s",serial,"shell",Self.cleanup(directory:directory,name:name)],3) }
                 if let p=process {
                     if p.isRunning {p.terminate();let end=monotonic()+0.5;while p.isRunning && monotonic()<end{Thread.sleep(forTimeInterval:0.02)};if p.isRunning{Darwin.kill(p.processIdentifier,SIGKILL)}}
                     p.waitUntilExit()
                 }
                 try? pipe?.fileHandleForReading.close();try? pipe?.fileHandleForWriting.close()
-                encodeLock.withLock{encoder?.close();encoder=nil;previous=nil}
+                encodeLock.withLock{encoder?.close();encoder=nil;previous=nil;cached=nil}
                 lock.withLock{finished=true};notify();work.leave();lifecycle.leave()
             }
             do {
@@ -118,21 +135,27 @@ final class AndroidJPEGSession: @unchecked Sendable {
                     }
                     return d
                 }
-                var sequence:UInt64=0,timestamp:UInt64=0
+                var sequence:UInt64=0,timestamp:UInt64=0,wireTime:UInt64=0
                 while !isCancelled {
                     let deadline=monotonic()+8,prefix=try read(8,deadline:deadline)
+                    if prefix.prefix(4)==Data("SWH1".utf8) {
+                        guard prefix.scrcpyUInt(4,4)==8 else{throw WispError("Invalid emulator JPEG heartbeat length")}
+                        wireTime=try AndroidJPEGWire.heartbeat(prefix,read(8,deadline:deadline),after:wireTime)
+                        lock.withLock{heartbeats &+= 1;heartbeatAt=monotonic();transportAt=heartbeatAt}
+                        continue // Transport liveness only, never a source frame/ready signal.
+                    }
                     if prefix.prefix(4)==Data("SWE1".utf8) {
                         let n=Int(prefix.scrcpyUInt(4,4));guard (1...2048).contains(n) else{throw WispError("Invalid emulator JPEG error packet")}
                         let text=String(decoding:try read(n,deadline:deadline),as:UTF8.self).unicodeScalars.filter{!CharacterSet.controlCharacters.contains($0)}
                         throw WispError(String(String.UnicodeScalarView(text)))
                     }
                     let h=try AndroidJPEGWire.header(prefix+read(24,deadline:deadline))
-                    guard h.sequence>sequence,h.capturedNS>timestamp,h.width<=maxSize,h.height<=maxSize else{throw WispError("Stale or oversized emulator JPEG frame")}
+                    guard h.sequence>sequence,h.capturedNS>timestamp,h.capturedNS>wireTime,h.width<=maxSize,h.height<=maxSize else{throw WispError("Stale or oversized emulator JPEG frame")}
                     let bytes=try read(h.length,deadline:deadline)
                     guard bytes.prefix(2)==Data([255,216]),bytes.suffix(2)==Data([255,217]) else{throw WispError("Invalid emulator JPEG markers")}
-                    sequence=h.sequence;timestamp=h.capturedNS
+                    sequence=h.sequence;timestamp=h.capturedNS;wireTime=h.capturedNS
                     let frame=AndroidJPEGFrame(bytes:bytes,sequence:sequence,capturedNS:timestamp,width:h.width,height:h.height)
-                    lock.withLock{guard !cancelled else{return};if latest != nil{dropped &+= 1};latest=frame;received &+= 1;receivedBytes &+= UInt64(bytes.count);dimensions=(h.width,h.height);lastAt=monotonic();ready=true}
+                    lock.withLock{guard !cancelled else{return};if latest != nil{dropped &+= 1};latest=frame;received &+= 1;receivedBytes &+= UInt64(bytes.count);dimensions=(h.width,h.height);lastAt=monotonic();transportAt=lastAt;ready=true}
                     notify()
                 }
             } catch { if !isCancelled{lock.withLock{failure=error.localizedDescription};notify()} }
@@ -140,21 +163,47 @@ final class AndroidJPEGSession: @unchecked Sendable {
     }
     func h264(quality:Int,fps:Int,forceKeyframe:Bool,dataSaver:Bool)throws->H264Frame? {
         try encodeLock.withLock { try autoreleasepool {
-            let frame=lock.withLock{()->AndroidJPEGFrame? in guard !cancelled,failure==nil,let f=latest else{return nil};latest=nil
-                guard let at=lastAt,monotonic()-at<=max(0.5,2/Double(self.fps)) else{dropped &+= 1;return nil};return f}
-            guard let frame else{return nil}
-            if dataSaver && previous==frame.bytes && !forceKeyframe{return nil}
-            let image=try AndroidJPEGWire.image(frame)
-            let resized=encoder?.width != frame.width || encoder?.height != frame.height
-            if resized {encoder?.close();encoder=try H264Encoder(width:frame.width,height:frame.height)}
-            let result=try encoder!.encode(image,quality:quality,fps:fps,forceKeyframe:forceKeyframe || resized)
-            previous=frame.bytes
-            lock.withLock{encoded &+= 1;hardware=encoder!.hardware}
-            return result
+            let state=lock.withLock{()->(active:Bool,frame:AndroidJPEGFrame?) in
+                guard sourceAliveLocked else{return(false,nil)}
+                let frame=latest;latest=nil;return(true,frame)
+            }
+            guard state.active else{return nil}
+            do {
+                var didDecode=false
+                if let frame=state.frame {
+                    // Always prefer the newest received JPEG. Identical bytes
+                    // can reuse decoded pixels in either Data saver mode.
+                    if cached?.bytes != frame.bytes || cached?.width != frame.width || cached?.height != frame.height {
+                        let image=try AndroidJPEGWire.image(frame)
+                        cached=(image,frame.bytes,frame.width,frame.height);didDecode=true
+                        lock.withLock{decoded &+= 1;cachedAvailable=sourceAliveLocked}
+                    }
+                }
+                guard let cached else{return nil}
+                if dataSaver && previous==cached.bytes && !forceKeyframe{return nil}
+                guard lock.withLock({sourceAliveLocked}) else{return nil}
+                let resized=encoder?.width != cached.width || encoder?.height != cached.height
+                if resized {encoder?.close();encoder=try H264Encoder(width:cached.width,height:cached.height)}
+                // This is a NEW encode with NEW PTS/reference state, never an
+                // old encoded H264 packet or another decode of cached JPEGs.
+                let result=try encoder!.encode(cached.image,quality:quality,fps:fps,forceKeyframe:forceKeyframe || resized)
+                let accepted=lock.withLock{()->Bool in
+                    guard sourceAliveLocked else{return false}
+                    encoded &+= 1;if !didDecode{cachedEncodes &+= 1};hardware=encoder!.hardware;return true
+                }
+                guard accepted else{return nil}
+                previous=cached.bytes
+                return result
+            } catch {
+                // A new corrupt image must fail visibly, never freeze on the
+                // previous good cache. A dead/cancelled helper cannot replay it.
+                lock.withLock{if !cancelled{failure=error.localizedDescription};ready=false;cachedAvailable=false;latest=nil}
+                cached=nil;previous=nil;encoder?.close();encoder=nil;notify();throw error
+            }
         } }
     }
     func stop(completion:@escaping()->Void={}) {
-        lock.withLock{cancelled=true;latest=nil}
+        lock.withLock{cancelled=true;latest=nil;cachedAvailable=false}
         work.notify(queue:network,execute:completion)
     }
 }

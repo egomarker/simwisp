@@ -22,7 +22,7 @@ try{
  await until('Chrome',()=>fs.existsSync(profile+'/DevToolsActivePort'));const port=fs.readFileSync(profile+'/DevToolsActivePort','utf8').split('\n')[0],pages=await(await fetch('http://127.0.0.1:'+port+'/json/list')).json();ws=new WebSocket(pages.find(p=>p.type==='page').webSocketDebuggerUrl);await new Promise((r,j)=>{ws.addEventListener('open',r,{once:true});ws.addEventListener('error',j,{once:true})});
  ws.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.id&&pending.has(m.id)){const p=pending.get(m.id);pending.delete(m.id);clearTimeout(p.timer);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result)}else if(m.method==='Runtime.exceptionThrown')exceptions.push(m.params);else if(m.method==='Network.webSocketFrameReceived'){const f=m.params.response;if(f.opcode===2)received++;else if(f.opcode===1){try{if(JSON.parse(f.payloadData).type==='video_config')configs++}catch{}}}});
  await cdp('Page.enable');await cdp('Runtime.enable');await cdp('Network.enable');await cdp('Network.setCookie',{name:'simwisp_session',value:cookie,url:base,secure:true,httpOnly:true,sameSite:'Strict'});await cdp('Page.navigate',{url:base});await until('page',()=>ev("document.readyState==='complete'&&document.querySelector('.device-item')!==null"));
- await ev(`(async()=>{const {SimStream}=await import('/js/stream.js');window.SimStream=SimStream;window.transportAudit={bytes:0,frames:0};const NativeSocket=WebSocket;window.WebSocket=class extends NativeSocket{constructor(...args){super(...args);this.addEventListener('message',e=>{if(e.data instanceof ArrayBuffer){transportAudit.bytes+=e.data.byteLength;transportAudit.frames++}})}};window.decoderCreates=0;const NativeDecoder=VideoDecoder;window.VideoDecoder=class extends NativeDecoder{constructor(o){super(o);decoderCreates++}};const c=document.createElement('canvas');c.id='jpeg-canvas';document.body.append(c);return true})()`);
+ await ev(`(async()=>{const {SimStream}=await import('/js/stream.js');window.SimStream=SimStream;window.transportAudit={bytes:0,frames:0,nonIncreasingPackets:0};const NativeSocket=WebSocket;window.WebSocket=class extends NativeSocket{constructor(...args){super(...args);let id=0,epoch=0,time=0n;this.addEventListener('message',e=>{if(e.data instanceof ArrayBuffer){transportAudit.bytes+=e.data.byteLength;transportAudit.frames++;const v=new DataView(e.data),nextEpoch=v.getUint32(8),nextID=v.getUint32(12),nextTime=v.getBigUint64(16);if(nextID<=id||(nextEpoch===epoch&&nextTime<=time))transportAudit.nonIncreasingPackets++;id=nextID;epoch=nextEpoch;time=nextTime}})}};window.decoderCreates=0;const NativeDecoder=VideoDecoder;window.VideoDecoder=class extends NativeDecoder{constructor(o){super(o);decoderCreates++}};const c=document.createElement('canvas');c.id='jpeg-canvas';document.body.append(c);return true})()`);
  const autoCount=launches().length;await connect('auto','auto');check('Auto still selects scrcpy, never JPEG',launches().length===autoCount);await destroy();
  for(const input of ['current','scrcpy','auto']){
    const before=events().length;await connect('jpeg',input);const selected=input==='auto'?'scrcpy':input;
@@ -57,15 +57,64 @@ try{
  check('final encoder is hardware VideoToolbox, intermediate fixedQ70',live.capture_counters.hardware_encoder===true&&live.capture_counters.jpeg_quality===70);
  check('at most one pending JPEG and bounded receiver decode',live.capture_counters.queued_frames<=1&&live.receiver_decode_queue<=3);
  check('natural IDRs preserve decoder',await ev('decoderCreates')===first.decoders);
- check('source and completed encodes are separate metrics',live.capture_counters.source_frames>=live.capture_counters.h264_encodes&&live.capture_counters.h264_encodes>=live.frames);
+ check('source/decodes/completed encodes are separate honest metrics',live.capture_counters.source_frames>=live.capture_counters.jpeg_decodes&&live.capture_counters.h264_encodes>=live.frames&&live.capture_counters.cached_image_encodes<=live.capture_counters.h264_encodes);
  const auditStart=await ev('auditStart');check('bandwidth counter equals independent WebSocket received bytes',samples.every(s=>s.stats.receivedBytes===s.stats.auditBytes-auditStart));
  check('bandwidth rate uses measured elapsed time',samples.slice(1).every((s,i)=>{const p=samples[i].stats,rate=(s.stats.auditBytes-p.auditBytes)/((s.stats.at-p.at)/1000);return Math.abs(s.stats.bps-rate)<=Math.max(1,rate*.02)}));
  const staticBefore=(await api()).capture_counters.source_frames;put('jpeg-mode.json',{static:true});await setting({data_saver:true});await sleep(2500);const idle=await api();
- check('Data saver captures fresh JPEGs but skips identical H264 encodes',idle.capture_counters.source_frames>=staticBefore+100&&idle.sent_fps===0);
+ check('Data saver captures fresh JPEGs but skips identical H264 encodes',idle.capture_counters.source_frames>=staticBefore+100&&idle.sent_fps===0&&idle.data_saver===true);
  const count=received;await sleep(1100);check('no cached P-frame replay on static source',received===count);
- await setting({data_saver:false});await sleep(1500);check('Data saver off resumes new captures and encodes',(await api()).sent_fps>=55);
+ await setting({data_saver:false});await sleep(2200);check('Data saver off resumes new captures and encodes',(await api()).sent_fps>=55);
  const recoverBefore={decoders:await ev('decoderCreates'),helpers:launches().length};await ev("testStream.send({type:'video_keyframe'})");await until('keyframe reset',async()=>await ev('decoderCreates')===recoverBefore.decoders+1);await sleep(500);
  check('explicit recovery needs no guest/helper restart',launches().length===recoverBefore.helpers&&await ev('decoderCreates')===recoverBefore.decoders+1);
+ // Local encode cadence must also obey lower requested FPS despite more source arrivals.
+ await setting({fps:30});await until('JPEG30 source configuration',async()=>(await api()).capture_counters.source_fps_limit===30);await sleep(1500);
+ const lowStart={at:performance.now(),received};await sleep(2200);const lowFPS=(received-lowStart.received)/((performance.now()-lowStart.at)/1000);
+ check('local JPEG encoder obeys requested30FPS without arrival-driven bursts',lowFPS>=27&&lowFPS<=32&&(await api()).fps===30);
+ await setting({fps:60});await until('JPEG60 source restored',async()=>(await api()).capture_counters.source_fps_limit===60);await sleep(1200);
+ // No new guest JPEGs during heartbeat-only idle: Data saver OFF still sends
+ // NEW, correctly paced H264 frames, decoded by the real browser decoder.
+ put('jpeg-mode.json',{heartbeat:true});await sleep(1100);
+ const mirrorBaseline=await api(),idleHelpers=launches().length,idleDecoder=await ev('decoderCreates'),mirrorStart={at:performance.now(),received},continuousSamples=[];
+ for(let i=0;i<6;i++){await sleep(1000);continuousSamples.push(await ev('testStats.at(-1)'))}
+ await sleep(3200);const mirrorIdle=await api(),staticWireFPS=(received-mirrorStart.received)/((performance.now()-mirrorStart.at)/1000);
+ check('idle heartbeats preserve real native/browser session beyond8s',mirrorIdle.state==='Streaming'&&mirrorIdle.android_backends.effective_capture==='jpeg'&&mirrorIdle.capture_counters.source_heartbeats>=16);
+ check('Data saver OFF keeps continuous55–62wireFPS and all six rendered windows',staticWireFPS>=55&&staticWireFPS<=62&&continuousSamples.every(s=>s.fps>=55&&s.fps<=62)&&mirrorIdle.data_saver===false);
+ check('continuous static stream does not invent source frames/bytes/decodes',mirrorIdle.capture_counters.source_frames===mirrorBaseline.capture_counters.source_frames&&mirrorIdle.capture_counters.source_jpeg_bytes===mirrorBaseline.capture_counters.source_jpeg_bytes&&mirrorIdle.capture_counters.jpeg_decodes===mirrorBaseline.capture_counters.jpeg_decodes&&mirrorIdle.capture_counters.last_frame_age_ms>9000);
+ check('static stream performs new hardware encodes using latest decoded image',mirrorIdle.capture_counters.h264_encodes>=mirrorBaseline.capture_counters.h264_encodes+500&&mirrorIdle.capture_counters.cached_image_encodes>=mirrorBaseline.capture_counters.cached_image_encodes+500&&mirrorIdle.frames>=mirrorBaseline.frames+500&&mirrorIdle.capture_counters.hardware_encoder===true);
+ check('continuous idle needs no helper restart or routine decoder recreation',launches().length===idleHelpers&&await ev('decoderCreates')===idleDecoder&&mirrorIdle.receiver_decode_queue<=3);
+ // A different SAME-SIZE JPEG must replace the cached pixels, not just keep
+ // resending the initial image until rotation/reconnect.
+ put('jpeg-mode.json',{static:true,index:20});
+ await until('new same-size source image replaces cached browser pixels',()=>ev("(()=>{const d=document.getElementById('jpeg-canvas').getContext('2d').getImageData(276,164,1,1).data;return d[0]>200&&d[1]>180&&d[2]>180})()"));
+ check('new source pixels replace cache without helper/decoder restart',(await api()).capture_counters.source_frames>mirrorIdle.capture_counters.source_frames&&launches().length===idleHelpers&&await ev('decoderCreates')===idleDecoder);
+ put('jpeg-mode.json',{heartbeat:true});await sleep(1100);await setting({data_saver:true});await sleep(1500);
+ const saverBaseline=await api(),saverReceived=received;await sleep(2200);const mirrorSaverIdle=await api();
+ check('only Data saver ON idles at zero while the guest produces only heartbeats',mirrorSaverIdle.data_saver===true&&mirrorSaverIdle.sent_fps===0&&await ev('testStats.at(-1).fps')===0&&received===saverReceived);
+ check('Data saver idle performs no captures/decodes/H264 encodes',mirrorSaverIdle.capture_counters.source_frames===saverBaseline.capture_counters.source_frames&&mirrorSaverIdle.capture_counters.jpeg_decodes===saverBaseline.capture_counters.jpeg_decodes&&mirrorSaverIdle.capture_counters.h264_encodes===saverBaseline.capture_counters.h264_encodes);
+ const cacheRecovery={decoders:await ev('decoderCreates'),frames:received};await ev("testStream.send({type:'video_keyframe'})");
+ await until('Data saver cached-image recovery IDR',async()=>await ev('decoderCreates')===cacheRecovery.decoders+1&&received>cacheRecovery.frames);await sleep(600);
+ const recoveredFrames=received;await sleep(1500);
+ check('explicit idle IDR is new encode then Data saver sleeps again',received===recoveredFrames&&launches().length===idleHelpers&&(await api()).capture_counters.source_frames===mirrorSaverIdle.capture_counters.source_frames);
+ const resumedStart={at:performance.now(),received};await setting({data_saver:false});
+ // Wait for a complete rate window, not the first server sample mixing idle
+ // and resumed time. Independently count actual wire frames over the transition.
+ await sleep(2200);const resumedCache=await api(),resumedWireFPS=(received-resumedStart.received)/((performance.now()-resumedStart.at)/1000);
+ check('Data saver OFF resumes continuous encode without any new JPEG',resumedCache.sent_fps>=55&&resumedWireFPS>=55&&resumedWireFPS<=62&&resumedCache.capture_counters.source_frames===mirrorSaverIdle.capture_counters.source_frames&&resumedCache.capture_counters.jpeg_decodes===mirrorSaverIdle.capture_counters.jpeg_decodes&&launches().length===idleHelpers);
+ // Pausing clears this session's cache; resume with heartbeat-only source
+ // cannot inherit old pixels or mark the replacement capture ready.
+ await setting({stream_paused:true});await until('cached stream pause',async()=>(await api()).state==='Paused');await sleep(500);const pausedFrames=received;
+ await setting({stream_paused:false});await sleep(1200);const pendingSource=await api();
+ check('paused/replaced source cannot resurrect cached pixels before a new JPEG',received===pausedFrames&&pendingSource.state!=='Streaming'&&pendingSource.capture_counters.source_frames===0);
+ const wakeAt=performance.now();put('jpeg-mode.json',{rotation:true});
+ await until('first fresh rotated image after idle renders',()=>ev("document.getElementById('jpeg-canvas').width===640&&document.getElementById('jpeg-canvas').height===320"));
+ const mirrorWakeMS=performance.now()-wakeAt;
+ check('new source after resume starts with its own rotated pixels',mirrorWakeMS<2000&&(await api()).capture_counters.source_frames>0);
+ // Corruption arriving AFTER a good cache must not leave a frozen continuous
+ // stream that hides the failed source.
+ put('jpeg-mode.json',{corrupt:true});await until('cached-source corruption visible',async()=>(await api()).android_backends.effective_capture==='unavailable');await sleep(300);const corruptFrames=received;await sleep(800);
+ check('corrupt replacement fails visibly instead of streaming older cached image',received===corruptFrames&&(await api()).android_backends.reason.includes('JPEG image'));
+ check('wire packets have strictly increasing IDs/PTS within each decoder epoch',await ev('transportAudit.nonIncreasingPackets')===0);
+ const continuousStatic={wireFPS:staticWireFPS,renderFPS:continuousSamples.map(s=>s.fps),baseline:mirrorBaseline,idle:mirrorIdle,dataSaverIdle:mirrorSaverIdle,resumedCache,resumedWireFPS,lowerFPS:lowFPS};
  await destroy();remove('jpeg-mode.json');
  // Manual failure is latched; never silently select Mac-window/scrcpy capture.
  fs.writeFileSync(root+'/jpeg-unavailable','1');await connect('jpeg','current').catch(()=>{});await until('missing helper visible',async()=>(await api())?.android_backends.effective_capture==='unavailable');
@@ -81,6 +130,6 @@ try{
  await ev("document.querySelector('[data-action=close]').click()");await until('all panels closed',async()=>!await api());await sleep(500);
  check('all fixture ADB remains serial scoped',events().filter(e=>e.kind==='command').every(e=>e.args[0]==='-s'&&e.args[1]==='emulator-5554'));
  check('zero browser exceptions',exceptions.length===0);
- const report={checks,exceptions,samples,wireFPS,renderFPS:samples.map(s=>s.stats.fps),live,idle,real_device_actions:false,real_capture:false,real_input:false};fs.writeFileSync(root+'/jpeg-browser-review.json',JSON.stringify(report,null,2));console.log(JSON.stringify({jpegBrowserChecks:checks.length,wireFPS,renderFPS:report.renderFPS,exceptions:exceptions.length}));
+ const report={checks,exceptions,samples,wireFPS,renderFPS:samples.map(s=>s.stats.fps),live,idle,continuousStatic,mirrorIdle,mirrorWakeMS,real_device_actions:false,real_capture:false,real_input:false};fs.writeFileSync(root+'/jpeg-browser-review.json',JSON.stringify(report,null,2));console.log(JSON.stringify({jpegBrowserChecks:checks.length,wireFPS,renderFPS:report.renderFPS,exceptions:exceptions.length}));
 }catch(error){let debug;try{debug={api:await api(),browser:await ev('({status:window.testStatus,stats:window.testStats?.slice(-5),decoders:window.decoderCreates})')}}catch{}fs.writeFileSync(root+'/jpeg-browser-review.json',JSON.stringify({error:String(error),debug,checks,exceptions,samples},null,2));throw error}
 finally{for(const n of ['headless','unavailable','jpeg-unavailable','jpeg-rotation','jpeg-mode.json','window-size.json','display.json','hold-video'])remove(n);if(ws?.readyState===WebSocket.OPEN){try{await cdp('Browser.close')}catch{}ws.close()}for(const p of pending.values())clearTimeout(p.timer);await sleep(250);if(chrome?.exitCode===null)try{process.kill(-chrome.pid,'SIGTERM')}catch{}}
