@@ -57,7 +57,7 @@ test-video: test-sps
 	 "$$root/video-tests" "$$root/results"; \
 	 if [[ -n "$${TEST_OUTPUT:-}" ]]; then mkdir -p "$$TEST_OUTPUT"; cp "$$root/results/video-review.json" "$$TEST_OUTPUT/"; fi
 # Opt-in real-codec fidelity regression. Use4200 static frames to cross the
-# automatic3600-frame boundary (about2.5min total for both capture paths).
+# automatic3600-frame boundary (about4min total for all three capture paths).
 VIDEO_QUALITY_SOURCE ?= Sources/Video.swift
 test-video-quality:
 	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-video-quality-tests.XXXXXX); \
@@ -103,6 +103,10 @@ test-android-jpeg-surface:
 .PHONY: test-android-jpeg
 test-android-jpeg: test-android-jpeg-surface
 	@ANDROID_JPEG=1 NODE='$(NODE)' Tests/Android/run.sh
+
+.PHONY: test-raw-cpu
+test-raw-cpu:
+	@Tests/Android/run-raw-benchmark.sh
 
 .PHONY: test-android-raw
 test-android-raw:

@@ -74,15 +74,81 @@ struct EmulatorRawEndpoint: CustomStringConvertible, CustomDebugStringConvertibl
 // No MMAP, shared-memory handle, PNG, arbitrary display, URL or input RPCs.
 enum EmulatorRawWire {
     static let maxEdge=4096,maxPixelBytes=32*1024*1024,maxMessage=maxPixelBytes+65536
-    struct Frame { let bytes:Data,width:Int,height:Int,sequence:UInt64,timestampUS:UInt64;var active:Bool{!bytes.isEmpty} }
+    // Each completed message owns its slab until all payload/CI views release it.
+    // The pool stores blocks, not leases: no cycle, no reuse of in-flight bytes.
+    fileprivate final class Block {
+        let pointer: UnsafeMutableRawPointer, capacity: Int
+        init(_ capacity: Int) { self.capacity=capacity; pointer = .allocate(byteCount:capacity,alignment:64) }
+        deinit { pointer.deallocate() }
+    }
+    fileprivate final class Lease {
+        let block: Block
+        private let pool: SlabPool?
+        init(_ block: Block, pool: SlabPool? = nil) { self.block=block; self.pool=pool }
+        deinit { pool?.recycle(block) }
+    }
+    fileprivate final class SlabPool {
+        private let lock=NSLock()
+        private var spare=[Block](), slots=0, allocations:UInt64=0, reuses:UInt64=0
+        // Assembling + pending + current encode, with one spare. Bound includes
+        // checked-out leases; a retaining consumer cannot grow memory forever.
+        static let limit=4
+        var counters:(UInt64,UInt64) { lock.withLock { (allocations,reuses) } }
+        func take(_ count:Int)throws->Lease {
+            try lock.withLock {
+                if let i=spare.firstIndex(where:{$0.capacity>=count}) {
+                    reuses &+= 1; return Lease(spare.remove(at:i),pool:self)
+                }
+                if !spare.isEmpty { spare.removeLast(); slots-=1 }
+                guard slots<Self.limit else { throw WispError("Emulator raw message ownership exceeds bound") }
+                let capacity=min(maxMessage,(count+65535) & ~65535)
+                let block=Block(capacity); slots+=1; allocations &+= 1
+                return Lease(block,pool:self)
+            }
+        }
+        func recycle(_ block:Block) { lock.withLock { spare.append(block) } }
+    }
+    struct Bytes {
+        fileprivate let lease:Lease?
+        fileprivate let offset:Int
+        let count:Int
+        init() { lease=nil;offset=0;count=0 }
+        fileprivate init(lease:Lease,offset:Int,count:Int) { self.lease=lease;self.offset=offset;self.count=count }
+        // Convenience for small owned requests/fixtures. Production messages
+        // arrive directly in pooled slabs and never take this copying path.
+        fileprivate init(copying data:Data) {
+            guard !data.isEmpty else { self.init();return }
+            let block=Block(data.count)
+            data.withUnsafeBytes { block.pointer.copyMemory(from:$0.baseAddress!,byteCount:data.count) }
+            self.init(lease:Lease(block),offset:0,count:data.count)
+        }
+        var isEmpty:Bool { count==0 }
+        subscript(_ i:Int)->UInt8 {
+            precondition(i>=0 && i<count)
+            return lease!.block.pointer.load(fromByteOffset:offset+i,as:UInt8.self)
+        }
+        func slice(_ range:Range<Int>)->Bytes {
+            precondition(range.lowerBound>=0 && range.upperBound<=count)
+            guard !range.isEmpty else { return Bytes() }
+            return Bytes(lease:lease!,offset:offset+range.lowerBound,count:range.count)
+        }
+        // Data owns this lease through its deallocator. Never escape a pointer
+        // from Data.withUnsafeBytes or assume a Foundation slice is zero-copy.
+        var data:Data {
+            guard let lease,!isEmpty else { return Data() }
+            return Data(bytesNoCopy:lease.block.pointer.advanced(by:offset),count:count,
+                        deallocator:.custom { [lease] _,_ in withExtendedLifetime(lease) {} })
+        }
+    }
+    struct Frame { let bytes:Bytes,width:Int,height:Int,sequence:UInt64,timestampUS:UInt64;var active:Bool{!bytes.isEmpty} }
     struct Reader {
-        let data:Data
+        let data:Bytes
         var offset=0,fields=0
         mutating func varint()throws->UInt64 {
             var result:UInt64=0
             for n in 0..<10 {
                 guard offset<data.count else{throw WispError("Truncated emulator protobuf")}
-                let b=data[data.startIndex+offset];offset+=1
+                let b=data[offset];offset+=1
                 guard n<9 || b<=1 else{throw WispError("Emulator protobuf integer overflow")}
                 result |= UInt64(b&127) << (n*7)
                 if b&128==0{return result}
@@ -94,9 +160,9 @@ enum EmulatorRawWire {
             let value=try varint();guard value>>3>0,value>>3<=0x1fffffff else{throw WispError("Invalid emulator protobuf tag")}
             return(Int(value>>3),Int(value&7))
         }
-        mutating func bytes()throws->Data {
+        mutating func bytes()throws->Bytes {
             let size=try varint();guard size<=UInt64(data.count-offset) else{throw WispError("Invalid emulator protobuf length")}
-            let start=offset;offset+=Int(size);return data.subdata(in:start..<offset)
+            let start=offset;offset+=Int(size);return data.slice(start..<offset)
         }
         mutating func skip(_ type:Int)throws {
             switch type {
@@ -120,43 +186,69 @@ enum EmulatorRawWire {
         var data=Data([0]);data.scrcpyAppend(UInt32(proto.count));data.append(proto);return data
     }
     static func image(_ data:Data,maxSize:Int)throws->Frame {
+        guard data.count<=maxMessage else { throw WispError("Emulator raw message exceeds bounds") }
+        return try image(Bytes(copying:data),maxSize:maxSize)
+    }
+    static func image(_ data:Bytes,maxSize:Int)throws->Frame {
         guard (8...maxEdge).contains(maxSize),data.count<=maxMessage else{throw WispError("Emulator raw message exceeds bounds")}
-        var r=Reader(data:data),formatData:Data?,payload:Data?,sequence:UInt64=0,timestamp:UInt64=0,seen=Set<Int>()
+        var r=Reader(data:data),formatData:Bytes?,payload:Bytes?,sequence:UInt64=0,timestamp:UInt64=0,seen=Set<Int>()
         while r.offset<data.count {
             let(f,t)=try r.key()
             if [1,4,5,6].contains(f){guard seen.insert(f).inserted,(f==1 || f==4) ? t==2:t==0 else{throw WispError("Invalid or duplicate emulator image field")}}
             switch(f,t){case(1,2):formatData=try r.bytes();case(4,2):payload=try r.bytes();case(5,0):sequence=try r.varint();case(6,0):timestamp=try r.varint();default:try r.skip(t)}
         }
         guard sequence<=UInt64(UInt32.max) else{throw WispError("Invalid emulator raw sequence")}
-        let pixels=payload ?? Data()
+        let pixels=payload ?? Bytes()
         guard pixels.isEmpty || formatData != nil else{throw WispError("Missing emulator raw format")}
-        let format=formatData ?? Data()
+        let format=formatData ?? Bytes()
         guard format.count<=65536 else{throw WispError("Emulator raw format exceeds bounds")}
         r=Reader(data:format);var kind:UInt64=0,width:UInt64=0,height:UInt64=0,display:UInt64=0;seen=[]
         while r.offset<format.count {
             let(f,t)=try r.key();if [1,3,4,5,6].contains(f){guard seen.insert(f).inserted,(f==6 ? t==2:t==0) else{throw WispError("Invalid or duplicate emulator format field")}}
-            switch(f,t){case(1,0):kind=try r.varint();case(3,0):width=try r.varint();case(4,0):height=try r.varint();case(5,0):display=try r.varint();case(6,2):let transport=try r.bytes();guard transport.isEmpty || transport==Data([8,0]) else{throw WispError("Emulator raw side channels are unsupported")};default:try r.skip(t)}
+            switch(f,t){case(1,0):kind=try r.varint();case(3,0):width=try r.varint();case(4,0):height=try r.varint();case(5,0):display=try r.varint();case(6,2):let transport=try r.bytes();guard transport.isEmpty || (transport.count==2 && transport[0]==8 && transport[1]==0) else{throw WispError("Emulator raw side channels are unsupported")};default:try r.skip(t)}
         }
         // Empty Image is the API inactivity notification, not cached pixels.
-        if pixels.isEmpty{return Frame(bytes:Data(),width:0,height:0,sequence:sequence,timestampUS:timestamp)}
+        if pixels.isEmpty{return Frame(bytes:Bytes(),width:0,height:0,sequence:sequence,timestampUS:timestamp)}
         guard kind==1,display==0,(8...UInt64(min(maxEdge,maxSize))).contains(width),(8...UInt64(min(maxEdge,maxSize))).contains(height),
               width*height*4<=UInt64(maxPixelBytes),pixels.count==Int(width*height*4),timestamp>0,timestamp<=UInt64(Int64.max) else{throw WispError("Invalid RGBA8888 emulator image dimensions or bytes")}
         return Frame(bytes:pixels,width:Int(width),height:Int(height),sequence:sequence,timestampUS:timestamp)
     }
-    struct Messages {
-        private var buffer=Data()
+    final class Messages {
+        private let pool=SlabPool()
+        private var header=[UInt8](repeating:0,count:5), headerCount=0
+        private var expected:Int?, used=0, lease:Lease?
         private(set)var peakBytes=0
-        mutating func append(_ data:Data,_ emit:(Data)throws->Void)throws {
-            guard data.count<=65536,buffer.count+data.count<=maxMessage+65541 else{throw WispError("Emulator raw receive buffer exceeds bound")}
-            buffer.append(data);peakBytes=max(peakBytes,buffer.count)
+        var storageCounters:(UInt64,UInt64) { pool.counters }
+        func append(_ data:Data,_ emit:(Bytes)throws->Void)throws {
+            try data.withUnsafeBytes { try append($0,emit) }
+        }
+        func append(_ data:UnsafeRawBufferPointer,_ emit:(Bytes)throws->Void)throws {
+            guard data.count<=65536 else { throw WispError("Emulator raw receive buffer exceeds bound") }
             var offset=0
-            while buffer.count-offset>=5 {
-                guard buffer[offset]==0 else{throw WispError("Compressed gRPC raw images are unsupported")}
-                let n=Int(buffer.scrcpyUInt(offset+1,4));guard (0...maxMessage).contains(n) else{throw WispError("Invalid gRPC raw image size")}
-                guard buffer.count-offset>=n+5 else{break}
-                try emit(buffer.subdata(in:offset+5..<offset+5+n));offset+=5+n
+            while offset<data.count {
+                if expected==nil {
+                    while headerCount<5 && offset<data.count {
+                        header[headerCount]=data[offset];headerCount+=1;offset+=1
+                    }
+                    guard headerCount==5 else { break }
+                    guard header[0]==0 else { throw WispError("Compressed gRPC raw images are unsupported") }
+                    let n=header.dropFirst().reduce(0){($0<<8)|Int($1)}
+                    guard n<=maxMessage else { throw WispError("Invalid gRPC raw image size") }
+                    expected=n;used=0
+                    if n==0 { expected=nil;headerCount=0;peakBytes=max(peakBytes,5);try emit(Bytes());continue }
+                    lease=try pool.take(n)
+                }
+                let n=expected!, amount=min(n-used,data.count-offset)
+                if amount>0 {
+                    lease!.block.pointer.advanced(by:used).copyMemory(from:data.baseAddress!.advanced(by:offset),byteCount:amount)
+                    used+=amount;offset+=amount;peakBytes=max(peakBytes,used+5)
+                }
+                if used==n {
+                    let message=Bytes(lease:lease!,offset:0,count:n)
+                    lease=nil;expected=nil;headerCount=0;used=0
+                    try emit(message)
+                }
             }
-            if offset>0{buffer=Data(buffer.dropFirst(offset))}
         }
     }
     struct Headers {

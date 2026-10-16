@@ -46,6 +46,13 @@ struct H264Frame {
 // so neither VideoToolbox nor the socket builds a multi-frame latency queue.
 final class H264Encoder {
     let width: Int, height: Int, codedWidth: Int, codedHeight: Int
+    // Only this encoder can submit a prepared buffer. Callers cannot mutate
+    // its pixels; VideoToolbox may retain them after submission.
+    final class PreparedFrame {
+        fileprivate let pixel: CVPixelBuffer, owner: UUID
+        fileprivate init(pixel: CVPixelBuffer, owner: UUID) { self.pixel=pixel;self.owner=owner }
+    }
+    private let identity=UUID()
     private var session: VTCompressionSession?
     private var pool: CVPixelBufferPool?
     private let context = CIContext(options: [.cacheIntermediates: false])
@@ -90,8 +97,22 @@ final class H264Encoder {
         guard status == noErr else { throw WispError("H.264 \(operation) failed (\(status))") }
     }
     private func property(_ key: CFString, _ value: CFTypeRef) throws { try check(VTSessionSetProperty(session!, key: key, value: value), String(key)) }
+    func prepare(_ image:CIImage)throws->PreparedFrame {
+        guard session != nil,let pool else { throw WispError("H.264 encoder closed") }
+        var pixel: CVPixelBuffer?
+        try check(CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, [kCVPixelBufferPoolAllocationThresholdKey: 3] as CFDictionary, &pixel), "bounded pixel allocation")
+        let bounds = CGRect(x: 0, y: 0, width: codedWidth, height: codedHeight)
+        let background = CIImage(color: .black).cropped(to: bounds)
+        context.render(image.composited(over: background), to: pixel!, bounds: bounds, colorSpace: colorSpace)
+        return PreparedFrame(pixel:pixel!,owner:identity)
+    }
+    // Mac-window/JPEG retain their existing prepare-per-encode behavior.
     func encode(_ image: CIImage, quality: Int, fps: Int, forceKeyframe: Bool) throws -> H264Frame {
-        guard let session, let pool else { throw WispError("H.264 encoder closed") }
+        try encode(prepare(image),quality:quality,fps:fps,forceKeyframe:forceKeyframe)
+    }
+    func encode(_ prepared:PreparedFrame,quality:Int,fps:Int,forceKeyframe:Bool)throws->H264Frame {
+        guard let session else { throw WispError("H.264 encoder closed") }
+        guard prepared.owner==identity else { throw WispError("H.264 prepared buffer belongs to another encoder") }
         if quality != previousQuality || fps != previousFPS {
             // Preserve the existing 1–95 control; it now selects a resolution-
             // scaled bitrate, not JPEG compression. A 1080p portrait at q20 is ~6 Mbps.
@@ -100,16 +121,11 @@ final class H264Encoder {
             try property(kVTCompressionPropertyKey_ExpectedFrameRate, fps as CFNumber)
             previousQuality = quality; previousFPS = fps
         }
-        var pixel: CVPixelBuffer?
-        try check(CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, [kCVPixelBufferPoolAllocationThresholdKey: 3] as CFDictionary, &pixel), "bounded pixel allocation")
-        let bounds = CGRect(x: 0, y: 0, width: codedWidth, height: codedHeight)
-        let background = CIImage(color: .black).cropped(to: bounds)
-        context.render(image.composited(over: background), to: pixel!, bounds: bounds, colorSpace: colorSpace)
         timestamp = max(timestamp + 1, UInt64(max(0, (monotonic() - started) * 1_000_000)))
         let pts = CMTime(value: Int64(timestamp), timescale: 1_000_000)
         outputLock.withLock { output = nil; outputError = noErr }
         let properties: CFDictionary? = forceKeyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
-        try check(VTCompressionSessionEncodeFrame(session, imageBuffer: pixel!, presentationTimeStamp: pts, duration: .invalid, frameProperties: properties, sourceFrameRefcon: nil, infoFlagsOut: nil), "encode")
+        try check(VTCompressionSessionEncodeFrame(session, imageBuffer: prepared.pixel, presentationTimeStamp: pts, duration: .invalid, frameProperties: properties, sourceFrameRefcon: nil, infoFlagsOut: nil), "encode")
         try check(VTCompressionSessionCompleteFrames(session, untilPresentationTimeStamp: .invalid), "drain")
         return try outputLock.withLock {
             try check(outputError, "output")

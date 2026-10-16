@@ -99,6 +99,7 @@ func runQuality(_ mode:String)throws {
     let encoder:H264Encoder?=capture==nil ? try H264Encoder(width:width,height:height):nil
     defer{encoder?.close()}
     try expect(CaptureHealth.shared.snapshot["active"] as? Int == 0,"no real capture")
+    var prepared:H264Encoder.PreparedFrame?,preparations=0
     var decoder:QualityDecoder?,cached:CIImage?,truth=[UInt8](),rows=[[String:Any]](),description:Data?,lastTimestamp:UInt64=0
     var referenceHash="",allDrops=[Double](),unrequestedDrops=[Double](),automaticKeys=[Int](),resumedFrames=0
     let start=monotonic()
@@ -108,12 +109,16 @@ func runQuality(_ mode:String)throws {
             let isStatic=n>=moving && n<moving+staticFrames,force=n==0 || n==forcedAt
             if !isStatic {
                 let image=try synthetic(n<moving ? n:n-staticFrames)
-                if let capture {cached=try macSource(CIImage(cgImage:image),capture)}else{cached=try jpegImage(jpeg(image))}
+                if let capture {cached=try macSource(CIImage(cgImage:image),capture)}else if mode=="raw_prepared" {
+                    cached=CIImage(bitmapData:Data(pixels(CIImage(cgImage:image))),bytesPerRow:width*4,size:CGSize(width:width,height:height),format:.RGBA8,colorSpace:space)
+                    prepared=try encoder!.prepare(cached!);preparations+=1
+                }else{cached=try jpegImage(jpeg(image))}
                 truth=pixels(cached!)
                 if n==moving-1{referenceHash=SHA256.hash(data:Data(truth)).map{String(format:"%02x",$0)}.joined()}
             }
             let frame:H264Frame
             if let capture {guard let value=try capture.h264(quality:1,fps:fps,forceKeyframe:force,dataSaver:false) else{throw WispError("Mac missing frame")};frame=value}
+            else if let prepared {frame=try encoder!.encode(prepared,quality:1,fps:fps,forceKeyframe:force)}
             else {frame=try encoder!.encode(cached!,quality:1,fps:fps,forceKeyframe:force)}
             try expect(frame.timestamp>lastTimestamp,"strictly monotonic PTS");lastTimestamp=frame.timestamp
             try expect(frame.width==width && frame.height==height && frame.codedWidth==412 && frame.codedHeight==914,"visible size and odd padding")
@@ -137,8 +142,9 @@ func runQuality(_ mode:String)throws {
     let earlyAutomatic=automaticKeys.filter{$0<forcedAt || $0-forcedAt<3500}
     let boundaries=automaticKeys.filter{$0>forcedAt && $0-forcedAt>=3500}
     let hardware=(capture?.counters["hardware_encoder"] as? Bool) ?? encoder!.hardware
-    let result:[String:Any]=["mode":mode,"totalFrames":total,"staticFrames":staticFrames,"resumedFrames":resumedFrames,"hardware":hardware,"decoderOutputs":decoder!.count,"descriptionCount":1,"staticReferenceSHA256":referenceHash,"largeUnrequestedDrops":largeDrops,"worstUnrequestedPSNRStep":worst,"worstAllStaticPSNRStep":allDrops.min() ?? 0,"automaticKeyframes":automaticKeys,"forcedFrame":forcedAt,"durationSeconds":monotonic()-start,"realCapture":false,"passed":largeDrops==0 && earlyAutomatic.isEmpty,"rows":rows]
+    let result:[String:Any]=["mode":mode,"preparedBuffers":preparations,"totalFrames":total,"staticFrames":staticFrames,"resumedFrames":resumedFrames,"hardware":hardware,"decoderOutputs":decoder!.count,"descriptionCount":1,"staticReferenceSHA256":referenceHash,"largeUnrequestedDrops":largeDrops,"worstUnrequestedPSNRStep":worst,"worstAllStaticPSNRStep":allDrops.min() ?? 0,"automaticKeyframes":automaticKeys,"forcedFrame":forcedAt,"durationSeconds":monotonic()-start,"realCapture":false,"passed":largeDrops==0 && earlyAutomatic.isEmpty,"rows":rows]
     try jsonData(result).write(to:directory.appendingPathComponent(mode+"-quality.json"))
+    if mode=="raw_prepared" {try expect(preparations==moving+resumed,"one prepared buffer per consumed source version, none for static repeats")}
     try expect(decoder!.count==total,"all access units decode, including recovery and resumed motion")
     try expect(resumedFrames==resumed,"motion resumes after static without replacing decoder")
     try expect(largeDrops==0,"\(mode): \(largeDrops) unrequested static fidelity collapses, worst \(worst)dB")
@@ -152,7 +158,7 @@ func runQuality(_ mode:String)throws {
 }
 do {
     try expect((900...12000).contains(staticFrames),"static duration must be900...12000 frames")
-    for mode in ["jpeg","mac_window"]{try runQuality(mode)}
+    for mode in ["jpeg","mac_window","raw_prepared"]{try runQuality(mode)}
     try jsonData(["passed":true,"checks":checks,"staticFrames":staticFrames,"realCapture":false,"realInput":false]).write(to:directory.appendingPathComponent("video-quality-review.json"))
     print("\(checks) native motion/static fidelity checks passed")
 }catch{

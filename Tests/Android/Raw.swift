@@ -9,7 +9,7 @@ func rawFixtureEndpoint(_ root:URL)throws->EmulatorRawEndpoint {
 }
 func runRawTests(root:URL)throws {
     var checks=0
-    func check(_ b:Bool,_ name:String){precondition(b,name);checks+=1}
+    func check(_ b:Bool,_ name:String){if !b { fputs("FAIL Raw: \(name)\n",stderr) };precondition(b,name);checks+=1}
     func reject(_ name:String,_ body:()throws->Void){do{try body();preconditionFailure("Accepted "+name)}catch{checks+=1}}
     func wait(_ name:String,_ body:()->Bool)throws{let end=monotonic()+10;while monotonic()<end{if body(){return};Thread.sleep(forTimeInterval:0.01)};throw WispError("Raw timeout "+name)}
     func mode(_ value:[String:Any])throws{try jsonData(value).write(to:root.appendingPathComponent("raw-mode.json"),options:.atomic)}
@@ -21,13 +21,13 @@ func runRawTests(root:URL)throws {
     let frame=try EmulatorRawWire.image(proto,maxSize:8);check(frame.width==8 && frame.height==8 && frame.bytes.count==256 && frame.sequence==0,"RGBA metadata/default first sequence")
     check(try !EmulatorRawWire.image(Data(),maxSize:8).active,"empty protobuf means inactive display, not corrupt image")
     for split in 0...packet(proto).count {
-        var parser=EmulatorRawWire.Messages(),out=[Data]();let p=packet(proto)
-        try parser.append(Data(p.prefix(split))){out.append($0)};try parser.append(Data(p.dropFirst(split))){out.append($0)}
+        let parser=EmulatorRawWire.Messages();var out=[Data]();let p=packet(proto)
+        try parser.append(Data(p.prefix(split))){out.append($0.data)};try parser.append(Data(p.dropFirst(split))){out.append($0.data)}
         check(out==[proto],"gRPC fragmentation \(split)")
     }
-    var parser=EmulatorRawWire.Messages(),count=0;try parser.append(packet(Data())+packet(proto)){_ in count+=1};check(count==2,"coalesced inactive + image")
-    reject("compressed gRPC"){var p=EmulatorRawWire.Messages();try p.append(Data([1,0,0,0,1,0])){_ in}}
-    reject("message allocation bound"){var p=EmulatorRawWire.Messages(),d=Data([0]);d.scrcpyAppend(UInt32(EmulatorRawWire.maxMessage+1));try p.append(d){_ in}}
+    let parser=EmulatorRawWire.Messages();var count=0;try parser.append(packet(Data())+packet(proto)){_ in count+=1};check(count==2,"coalesced inactive + image")
+    reject("compressed gRPC"){let p=EmulatorRawWire.Messages();try p.append(Data([1,0,0,0,1,0])){_ in}}
+    reject("message allocation bound"){let p=EmulatorRawWire.Messages();var d=Data([0]);d.scrcpyAppend(UInt32(EmulatorRawWire.maxMessage+1));try p.append(d){_ in}}
     for data in [Data([10,255]),proto+EmulatorRawWire.uint(6,2),length(1,format)+length(4,Data([0])),Data([0]),Data([8,1]),Data([0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,2])] {
         reject("bad protobuf length/type/duplicate/bounds"){_ = try EmulatorRawWire.image(data,maxSize:8)}
     }
@@ -47,6 +47,7 @@ func runRawTests(root:URL)throws {
     check(AndroidBackendChoice(capture:"raw",input:"raw").capture == .raw && AndroidBackendChoice(capture:"raw",input:"raw").input == .auto,"raw is capture-only")
     var headers=EmulatorRawWire.Headers();for b in Data("HTTP/2 200\r\ncontent-type: application/grpc\r\n\r\n".utf8){try headers.append(Data([b]))};check(headers.ready,"fragmented HTTP2 headers accepted")
     for text in ["HTTP/1.1 200 OK\r\n","HTTP/2 403\r\n","HTTP/2 200\r\ncontent-type: text/plain\r\n","grpc-status: 16\r\n",String(repeating:"x",count:8193)]{reject("headers/status/auth fail closed"){var h=EmulatorRawWire.Headers();try h.append(Data(text.utf8))}}
+    checks += try runRawStorageTests()
     let network=DispatchQueue(label:"fixture.raw-native"),life=DispatchGroup()
     try mode(["static":true]);let s=AndroidRawSession(serial:"emulator-5554",maxSize:64,network:network,lifecycle:life,discovery:{_ in try rawFixtureEndpoint(root)});s.start();s.start()
     try wait("first raw image"){s.state.ready || s.state.error != nil};check(s.state.error==nil,"system HTTP2 curl/gRPC receives real fragmented body: \(s.state.error ?? "")")
@@ -58,9 +59,22 @@ func runRawTests(root:URL)throws {
     var last=first!.timestamp
     for i in 0..<30 {let f=try s.h264(quality:1,fps:i%2==0 ? 60:30,forceKeyframe:false,dataSaver:false);check(f != nil && f!.timestamp>last,"cached pixels NEW encode and monotonic PTS");last=f!.timestamp}
     check(s.diagnostics["source_frames"] as? UInt64==before && s.diagnostics["encoder_creations"] as? UInt64==1,"pacing changes preserve source/cache/encoder")
+    check(s.diagnostics["prepared_pixel_buffers"] as? UInt64==1,"static repeats prepare exactly one encoder pixel buffer, not one per H264 frame")
     check(try s.h264(quality:1,fps:60,forceKeyframe:true,dataSaver:true)?.keyframe==true,"explicit recovery bypasses Data saver without fetching pixels")
     Thread.sleep(forTimeInterval:8.2);check(s.state.ready && s.state.error==nil && s.diagnostics["source_frames"] as? UInt64==before,"silent healthy raw stream survives idle beyond JPEG heartbeat timeout")
     try mode(["inactive":true]);try wait("inactive display"){!s.state.ready};check(!s.canEncode(dataSaver:false,forceKeyframe:true),"inactive display invalidates cached output")
+    // An active same-size version after inactivity must prepare fresh pixels,
+    // but never manufacture an encoder/source/transport reset for a repeat.
+    let preparedBefore=s.diagnostics["prepared_pixel_buffers"] as! UInt64
+    try mode(["static":true,"variant":true,"revision":1]);try wait("same-size raw wake"){s.state.ready}
+    let awake=try s.h264(quality:20,fps:30,forceKeyframe:true,dataSaver:true)
+    check(awake?.keyframe==true && s.diagnostics["encoder_creations"] as? UInt64==1 && s.diagnostics["prepared_pixel_buffers"] as? UInt64==preparedBefore+1,"fresh same-size wake replaces only prepared pixels")
+    check(try s.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:true)==nil,"same prepared version idles only with saver")
+    let oldVersion=s.diagnostics["source_frames"] as! UInt64
+    try mode(["static":true,"revision":2]);try wait("new same-size version"){s.diagnostics["source_frames"] as! UInt64>oldVersion}
+    _ = try s.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:true)
+    check(s.diagnostics["prepared_pixel_buffers"] as? UInt64==preparedBefore+2 && s.diagnostics["encoder_creations"] as? UInt64==1,"each consumed new version prepares once")
+    check((s.diagnostics["receive_storage_allocations"] as! UInt64) <= 4 && (s.diagnostics["receive_storage_reuses"] as! UInt64) >= 1,"session uses bounded reusable receive slabs")
     try mode(["rotation":true]);try wait("raw rotation wake"){s.state.ready && s.diagnostics["video_width"] as? Int==64};let rotated=try s.h264(quality:1,fps:60,forceKeyframe:false,dataSaver:false)
     check(rotated?.keyframe==true && rotated?.width==64 && rotated?.height==32 && s.diagnostics["encoder_creations"] as? UInt64==2,"actual geometry alone replaces encoder and forces keyframe")
     s.stop();check(life.wait(timeout:.now()+4) == .success,"cancel wakes idle poll, joins curl and encoder");check(s.state.finished && !s.state.ready,"stopped source cannot resurrect")

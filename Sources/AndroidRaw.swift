@@ -13,9 +13,12 @@ final class AndroidRawSession: @unchecked Sendable {
     private let lock=NSLock(),encodeLock=NSLock(),work=DispatchGroup(),wake=Pipe()
     private var started=false,cancelled=false,finished=false,ready=false,noticePending=false
     private var failure:String?,latest:EmulatorRawWire.Frame?,available=false
-    private var cached:CIImage?,cachedVersion:UInt64=0,encodedVersion:UInt64=0,version:UInt64=0
+    private var cached:H264Encoder.PreparedFrame?,cachedVersion:UInt64=0,encodedVersion:UInt64=0,version:UInt64=0
+    private var recoveryRequired=false // encodeLock: a discarded encode advanced VT references.
     private var encoder:H264Encoder?,received:UInt64=0,receivedBytes:UInt64=0,dropped:UInt64=0,encoded:UInt64=0,cachedEncodes:UInt64=0,encoderCreations:UInt64=0,bufferPeak=0
     private var dimensions=(0,0),hardware=false,lastAt:Double?,sourceTimestamp:UInt64=0
+    private var preparedBuffers:UInt64=0,receiveAllocations:UInt64=0,receiveReuses:UInt64=0,availabilityGeneration:UInt64=0
+    private let colorSpace=CGColorSpace(name:CGColorSpace.sRGB)!
     var onChange:(()->Void)?
     init(serial:String,maxSize:Int,network:DispatchQueue,lifecycle:DispatchGroup,discovery:@escaping Discovery=EmulatorRawEndpoint.discover){
         self.serial=serial;self.maxSize=min(EmulatorRawWire.maxEdge,max(8,maxSize));self.network=network;self.lifecycle=lifecycle;discover=discovery
@@ -24,7 +27,7 @@ final class AndroidRawSession: @unchecked Sendable {
     private var aliveLocked:Bool{!cancelled && !finished && failure==nil && ready && available}
     func canEncode(dataSaver:Bool,forceKeyframe:Bool)->Bool{lock.withLock{aliveLocked && (latest != nil || (!dataSaver || forceKeyframe))}}
     var diagnostics:[String:Any]{lock.withLock{[
-        "source_mode":"emulator_host_rgba_stream","source_format":"RGBA8888","source_frames":received,"source_raw_bytes":receivedBytes,"video_width":dimensions.0,"video_height":dimensions.1,"max_size":maxSize,"queued_frames":latest == nil ? 0:1,"dropped_frames":dropped,"h264_encodes":encoded,"cached_image_encodes":cachedEncodes,"encoder_creations":encoderCreations,"hardware_encoder":hardware,"cached_image_available":aliveLocked,"last_frame_age_ms":lastAt.map{max(0,(monotonic()-$0)*1000)} as Any? ?? NSNull(),"source_timestamp_us":sourceTimestamp,"receive_buffer_peak_bytes":bufferPeak,"jpeg_encodes":0,"jpeg_decodes":0
+        "source_mode":"emulator_host_rgba_stream","source_format":"RGBA8888","source_frames":received,"source_raw_bytes":receivedBytes,"video_width":dimensions.0,"video_height":dimensions.1,"max_size":maxSize,"queued_frames":latest == nil ? 0:1,"dropped_frames":dropped,"h264_encodes":encoded,"cached_image_encodes":cachedEncodes,"encoder_creations":encoderCreations,"hardware_encoder":hardware,"cached_image_available":aliveLocked,"last_frame_age_ms":lastAt.map{max(0,(monotonic()-$0)*1000)} as Any? ?? NSNull(),"source_timestamp_us":sourceTimestamp,"receive_buffer_peak_bytes":bufferPeak,"receive_storage_allocations":receiveAllocations,"receive_storage_reuses":receiveReuses,"prepared_pixel_buffers":preparedBuffers,"jpeg_encodes":0,"jpeg_decodes":0
     ]}}
     private func notify(){let send=lock.withLock{()->Bool in if cancelled || noticePending{return false};noticePending=true;return true};if send{network.async{[weak self] in guard let self else{return};self.lock.withLock{self.noticePending=false};if !self.lock.withLock({self.cancelled}){self.onChange?()}}}}
     private var stopped:Bool{lock.withLock{cancelled}}
@@ -54,14 +57,16 @@ final class AndroidRawSession: @unchecked Sendable {
                 guard !stopped else{return};try p.run();process=p
                 try stdout.fileHandleForWriting.close();try stderr.fileHandleForWriting.close();try stdin.fileHandleForReading.close()
                 let outputFD=stdout.fileHandleForReading.fileDescriptor,errorFD=stderr.fileHandleForReading.fileDescriptor,cancelFD=wake.fileHandleForReading.fileDescriptor
-                var headers=EmulatorRawWire.Headers(),messages=EmulatorRawWire.Messages(),firstPacket=false,lastSequence:UInt64?,pending:Data?
+                var headers=EmulatorRawWire.Headers(),messages=EmulatorRawWire.Messages(),firstPacket=false,lastSequence:UInt64?,pending:EmulatorRawWire.Bytes?
+                let readBuffer=UnsafeMutableRawBufferPointer.allocate(byteCount:65536,alignment:64)
+                defer { readBuffer.deallocate() }
                 let initialDeadline=monotonic()+8
-                func accept(_ data:Data)throws{
+                func accept(_ data:EmulatorRawWire.Bytes)throws{
                     let frame=try EmulatorRawWire.image(data,maxSize:maxSize);firstPacket=true
                     if frame.active {if let previous=lastSequence,frame.sequence<=previous{throw WispError("Stale emulator raw image sequence")};lastSequence=frame.sequence}
                     lock.withLock{
                         guard !cancelled else{return}
-                        if !frame.active{latest=nil;available=false;ready=false;return}
+                        if !frame.active{latest=nil;available=false;ready=false;availabilityGeneration &+= 1;return}
                         if latest != nil{dropped &+= 1};latest=frame;version &+= 1;received &+= 1;receivedBytes &+= UInt64(frame.bytes.count);dimensions=(frame.width,frame.height);lastAt=monotonic();sourceTimestamp=frame.timestampUS;available=true;ready=true
                     };notify()
                 }
@@ -73,11 +78,12 @@ final class AndroidRawSession: @unchecked Sendable {
                     let count=Darwin.poll(&fds,3,timeout);if count<0 && errno==EINTR{continue};guard count>=0 else{throw WispError("Emulator raw transport failed")};if count==0{continue}
                     if fds[2].revents != 0 || stopped{break}
                     for i in 0...1 where fds[i].revents != 0 {
-                        var bytes=Data(count:65536);let n=bytes.withUnsafeMutableBytes{Darwin.read(fds[i].fd,$0.baseAddress!,65536)}
-                        if n<0 && errno==EINTR{continue};guard n>0 else{throw WispError("Emulator raw stream disconnected")};bytes.count=n
-                        if i==0 {try headers.append(bytes)}else{
-                            try messages.append(bytes){value in if headers.ready{try accept(value)}else{guard pending==nil else{throw WispError("Raw image before validated HTTP/2 headers")};pending=value}}
-                            lock.withLock{bufferPeak=messages.peakBytes}
+                        let n=Darwin.read(fds[i].fd,readBuffer.baseAddress!,readBuffer.count)
+                        if n<0 && errno==EINTR{continue};guard n>0 else{throw WispError("Emulator raw stream disconnected")}
+                        if i==0 {try headers.append(Data(bytes:readBuffer.baseAddress!,count:n))}else{
+                            try messages.append(UnsafeRawBufferPointer(rebasing:readBuffer.prefix(n))){value in if headers.ready{try accept(value)}else{guard pending==nil else{throw WispError("Raw image before validated HTTP/2 headers")};pending=value}}
+                            let counters=messages.storageCounters
+                            lock.withLock{bufferPeak=messages.peakBytes;receiveAllocations=counters.0;receiveReuses=counters.1}
                         }
                     }
                 }
@@ -86,21 +92,30 @@ final class AndroidRawSession: @unchecked Sendable {
     }
     func h264(quality:Int,fps:Int,forceKeyframe:Bool,dataSaver:Bool)throws->H264Frame?{
         try encodeLock.withLock{try autoreleasepool{
-            let state=lock.withLock{()->(EmulatorRawWire.Frame?,UInt64)? in guard aliveLocked else{return nil};let f=latest;latest=nil;return(f,version)}
-            guard let(frame,current)=state else{return nil}
+            let state=lock.withLock{()->(EmulatorRawWire.Frame?,UInt64,UInt64)? in guard aliveLocked else{return nil};let f=latest;latest=nil;return(f,version,availabilityGeneration)}
+            guard let(frame,current,generation)=state else{return nil}
             do{
+                var resized=false
                 if let frame {
                     // streamScreenshot supplies an already display-oriented
                     // bitmap. The legacy proto's "bottom up" comment must not
                     // become a SECOND Mac-side vertical flip. No emulator change.
-                    cached=CIImage(bitmapData:frame.bytes,bytesPerRow:frame.width*4,size:CGSize(width:frame.width,height:frame.height),format:.RGBA8,colorSpace:CGColorSpace(name:CGColorSpace.sRGB)!);cachedVersion=current
+                    resized=encoder?.width != frame.width || encoder?.height != frame.height
+                    if resized{cached=nil;encoder?.close();encoder=try H264Encoder(width:frame.width,height:frame.height);lock.withLock{encoderCreations &+= 1}}
+                    let image=CIImage(bitmapData:frame.bytes.data,bytesPerRow:frame.width*4,size:CGSize(width:frame.width,height:frame.height),format:.RGBA8,colorSpace:colorSpace)
+                    // Keep exactly the existing color/alpha/orientation/padding
+                    // render, but only for a newly consumed source version.
+                    cached=try encoder!.prepare(image);cachedVersion=current
+                    lock.withLock{preparedBuffers &+= 1}
                 }
-                guard let cached,(!dataSaver || encodedVersion != cachedVersion || forceKeyframe),lock.withLock({aliveLocked}) else{return nil}
-                let resized=encoder?.width != Int(cached.extent.width) || encoder?.height != Int(cached.extent.height)
-                if resized{encoder?.close();encoder=try H264Encoder(width:Int(cached.extent.width),height:Int(cached.extent.height));lock.withLock{encoderCreations &+= 1}}
-                let result=try encoder!.encode(cached,quality:quality,fps:fps,forceKeyframe:forceKeyframe || resized)
-                let accepted=lock.withLock{()->Bool in guard aliveLocked else{return false};encoded &+= 1;if frame==nil{cachedEncodes &+= 1};hardware=encoder!.hardware;return true}
-                guard accepted else{return nil};encodedVersion=cachedVersion;return result
+                guard let cached,(!dataSaver || encodedVersion != cachedVersion || forceKeyframe),lock.withLock({aliveLocked && availabilityGeneration==generation}) else{return nil}
+                let result=try encoder!.encode(cached,quality:quality,fps:fps,forceKeyframe:forceKeyframe || resized || recoveryRequired)
+                let accepted=lock.withLock{()->Bool in guard aliveLocked && availabilityGeneration==generation else{return false};encoded &+= 1;if frame==nil{cachedEncodes &+= 1};hardware=encoder!.hardware;return true}
+                // Inactivity may race an encode and an immediate same-size wake.
+                // Never publish the stale result or let the next P-frame depend
+                // on it. Request only an IDR, not a transport/debt/epoch reset.
+                guard accepted else{recoveryRequired=true;return nil}
+                recoveryRequired=false;encodedVersion=cachedVersion;return result
             }catch{lock.withLock{if !cancelled{failure="Emulator raw H.264 encoding failed"};ready=false;available=false;latest=nil};cached=nil;encoder?.close();encoder=nil;notify();throw error}
         }}
     }

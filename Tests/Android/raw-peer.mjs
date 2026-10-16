@@ -9,7 +9,7 @@ function protoFields(b){const r={};let i=0;function read(){let v=0n,s=0n;for(let
 const streams=new Set(),sessions=new Set(),server=http2.createServer();let connection=0;
 server.on('session',s=>{sessions.add(s);s.on('error',()=>{});s.on('close',()=>sessions.delete(s))});
 server.on('stream',(s,h)=>{
- const id=++connection;streams.add(s);s.on('error',()=>{});let body=Buffer.alloc(0),seq=0,timer,initial=true,wasInactive=false;
+ const id=++connection;streams.add(s);s.on('error',()=>{});let body=Buffer.alloc(0),seq=0,timer,initial=true,wasInactive=false,lastRevision;
  s.on('data',b=>{body=Buffer.concat([body,b]);if(body.length>1024)s.close()});
  s.on('close',()=>{streams.delete(s);clearTimeout(timer);record({kind:'raw-close',id})});
  s.on('end',()=>{
@@ -24,7 +24,7 @@ server.on('stream',(s,h)=>{
   if(init.grpcError){s.end();return}
   function send(){
    if(s.destroyed)return;const m=mode();if(m.eof){s.end();return}
-   if(m.noInitial || (m.static && !initial) || (m.inactive && wasInactive)){timer=setTimeout(send,25);return}
+   if(m.noInitial || (m.static && !initial && !wasInactive && m.revision===lastRevision) || (m.inactive && wasInactive)){timer=setTimeout(send,25);return}
    let proto;
    if(m.inactive){proto=Buffer.alloc(0);wasInactive=true}
    else{
@@ -45,7 +45,7 @@ server.on('stream',(s,h)=>{
     proto=Buffer.concat([bytes(1,format),bytes(4,raw),field(5,m.duplicate?0:seq),field(6,BigInt(Date.now())*1000n)]);
    }
    const header=Buffer.alloc(5);header[0]=m.compressed?1:0;header.writeUInt32BE(m.oversize?33554432+65537:proto.length,1);
-   const packet=Buffer.concat([header,proto]);record({kind:'raw-frame',id,seq,inactive:!!m.inactive,bytes:proto.length});seq++;initial=false;
+   const packet=Buffer.concat([header,proto]);record({kind:'raw-frame',id,seq,inactive:!!m.inactive,bytes:proto.length});seq++;initial=false;lastRevision=m.revision;
    s.write(packet.subarray(0,2));s.write(packet.subarray(2,17));s.write(packet.subarray(17));
    timer=setTimeout(send,1000/(m.fps??60));
   }send();
