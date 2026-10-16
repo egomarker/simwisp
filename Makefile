@@ -103,3 +103,7 @@ test-android-jpeg-surface:
 .PHONY: test-android-jpeg
 test-android-jpeg: test-android-jpeg-surface
 	@ANDROID_JPEG=1 NODE='$(NODE)' Tests/Android/run.sh
+
+.PHONY: test-android-raw
+test-android-raw:
+	@ANDROID_RAW=1 NODE='$(NODE)' Tests/Android/run.sh

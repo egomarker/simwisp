@@ -12,6 +12,11 @@ final class StreamSession: @unchecked Sendable {
     private let makeCapture: (DeviceWindow) -> WindowCapture
     private let scrcpyInstallation: ScrcpySession.Installation
     private let jpegInstallation: AndroidJPEGSession.Installation
+    private let rawDiscovery: AndroidRawSession.Discovery
+    private var raw: AndroidRawSession?
+    private var rawFinish: (() -> Void)?
+    private var rawRetiring = false, rawFailed = false
+    private var rawAvailable: Bool?
     private var jpeg: AndroidJPEGSession?
     private var jpegFinish: (() -> Void)?
     private var jpegRetiring = false, jpegFailed = false
@@ -37,8 +42,9 @@ final class StreamSession: @unchecked Sendable {
     private var lastScrcpyWindowSize: ScrcpyVideoSize?
     private var pendingScrcpySize: ScrcpyVideoSize?
     private var scrcpySizeChangedAt = 0.0
-    // Service replacement must also join the JPEG helper and its encoder.
-    var usesScrcpy: Bool { scrcpy != nil || backendRetiring || jpeg != nil || jpegRetiring }
+    // Service replacement must join every independent Android source/encoder.
+    var usesScrcpy: Bool { scrcpy != nil || backendRetiring || jpeg != nil || jpegRetiring || raw != nil || rawRetiring }
+    private var independentCapture: String? { backendChoice.capture == .raw ? "raw" : backendChoice.capture == .jpeg ? "jpeg" : nil }
     private var isAndroid: Bool { devices.device(id)?.platform == "android" }
 
     private let nativeInputWorker: DispatchQueue
@@ -74,8 +80,8 @@ final class StreamSession: @unchecked Sendable {
     private let accessibility: AccessibilitySession
     private var started = monotonic()
     var onClose: (() -> Void)?
-    init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
-        self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation
+    init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
+        self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation; self.rawDiscovery = rawDiscovery
         backendChoice = AndroidBackendChoice(capture: request.query["capture_backend"], input: request.query["input_backend"])
         initialScrcpySize = ScrcpyVideoSize(width:Int(request.query["w"] ?? "") ?? 0,height:Int(request.query["h"] ?? "") ?? 0) ?? .headless
         if let w=Int(request.query["w"] ?? ""), let h=Int(request.query["h"] ?? ""), (1...8192).contains(w), (1...8192).contains(h) { inputSizeHint=(w,h) }
@@ -87,7 +93,7 @@ final class StreamSession: @unchecked Sendable {
         accessibility = AccessibilitySession(serial: id, platform: devices.device(id)?.platform ?? "ios", executable: devices.adb, queue: queue, lifecycle: lifecycle) { [weak client] value, completion in client?.sendJSON(value, completion: completion) }
     }
     private var accessibilityStreamReady: Bool {
-        !closed && !paused && captureHasFrame && lastError == nil && ((isAndroid && effectiveCapture == "scrcpy" && scrcpy?.state.ready == true && scrcpy?.state.error == nil) || (isAndroid && effectiveCapture == "jpeg" && jpeg?.state.ready == true && jpeg?.state.error == nil) || (capture != nil && capture?.failure == nil && capture?.hasFrame == true && devices.window(id) != nil))
+        !closed && !paused && captureHasFrame && lastError == nil && ((isAndroid && effectiveCapture == "scrcpy" && scrcpy?.state.ready == true && scrcpy?.state.error == nil) || (isAndroid && effectiveCapture == "jpeg" && jpeg?.state.ready == true && jpeg?.state.error == nil) || (isAndroid && effectiveCapture == "raw" && raw?.state.ready == true && raw?.state.error == nil) || (capture != nil && capture?.failure == nil && capture?.hasFrame == true && devices.window(id) != nil))
     }
     private func reconcileAccessibility() {
         // Avoid capture/discovery locks when no pane is requested. No new timer.
@@ -104,7 +110,7 @@ final class StreamSession: @unchecked Sendable {
         timer.setEventHandler { [weak self] in self?.tick() }; timer.resume(); self.timer = timer
     }
     var snapshot: [String: Any] {
-        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "data_saver": dataSaver, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (captureHasFrame ? "Streaming" : "Starting")), "uptime": Int(monotonic() - started), "capture_counters": effectiveCapture == "scrcpy" ? (scrcpy?.diagnostics ?? [:]) : effectiveCapture == "jpeg" ? (jpeg?.diagnostics ?? [:]) : (capture?.counters ?? [:]), "input_counters": effectiveInput == "scrcpy" ? (scrcpy?.inputDiagnostics ?? [:]) : [:], "sent_fps": sentFPS, "target_fps": flow.targetFPS, "last_encode_ms": lastEncodeMS, "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending, "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS, "accessibility": accessibility.snapshot, "android_backends": isAndroid ? backendSnapshot : [:]]
+        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "data_saver": dataSaver, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (captureHasFrame ? "Streaming" : "Starting")), "uptime": Int(monotonic() - started), "capture_counters": effectiveCapture == "scrcpy" ? (scrcpy?.diagnostics ?? [:]) : effectiveCapture == "jpeg" ? (jpeg?.diagnostics ?? [:]) : effectiveCapture == "raw" ? (raw?.diagnostics ?? [:]) : (capture?.counters ?? [:]), "input_counters": effectiveInput == "scrcpy" ? (scrcpy?.inputDiagnostics ?? [:]) : [:], "sent_fps": sentFPS, "target_fps": flow.targetFPS, "last_encode_ms": lastEncodeMS, "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending, "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS, "accessibility": accessibility.snapshot, "android_backends": isAndroid ? backendSnapshot : [:]]
     }
     // One-shot deadlines avoid quantizing 16.67 ms frames onto 16 ms polling
     // ticks. Local encode/write completions wake it; receiver RTT never gates
@@ -124,6 +130,8 @@ final class StreamSession: @unchecked Sendable {
                 if jpeg?.canEncode(dataSaver:dataSaver,forceKeyframe:forceKeyframe) == true {
                     deadline = min(deadline, max(now, flow.nextFrame))
                 }
+            } else if effectiveCapture == "raw" && backendResolved {
+                if raw?.canEncode(dataSaver:dataSaver,forceKeyframe:forceKeyframe) == true { deadline=min(deadline,max(now,flow.nextFrame)) }
             } else { deadline = min(deadline, max(now, max(nextFrame, flow.nextFrame))) }
         }
         timer?.schedule(deadline: .now() + max(0.0001, deadline - now), leeway: .microseconds(100))
@@ -143,8 +151,10 @@ final class StreamSession: @unchecked Sendable {
             if paused { return }
             guard prepareAndroid() else { nextFrame = now + 0.25; return }
             if backendChoice.capture == .jpeg { guard prepareJPEG() else { return } }
+            if backendChoice.capture == .raw { guard prepareRaw() else { return } }
             if effectiveCapture == "unavailable" { notifyError(backendReason ?? "Android capture unavailable");nextFrame=now+0.5;return }
             if effectiveCapture == "jpeg" { encodeJPEG();return }
+            if effectiveCapture == "raw" { encodeRaw();return }
             if effectiveCapture == "scrcpy" {
                 guard !sending else { return }
                 guard flow.hasCapacity else { flow.congested(now:now);scrcpy?.requestKeyframe();return }
@@ -197,8 +207,8 @@ final class StreamSession: @unchecked Sendable {
         }
     }
     private func deliver(_ frame: H264Frame, epoch: UInt32) {
-        if isAndroid && (effectiveCapture == "scrcpy" || effectiveCapture == "jpeg") && (lastVideoSize.0 != frame.width || lastVideoSize.1 != frame.height) {
-            if effectiveCapture == "jpeg" && lastVideoSize.0>0 { scrcpy?.invalidatePhysicalSize() }
+        if isAndroid && (effectiveCapture == "scrcpy" || effectiveCapture == "jpeg" || effectiveCapture == "raw") && (lastVideoSize.0 != frame.width || lastVideoSize.1 != frame.height) {
+            if (effectiveCapture == "jpeg" || effectiveCapture == "raw") && lastVideoSize.0>0 { scrcpy?.invalidatePhysicalSize() }
             lastVideoSize=(frame.width,frame.height);client.sendJSON(["type":"rotated","landscape":frame.width>frame.height])
         }
         let packetBytes = frame.payload.count + 24
@@ -277,7 +287,7 @@ final class StreamSession: @unchecked Sendable {
         ["type":"android_backends","capture":backendChoice.capture.rawValue,"input":backendChoice.input.rawValue,
          "effective_capture":effectiveCapture,"effective_input":effectiveInput,"available":backendAvailable as Any? ?? NSNull(),
          "reason":backendReason as Any? ?? NSNull(),"version":ScrcpyWire.version,
-         "jpeg_available":jpegAvailable as Any? ?? NSNull(),"jpeg_quality":AndroidJPEGWire.quality]
+         "jpeg_available":jpegAvailable as Any? ?? NSNull(),"jpeg_quality":AndroidJPEGWire.quality,"raw_available":rawAvailable as Any? ?? NSNull()]
     }
     private func publishBackends() { client.sendJSON(backendSnapshot) }
     private func releaseAndroid(completion: @escaping () -> Void = {}) {
@@ -288,6 +298,7 @@ final class StreamSession: @unchecked Sendable {
     }
     private func resetAndroid() {
         releaseJPEG();jpegFailed=false;jpegAvailable=nil
+        releaseRaw();rawFailed=false;rawAvailable=nil
         pendingInput.removeAll();input.cancel(id);backendResolved=false;captureHasFrame=false;captureFallback=nil;backendReason=nil
         effectiveCapture="starting";effectiveInput="starting";releaseAndroid();publishBackends()
     }
@@ -304,7 +315,7 @@ final class StreamSession: @unchecked Sendable {
         return lastScrcpyWindowSize ?? initialScrcpySize
     }
     private func prepareAndroid() -> Bool {
-        if backendRetiring || jpegRetiring { return false }
+        if backendRetiring || jpegRetiring || rawRetiring { return false }
         if let source=scrcpy {
             let s=source.state
             backendAvailable=s.installed
@@ -314,16 +325,16 @@ final class StreamSession: @unchecked Sendable {
                     captureFallback=error;backendReason="Capture: "+error;backendResolved=false;releaseAndroid();return false
                 }
                 backendReason=(captureFallback.map { "Capture: "+$0+"; " } ?? "")+error
-                effectiveCapture=backendChoice.capture == .jpeg ? "jpeg" : backendChoice.capture == .scrcpy ? "unavailable":"current"
+                effectiveCapture=independentCapture ?? (backendChoice.capture == .scrcpy ? "unavailable":"current")
                 effectiveInput=backendChoice.input == .scrcpy ? "unavailable":"current"
                 backendResolved=true;releaseAndroid();publishBackends();return true
             }
             if !s.ready || (source.video && s.size.0==0) {
-                if monotonic()-backendStarted>12 { backendReason="scrcpy startup timed out";effectiveCapture=backendChoice.capture == .jpeg ? "jpeg" : backendChoice.capture == .scrcpy ? "unavailable":"current";effectiveInput=backendChoice.input == .scrcpy ? "unavailable":"current";backendResolved=true;releaseAndroid();publishBackends();return true }
+                if monotonic()-backendStarted>12 { backendReason="scrcpy startup timed out";effectiveCapture=independentCapture ?? (backendChoice.capture == .scrcpy ? "unavailable":"current");effectiveInput=backendChoice.input == .scrcpy ? "unavailable":"current";backendResolved=true;releaseAndroid();publishBackends();return true }
                 return false
             }
             if !backendResolved {
-                effectiveCapture=source.video ? "scrcpy" : backendChoice.capture == .jpeg ? "jpeg":"current";effectiveInput=backendChoice.input == .current ? "current":"scrcpy"
+                effectiveCapture=source.video ? "scrcpy" : independentCapture ?? "current";effectiveInput=backendChoice.input == .current ? "current":"scrcpy"
                 backendResolved=true;backendReason=captureFallback.map{"Capture fell back: "+$0};publishBackends()
             }
             if source.video {
@@ -338,8 +349,8 @@ final class StreamSession: @unchecked Sendable {
             return true
         }
         if backendResolved { return true }
-        if (backendChoice.capture == .current || backendChoice.capture == .jpeg) && backendChoice.input == .current {
-            effectiveCapture=backendChoice.capture == .jpeg ? "jpeg":"current";effectiveInput="current";backendResolved=true;publishBackends()
+        if (backendChoice.capture == .current || independentCapture != nil) && backendChoice.input == .current {
+            effectiveCapture=independentCapture ?? "current";effectiveInput="current";backendResolved=true;publishBackends()
             if !backendProbePending {
                 backendProbePending=true;lifecycle.enter();let done=lifecycle
                 worker.async { [weak self] in
@@ -350,11 +361,11 @@ final class StreamSession: @unchecked Sendable {
             return true
         }
         guard let adb=devices.adb else {
-            backendReason="Android SDK adb is unavailable";effectiveCapture=(backendChoice.capture == .scrcpy || backendChoice.capture == .jpeg) ? "unavailable":"current";effectiveInput=backendChoice.input == .scrcpy ? "unavailable":"current";backendResolved=true;publishBackends();return true
+            backendReason="Android SDK adb is unavailable";effectiveCapture=(backendChoice.capture == .scrcpy || independentCapture != nil) ? "unavailable":"current";effectiveInput=backendChoice.input == .scrcpy ? "unavailable":"current";backendResolved=true;publishBackends();return true
         }
         if capture != nil { releaseCapture() }
         scrcpyFPS=flow.fps;scrcpyQuality=flow.quality;backendStarted=monotonic();lastScrcpyGeneration=nil
-        let source=ScrcpySession(adb:adb,serial:id,video:backendChoice.capture != .current && backendChoice.capture != .jpeg && captureFallback == nil,controls:backendChoice.input != .current,fps:scrcpyFPS,quality:scrcpyQuality,videoSize:desiredScrcpySize(),network:queue,lifecycle:lifecycle,installation:scrcpyInstallation)
+        let source=ScrcpySession(adb:adb,serial:id,video:backendChoice.capture != .current && independentCapture == nil && captureFallback == nil,controls:backendChoice.input != .current,fps:scrcpyFPS,quality:scrcpyQuality,videoSize:desiredScrcpySize(),network:queue,lifecycle:lifecycle,installation:scrcpyInstallation)
         scrcpy=source;scrcpyFinish=beginCaptureWork()
         source.onChange={ [weak self,weak source] in guard let self,let source,!self.closed,self.scrcpy === source else{return};self.nextFrame=monotonic();self.tick() }
         source.start();publishBackends();return false
@@ -423,6 +434,62 @@ final class StreamSession: @unchecked Sendable {
                     self.jpegFailed=true;self.jpegAvailable=false;self.effectiveCapture="unavailable"
                     self.backendReason=error.localizedDescription;self.notifyError(error.localizedDescription)
                     self.releaseJPEG();self.publishBackends()
+                }
+            }
+        }
+    }
+    private func releaseRaw() {
+        guard let old=raw else{return};raw=nil;captureHasFrame=false;rawRetiring=true
+        let finish=rawFinish;rawFinish=nil
+        old.stop{[weak self] in finish?();self?.rawRetiring=false;self?.reschedule()}
+    }
+    private func prepareRaw()->Bool {
+        if rawRetiring{return false}
+        if rawFailed{effectiveCapture="unavailable";return true}
+        if let source=raw {
+            let state=source.state
+            if let error=state.error {
+                rawFailed=true;rawAvailable=false;effectiveCapture="unavailable";backendReason=error
+                releaseRaw();publishBackends();return true
+            }
+            let desired=desiredScrcpySize(),now=monotonic()
+            if min(EmulatorRawWire.maxEdge,desired.maxSize)==source.maxSize{pendingScrcpySize=nil}
+            else if pendingScrcpySize != desired{pendingScrcpySize=desired;scrcpySizeChangedAt=now}
+            if pendingScrcpySize != nil && now-scrcpySizeChangedAt>=0.35 {
+                pendingScrcpySize=nil;requestKeyframe(newEpoch:true);releaseRaw();return false
+            }
+            // FPS/quality changes affect only local encoding, not raw capture.
+            guard state.ready else{captureHasFrame=false;return false}
+            if rawAvailable != true{rawAvailable=true;effectiveCapture="raw";publishBackends()}
+            return true
+        }
+        if capture != nil{releaseCapture()}
+        rawAvailable=nil;requestKeyframe(newEpoch:true)
+        let source=AndroidRawSession(serial:id,maxSize:desiredScrcpySize().maxSize,network:queue,lifecycle:lifecycle,discovery:rawDiscovery)
+        raw=source;rawFinish=beginCaptureWork()
+        source.onChange={ [weak self,weak source] in guard let self,let source,!self.closed,self.raw === source else{return};self.tick() }
+        source.start();publishBackends();return false
+    }
+    private func encodeRaw() {
+        guard !encoding,!sending,!paused,let source=raw,source.canEncode(dataSaver:dataSaver,forceKeyframe:forceKeyframe) else{return}
+        let now=monotonic();guard flow.hasCapacity else{flow.congested(now:now);return}
+        guard flow.beginFrame(now:now,maintainCadence:true) else{return};encoding=true
+        let q=quality,f=fps,key=forceKeyframe,saver=dataSaver,epoch=videoEpoch
+        worker.async{[weak self] in
+            let start=monotonic(),result=Result{try source.h264(quality:q,fps:f,forceKeyframe:key,dataSaver:saver)}
+            guard let self else{return}
+            self.queue.async{
+                self.encoding=false;self.lastEncodeMS=(monotonic()-start)*1000
+                defer{self.reconcileAccessibility();self.reschedule()}
+                guard !self.closed,!self.paused,self.raw === source,self.videoEpoch==epoch else{return}
+                switch result {
+                case .success(let frame):
+                    guard let frame else{return}
+                    if self.lastVideoSize != (frame.width,frame.height){self.videoEpoch &+= 1;self.forceKeyframe=true}
+                    self.deliver(frame,epoch:self.videoEpoch)
+                case .failure(let error):
+                    self.rawFailed=true;self.rawAvailable=false;self.effectiveCapture="unavailable";self.backendReason=error.localizedDescription
+                    self.notifyError(error.localizedDescription);self.releaseRaw();self.publishBackends()
                 }
             }
         }
@@ -514,7 +581,7 @@ final class StreamSession: @unchecked Sendable {
     func stop(completion: @escaping () -> Void = {}) {
         if !closed {
             closed = true; accessibility.stop()
-            timer?.cancel(); timer = nil; pendingInput.removeAll(); input.cancel(id); releaseAndroid(); releaseJPEG(); releaseCapture(); onClose?(); onClose = nil
+            timer?.cancel(); timer = nil; pendingInput.removeAll(); input.cancel(id); releaseAndroid(); releaseJPEG(); releaseRaw(); releaseCapture(); onClose?(); onClose = nil
         }
         // Await only this device's capture work, including an in-flight configure.
         // Other simulator captures do not delay or get stopped by this request.

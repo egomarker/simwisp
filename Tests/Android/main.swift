@@ -29,6 +29,8 @@ let peer=Process();peer.executableURL=URL(fileURLWithPath:node);peer.arguments=[
 func wait(_ label:String,_ test:()->Bool)throws{let end=monotonic()+10;while monotonic()<end{if test(){return};Thread.sleep(forTimeInterval:0.01)};throw WispError("Timeout: "+label)}
 try wait("fixture peer"){fm.fileExists(atPath:root.appendingPathComponent("peer.json").path)}
 
+let rawPeer=Process();rawPeer.executableURL=URL(fileURLWithPath:node);rawPeer.arguments=[URL(fileURLWithPath:fm.currentDirectoryPath).appendingPathComponent("Tests/Android/raw-peer.mjs").path,root.path];rawPeer.standardOutput=FileHandle.nullDevice;rawPeer.standardError=FileHandle.standardError;try rawPeer.run()
+try wait("owned raw HTTP2 peer"){fm.fileExists(atPath:root.appendingPathComponent("raw-peer.json").path)}
 if CommandLine.arguments.contains("--serve") {
     // Real native service, fake discovery/capture/input/ADB. Nothing can reach a host device.
     var settings=Settings();settings.port=45154;settings.projectDirectory=root.path;settings.androidSDK=root.appendingPathComponent("sdk").path;settings.pairingToken="isolated-android-backends"
@@ -65,11 +67,11 @@ if CommandLine.arguments.contains("--serve") {
         @MainActor func stopCapture()async throws{}
         @MainActor func removeStreamOutput(_ output:any SCStreamOutput,type:SCStreamOutputType)throws{}
     }
-    let service=Service(settings:settings,pairingStateURL:root.appendingPathComponent("pairing-state.json"),tlsDirectory:root.appendingPathComponent("tls"),devices:devices,input:fakeInput,metroEndpoint:URL(string:"http://127.0.0.1:45154/fixture/empty-metro")!,scrcpyInstallation:{if fm.fileExists(atPath:root.appendingPathComponent("unavailable").path){throw WispError("scrcpy fixture unavailable <img src=x onerror=bad>")};return try installation()},jpegInstallation:{if fm.fileExists(atPath:root.appendingPathComponent("jpeg-unavailable").path){throw WispError("JPEG fixture unavailable <img src=x onerror=bad>")};return jar.path},makeCapture:{w in WindowCapture(target:w,makeStream:{c in FakeStream(c,sample!)})})
+    let service=Service(settings:settings,pairingStateURL:root.appendingPathComponent("pairing-state.json"),tlsDirectory:root.appendingPathComponent("tls"),devices:devices,input:fakeInput,metroEndpoint:URL(string:"http://127.0.0.1:45154/fixture/empty-metro")!,scrcpyInstallation:{if fm.fileExists(atPath:root.appendingPathComponent("unavailable").path){throw WispError("scrcpy fixture unavailable <img src=x onerror=bad>")};return try installation()},jpegInstallation:{if fm.fileExists(atPath:root.appendingPathComponent("jpeg-unavailable").path){throw WispError("JPEG fixture unavailable <img src=x onerror=bad>")};return jar.path},rawDiscovery:{_ in if fm.fileExists(atPath:root.appendingPathComponent("raw-unavailable").path){throw WispError("Raw fixture unavailable <img src=x onerror=bad>")};return try rawFixtureEndpoint(root)},makeCapture:{w in WindowCapture(target:w,makeStream:{c in FakeStream(c,sample!)})})
     service.stateChanged={state in if state=="Running"{print("Isolated Android service ready");fflush(stdout)}}
-    try service.start();let signal=DispatchSource.makeSignalSource(signal:SIGTERM,queue:.main);Darwin.signal(SIGTERM,SIG_IGN);signal.setEventHandler{service.stop{peer.terminate();peer.waitUntilExit();exit(0)}};signal.resume();dispatchMain()
+    try service.start();let signal=DispatchSource.makeSignalSource(signal:SIGTERM,queue:.main);Darwin.signal(SIGTERM,SIG_IGN);signal.setEventHandler{service.stop{peer.terminate();peer.waitUntilExit();rawPeer.terminate();rawPeer.waitUntilExit();exit(0)}};signal.resume();dispatchMain()
 }
-defer{if peer.isRunning{peer.terminate();peer.waitUntilExit()}}
+defer{if peer.isRunning{peer.terminate();peer.waitUntilExit()};if rawPeer.isRunning{rawPeer.terminate();rawPeer.waitUntilExit()}}
 var checks=0
 func expect(_ value:Bool,_ name:String){if !value{fatalError(name)};checks+=1}
 func rejects(_ name:String,_ body:()throws->Void){do{try body();fatalError("Accepted "+name)}catch{checks+=1}}
@@ -255,3 +257,4 @@ expect(!events.contains{($0["args"] as? [String])?.contains("kill-server")==true
 try jsonData(["checks":checks,"real_device_actions":false,"real_capture":false,"real_input":false]).write(to:root.appendingPathComponent("native-review.json"))
 print("Android backend native checks: \(checks) passed")
 try runJPEGTests(root:root,adb:adb,jar:jar)
+try runRawTests(root:root)

@@ -4,8 +4,8 @@ import CoreMedia
 // Private wire protocol, deliberately pinned to the installed/tested server tag.
 // v5 adds session packets and moves CONFIG/KEY to bits 62/61 (not older scrcpy framing).
 enum AndroidBackendMode: String, CaseIterable { case auto, scrcpy, current }
-// JPEG is capture-only and deliberately excluded from Auto/input resolution.
-enum AndroidCaptureMode: String, CaseIterable { case auto, scrcpy, current, jpeg }
+// JPEG and emulator-host raw are capture-only, manual opt-ins; Auto is unchanged.
+enum AndroidCaptureMode: String, CaseIterable { case auto, scrcpy, current, jpeg, raw }
 struct AndroidBackendChoice: Equatable {
     var capture: AndroidCaptureMode = .auto
     var input: AndroidBackendMode = .auto
