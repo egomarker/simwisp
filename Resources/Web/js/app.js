@@ -473,7 +473,7 @@ async function reconcileDeviceAction(action, version) {
 async function handleDeviceStop(id) {
   if (!canStopDevices || stoppingIds.has(id)) return;
   const device = allSims.find(s => s.id === id);
-  if (!device) return;
+  if (!device || (device.platform === 'android' && !device.id.startsWith('emulator-'))) return;
   const sharedApp = device.platform === 'ios' ? '\nSimulator may also quit if no iOS devices or windows remain.' : '';
   if (!window.confirm(`Stop ${device.name}?\nThis shuts down the simulator. Unsaved app state may be lost.${sharedApp}`)) return;
   stoppingIds.add(id);
@@ -504,7 +504,11 @@ function renderDeviceList() {
   updateKeyboardPlaceholder();
   $('device-count').textContent = allSims.length;
   const filterOn = projFilter.checked;
-  const sims = filterOn ? allSims.filter(s => s.project_app) : allSims;
+  const isReal = s => s.physical === true || (s.platform === 'android' && !s.id.startsWith('emulator-'));
+  // Stable grouping on every render (including cache/filter/refresh); never
+  // mutate discovery order, panel focus or relative order within either group.
+  const sims = (filterOn ? allSims.filter(s => s.project_app) : [...allSims])
+    .sort((a, b) => Number(isReal(b)) - Number(isReal(a)));
   const adbHint = !hasAdb
     ? '<div class="device-list-hint">🤖 <span>No <code>adb</code> — install Android Studio for Android</span></div>'
     : '';
@@ -526,7 +530,7 @@ function renderDeviceList() {
     }</div>${adbHint}`;
     return;
   }
-  deviceList.innerHTML = bootingRows + sims.map(s => `
+  const rows = sims.map(s => `
     <div class="device-row" aria-busy="${stoppingIds.has(s.id)}">
     <button type="button" class="device-item${simPanels.has(s.id) ? ' active' : ''}"
         aria-pressed="${simPanels.has(s.id)}" title="${esc(s.name)}" ${stoppingIds.has(s.id) ? 'disabled' : ''}
@@ -536,15 +540,17 @@ function renderDeviceList() {
       <span class="device-icon">${simIcon(s.name)}</span>
       <span class="device-info">
         <span class="device-name">${esc(s.name)}</span>
-        <span class="device-dims">${stoppingIds.has(s.id) ? 'Stopping…' : `${s.platform === 'android' ? 'Android' : 'iOS'} · ${s.width && s.height ? `${s.width} × ${s.height}` : 'Emulator'}`}</span>
+        <span class="device-dims">${stoppingIds.has(s.id) ? 'Stopping…' : `${s.platform === 'android' ? (s.physical ? 'Android device' : 'Android') : 'iOS'} · ${s.width && s.height ? `${s.width} × ${s.height}` : s.physical ? 'Connected' : 'Emulator'}`}</span>
       </span>
       ${s.project_app ? '<span class="device-badge" title="Project app installed">★</span>' : ''}
       ${simPanels.has(s.id) ? '<span class="device-open-indicator" aria-hidden="true"></span>' : ''}
     </button>
-    ${canStopDevices ? `<button type="button" class="device-stop-btn" data-stop-id="${esc(s.id)}" title="${stoppingIds.has(s.id) ? 'Stopping…' : 'Stop simulator'}" aria-label="Stop ${esc(s.name)}" ${stoppingIds.has(s.id) ? 'disabled' : ''}>
+    ${canStopDevices && !(s.platform === 'android' && !s.id.startsWith('emulator-')) ? `<button type="button" class="device-stop-btn" data-stop-id="${esc(s.id)}" title="${stoppingIds.has(s.id) ? 'Stopping…' : 'Stop simulator'}" aria-label="Stop ${esc(s.name)}" ${stoppingIds.has(s.id) ? 'disabled' : ''}>
       ${stoppingIds.has(s.id) ? '<span class="add-spinner" aria-hidden="true"></span>' : '<svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M10 2v7M5 4.5a7 7 0 1 0 10 0"/></svg>'}
     </button>` : ''}
-    </div>`).join('') + adbHint;
+    </div>`);
+  const realCount = sims.filter(isReal).length;
+  deviceList.innerHTML = rows.slice(0, realCount).join('') + bootingRows + rows.slice(realCount).join('') + adbHint;
 
   deviceList.querySelectorAll('button.device-stop-btn').forEach(el => {
     el.addEventListener('click', () => handleDeviceStop(el.dataset.stopId));
@@ -605,7 +611,8 @@ function addSimPanel(udid, name, w, h, platform) {
 
   frameEl.append(canvasEl, overlayEl);
 
-  const pillEl = createPill(udid, name, platform);
+  const physical = platform === 'android' && !udid.startsWith('emulator-');
+  const pillEl = createPill(udid, name, platform, physical);
   stageEl.appendChild(frameEl);
   panelEl.append(stageEl, pillEl);
 
@@ -619,14 +626,14 @@ function addSimPanel(udid, name, w, h, platform) {
     stream: null, panelEl, stageEl, frameEl, canvasEl, name,
     overlayEl, pillEl, dotEl, statsEl,
     statusEl: pillEl.querySelector('.panel-status'),
-    platform,
+    platform, physical,
     accessibility: null, backends: null,
     ro: null, appearMode: 'dark', twoFingerMode: false,
   };
   simPanels.set(udid, panel);
   if (platform === 'android') {
-    const identity = allSims.find(s => s.id === udid)?.avd || name;
-    panel.backends = new AndroidBackends(pillEl.querySelector('.backend-trigger'), name, identity, choices => panel.stream?.switchBackends(choices));
+    const identity = physical ? 'device:' + udid : allSims.find(s => s.id === udid)?.avd || name;
+    panel.backends = new AndroidBackends(pillEl.querySelector('.backend-trigger'), name, identity, choices => panel.stream?.switchBackends(choices), { physical });
     const button = pillEl.querySelector('[data-action="accessibility"]');
     // Optional assets and pane are created only on an explicit first open.
     const firstOpen = async () => {
@@ -915,7 +922,7 @@ function updateStreamVisibility() {
 }
 
 // ── Controls pill (per panel) ─────────────────────────────────────────────────
-function createPill(udid, name, platform) {
+function createPill(udid, name, platform, physical = false) {
   const pill = document.createElement('div');
   pill.className = 'controls-pill';
   pill.innerHTML = `
@@ -979,6 +986,7 @@ function createPill(udid, name, platform) {
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true" focusable="false"><rect x="3.5" y="3" width="17" height="18" rx="3" stroke="currentColor" stroke-width="1.7"/><path d="M7 9l3 3-3 3M12.5 15H17M8 6.5h8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
     </div>`;
+  if (physical) pill.querySelectorAll('[data-action="rotate"], [data-action="appear"]').forEach(button => button.remove());
   pill.querySelector('.panel-telemetry').title = name;
   pill.querySelector('.panel-actions').setAttribute('aria-label', name + ' controls');
   pill.querySelectorAll('button').forEach(button => button.setAttribute('aria-label', button.title));
@@ -990,6 +998,7 @@ function createPill(udid, name, platform) {
     const panel  = simPanels.get(udid);
 
     setFocusedPanel(udid);
+    if (panel?.physical && ['rotate', 'appear'].includes(action)) return;
 
     switch (action) {
       case 'metro-console': openDeviceConsole(udid).catch(() => deviceActionMessage('Console could not load; retry.', true)); break;

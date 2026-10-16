@@ -12,7 +12,9 @@ func makeJPEGFixtures(_ root:URL)throws {
         guard let b=context.jpegRepresentation(of:marker.composited(over:background),colorSpace:space,options:[kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption:0.70]) else{throw WispError("Cannot make synthetic JPEG")}
         return b.base64EncodedString()
     }
-    try jsonData(["portrait":try (0..<60).map{try jpeg(320,640,$0)},"landscape":try jpeg(640,320,0)]).write(to:root.appendingPathComponent("jpeg.json"))
+    var scaled: [String: Any] = [:]
+    for (w,h) in [(80,160),(160,320),(270,600)] { scaled[String(h)] = ["width":w,"height":h,"portrait":try jpeg(w,h,0),"landscape":try jpeg(h,w,0)] }
+    try jsonData(["portrait":try (0..<60).map{try jpeg(320,640,$0)},"landscape":try jpeg(640,320,0),"scaled":scaled]).write(to:root.appendingPathComponent("jpeg.json"))
 }
 func runJPEGTests(root:URL,adb:URL,jar:URL)throws {
     let fm=FileManager.default;var checks=0

@@ -108,6 +108,10 @@ test-android-jpeg: test-android-jpeg-surface
 test-raw-cpu:
 	@Tests/Android/run-raw-benchmark.sh
 
+.PHONY: test-android-physical
+test-android-physical:
+	@ANDROID_PHYSICAL=1 NODE='$(NODE)' Tests/Android/run.sh
+
 .PHONY: test-android-raw
 test-android-raw:
 	@ANDROID_RAW=1 NODE='$(NODE)' Tests/Android/run.sh

@@ -13,6 +13,10 @@ public final class Surface {
         check(Arrays.equals(JpegPixels.scaledSize(8,16384,4096),new int[]{8,4096}),"minimum dimensions");
         check(Arrays.equals(JpegPixels.scaledSize(100,200,4096),new int[]{100,200}),"never upscale");
         for(int[] invalid:new int[][]{{0,100,914},{100,7,914},{16385,100,914},{100,100,7},{100,100,4097}})reject(()->JpegPixels.scaledSize(invalid[0],invalid[1],invalid[2]));
+        for(int divisor:new int[]{1,2,4}) {
+            check(Arrays.equals(JpegPixels.scaledSize(1080,2400,2400/divisor),new int[]{1080/divisor,2400/divisor}),"phone scale before JPEG compression");
+            check(Arrays.equals(JpegPixels.scaledSize(2400,1080,2400/divisor),new int[]{2400/divisor,1080/divisor}),"phone rotation preserves scale");
+        }
         Random random=new Random(17030);
         for(int i=0;i<500;i++){
             int w=8+random.nextInt(128),h=8+random.nextInt(128),pad=random.nextInt(16)*4,stride=w*4+pad,offset=random.nextInt(16);

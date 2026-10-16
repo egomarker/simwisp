@@ -12,8 +12,9 @@ struct Device: Codable {
     // Backend-only alias; keep the AVD name/serial and public inventory unchanged.
     var metroName: String? = nil
     var avd: String? = nil
+    var physicalAndroid: Bool { platform == "android" && !id.hasPrefix("emulator-") }
     private enum CodingKeys: String, CodingKey { case id, name, platform, width, height, project_app, avd }
-    var json: [String: Any] { ["id": id, "name": name, "platform": platform, "width": width, "height": height, "project_app": project_app, "avd": avd as Any? ?? NSNull()] }
+    var json: [String: Any] { ["id": id, "name": name, "platform": platform, "width": width, "height": height, "project_app": project_app, "avd": avd as Any? ?? NSNull(), "physical": physicalAndroid] }
 }
 // React Native's Android device label is Build.MODEL + release + SDK_INT,
 // not the emulator's AVD name. Read once per existing tool-cache refresh on the
@@ -34,9 +35,53 @@ enum AndroidMetroIdentity {
     }
     static func read(adb: String, serial: String,
                      run: (String, [String], Double) throws -> CommandResult = { try command($0, $1, timeout: $2) }) -> String? {
-        guard DeviceControl.validID(serial, platform: "android"),
+        guard DeviceControl.validADBSerial(serial),
               let result = try? run(adb, ["-s", serial, "shell", properties], 3), result.status == 0 else { return nil }
         return name(result.output)
+    }
+}
+// Inventory policy shared by live discovery and inert tests. Offline and
+// unauthorized entries never become selectors. Duplicate/malformed inventories
+// fail closed rather than choosing an ambiguous transport.
+enum AndroidDeviceInventory {
+    static func connected(_ data: Data) -> [String] {
+        guard data.count <= 65536, let text = String(data: data, encoding: .utf8) else { return [] }
+        let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        guard lines.first == "List of devices attached", lines.count <= 257 else { return [] }
+        var seen = Set<String>(), result = [String]()
+        for line in lines.dropFirst() {
+            let fields = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            guard fields.count >= 2, seen.insert(fields[0]).inserted,
+                  ["device", "offline", "unauthorized", "bootloader", "recovery", "sideload", "rescue", "host", "connecting"].contains(fields[1]) || (fields[1] == "no" && fields.dropFirst(2).first == "permissions") else { return [] }
+            if fields[1] == "device", DeviceControl.validADBSerial(fields[0]) { result.append(fields[0]) }
+        }
+        return result
+    }
+    static func displaySize(_ data: Data) -> (Int, Int)? {
+        guard data.count <= 1024, let text = String(data: data, encoding: .utf8) else { return nil }
+        var size: (Int, Int)?
+        for line in text.components(separatedBy: .newlines) {
+            let p = line.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: ": ")
+            guard p.count == 2, ["Physical size", "Override size"].contains(p[0]) else { continue }
+            let values = p[1].split(separator: "x", omittingEmptySubsequences: false)
+            guard values.count == 2, values.allSatisfy({ !$0.isEmpty && $0.utf8.allSatisfy { (48...57).contains($0) } }),
+                  let w = Int(values[0]), let h = Int(values[1]), (8...8192).contains(w), (8...8192).contains(h) else { return nil }
+            size = (w, h)
+        }
+        return size
+    }
+    static func read(adb: String, run: (String, [String], Double) throws -> CommandResult = { try command($0, $1, timeout: $2) }) -> [Device] {
+        guard let result = try? run(adb, ["devices"], 3), result.status == 0 else { return [] }
+        return connected(result.output).map { serial in
+            let metro = AndroidMetroIdentity.read(adb: adb, serial: serial, run: run)
+            if DeviceControl.validID(serial, platform: "android") {
+                let avd = (try? run(adb, ["-s", serial, "emu", "avd", "name"], 3)).flatMap { $0.status == 0 ? $0.text.components(separatedBy: .newlines).first : nil } ?? serial
+                return Device(id: serial, name: avd.replacingOccurrences(of: "_", with: " "), platform: "android", width: 0, height: 0, metroName: metro, avd: avd)
+            }
+            let model = metro?.components(separatedBy: " - ").first ?? serial
+            let display = (try? run(adb, ["-s", serial, "shell", "wm", "size"], 3)).flatMap { $0.status == 0 ? displaySize($0.output) : nil }
+            return Device(id: serial, name: model, platform: "android", width: display?.0 ?? 0, height: display?.1 ?? 0, metroName: metro)
+        }
     }
 }
 struct DeviceWindow: Equatable {
@@ -170,7 +215,7 @@ final class Devices {
             }
             for var device in androidCache {
                 let port = device.id.replacingOccurrences(of: "emulator-", with: "")
-                if let info = hostWindows.first(where: { ($0[kCGWindowOwnerName as String] as? String ?? "").lowercased().hasPrefix("qemu-system") && ($0[kCGWindowName as String] as? String ?? "").hasSuffix(":" + port) && Self.bounds($0).width > 100 }), let window = makeWindow(info, ios: false) {
+                if !device.physicalAndroid, let info = hostWindows.first(where: { ($0[kCGWindowOwnerName as String] as? String ?? "").lowercased().hasPrefix("qemu-system") && ($0[kCGWindowName as String] as? String ?? "").hasSuffix(":" + port) && Self.bounds($0).width > 100 }), let window = makeWindow(info, ios: false) {
                     mapped[device.id] = window
                     // Same Quartz crop geometry used for iOS, capture, and HID
                     // input; Android's internal ADB display size is unrelated.
@@ -178,7 +223,7 @@ final class Devices {
                 }
                 devices.append(device)
             }
-            let runningNames = Set(androidCache.map { $0.name.replacingOccurrences(of: " ", with: "_") })
+            let runningNames = Set(androidCache.filter { !$0.physicalAndroid }.map { $0.name.replacingOccurrences(of: " ", with: "_") })
             library += avds.filter { !runningNames.contains($0) }.map { ["id": $0, "name": $0.replacingOccurrences(of: "_", with: " "), "platform": "android"] }
             lock.lock(); running = devices; available = library; windows = mapped; lock.unlock()
         }
@@ -219,17 +264,8 @@ final class Devices {
         return nil
     }
     private func androidDevices() -> [Device] {
-        guard let adb, let result = try? command(adb, ["devices"], timeout: 3) else { return [] }
-        return result.text.split(separator: "\n").compactMap { line in
-            let columns = line.split(whereSeparator: { $0.isWhitespace })
-            guard columns.count >= 2, columns[1] == "device", columns[0].hasPrefix("emulator-") else { return nil }
-            let serial = String(columns[0])
-            let title = (try? command(adb, ["-s", serial, "emu", "avd", "name"], timeout: 3).text.components(separatedBy: .newlines).first) ?? serial
-            // Unknown until a matching Quartz window is found. Do not present
-            // ADB's physical/override resolution as the streamed window size.
-            return Device(id: serial, name: title.replacingOccurrences(of: "_", with: " "), platform: "android", width: 0, height: 0,
-                          metroName: AndroidMetroIdentity.read(adb: adb, serial: serial), avd: title)
-        }
+        guard let adb else { return [] }
+        return AndroidDeviceInventory.read(adb: adb)
     }
     func boot(_ id: String) throws {
         if let bootOverride { try bootOverride(id); invalidate(); return }

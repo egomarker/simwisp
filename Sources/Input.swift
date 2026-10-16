@@ -121,6 +121,7 @@ final class DeviceInput {
         return true
     }
     private func adb(_ id: String, _ args: [String]) throws -> CommandResult {
+        guard DeviceControl.validADBSerial(id), devices.device(id)?.platform == "android" else { throw WispError("Invalid or unavailable Android device") }
         guard let adb = devices.adb else { throw WispError("Android SDK adb unavailable") }
         let result = try command(adb, Self.adbArguments(id, args), timeout: 8)
         if result.status != 0 { throw WispError(String(decoding: result.error, as: UTF8.self)) }
@@ -151,6 +152,9 @@ final class DeviceInput {
     private func handle(_ m: [String: Any], id: String) throws -> [String: Any]? {
         if let handlerOverride { return try handlerOverride(m, id) }
         guard let type = m["type"] as? String, let device = devices.device(id) else { throw WispError("Device is not available") }
+        // Physical input belongs exclusively to the persistent control socket.
+        // Never synthesize Mac HID, emulator rotation or legacy ADB fallbacks.
+        guard !device.physicalAndroid else { throw WispError("Physical Android input requires its scrcpy control connection") }
         let android = device.platform == "android"
         let window = devices.window(id)
         func number(_ key: String) -> Double { clamp((m[key] as? NSNumber)?.doubleValue ?? 0) }

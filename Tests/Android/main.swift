@@ -36,10 +36,23 @@ if CommandLine.arguments.contains("--serve") {
     var settings=Settings();settings.port=45154;settings.projectDirectory=root.path;settings.androidSDK=root.appendingPathComponent("sdk").path;settings.pairingToken="isolated-android-backends"
     let devices=Devices(settings:settings,discovery:{
         let serial=(try? String(contentsOf:root.appendingPathComponent("serial"),encoding:.utf8)) ?? "emulator-5554"
-        let headless=fm.fileExists(atPath:root.appendingPathComponent("headless").path)
+        if fm.fileExists(atPath:root.appendingPathComponent("device-offline").path) { return ([],[],[:]) }
+        if let data=try? Data(contentsOf:root.appendingPathComponent("sidebar-inventory.json")) {
+            let inventory = [Device(id:"ios-sidebar",name:"A simulator",platform:"ios",width:320,height:640,project_app:true),
+                Device(id:"USBPHYSICALTEST123",name:"Z USB phone",platform:"android",width:1080,height:2400,project_app:true),
+                Device(id:"emulator-5554",name:"B emulator",platform:"android",width:320,height:640),
+                Device(id:"adb-PHYSICAL-TEST._adb-tls-connect._tcp",name:"Y Wi-Fi phone",platform:"android",width:1080,height:2400)]
+            return (dictionary(data)["reverse"] as? Bool == true ? Array(inventory.reversed()) : inventory, [], [:])
+        }
+        let physical = !serial.hasPrefix("emulator-")
+        let headless=physical || fm.fileExists(atPath:root.appendingPathComponent("headless").path)
         let dimensions=(try? Data(contentsOf:root.appendingPathComponent("window-size.json"))).map(dictionary) ?? [:]
         let width=(dimensions["width"] as? Int) ?? 320,height=(dimensions["height"] as? Int) ?? 640
         let win=DeviceWindow(id:123,pid:0,title:"fixture",bounds:CGRect(x:0,y:0,width:width,height:height),crop:CGRect(x:0,y:0,width:width,height:height))
+        if physical {
+            let display=(try? Data(contentsOf:root.appendingPathComponent("physical-size.json"))).map(dictionary) ?? [:]
+            return ([Device(id:serial,name:"Phone fixture",platform:"android",width:display["width"] as? Int ?? 1080,height:display["height"] as? Int ?? 2400)],[],[:])
+        }
         return ([Device(id:serial,name:"Pixel fixture",platform:"android",width:headless ? 0:width,height:headless ? 0:height,avd:"Pixel_fixture")],[],headless ? [:]:[serial:win])
     })
     let fakeInput=DeviceInput(devices:devices,handler:{m,id in
@@ -72,6 +85,8 @@ if CommandLine.arguments.contains("--serve") {
     try service.start();let signal=DispatchSource.makeSignalSource(signal:SIGTERM,queue:.main);Darwin.signal(SIGTERM,SIG_IGN);signal.setEventHandler{service.stop{peer.terminate();peer.waitUntilExit();rawPeer.terminate();rawPeer.waitUntilExit();exit(0)}};signal.resume();dispatchMain()
 }
 defer{if peer.isRunning{peer.terminate();peer.waitUntilExit()};if rawPeer.isRunning{rawPeer.terminate();rawPeer.waitUntilExit()}}
+// Dedicated phone target skips legacy emulator traffic; the default suite retains it.
+if ProcessInfo.processInfo.environment["ANDROID_PHYSICAL"] != "1" {
 var checks=0
 func expect(_ value:Bool,_ name:String){if !value{fatalError(name)};checks+=1}
 func rejects(_ name:String,_ body:()throws->Void){do{try body();fatalError("Accepted "+name)}catch{checks+=1}}
@@ -258,3 +273,5 @@ try jsonData(["checks":checks,"real_device_actions":false,"real_capture":false,"
 print("Android backend native checks: \(checks) passed")
 try runJPEGTests(root:root,adb:adb,jar:jar)
 try runRawTests(root:root)
+}
+try runPhysicalTests(root:root,node:node)

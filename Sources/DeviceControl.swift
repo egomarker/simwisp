@@ -81,6 +81,16 @@ final class DeviceControl {
               let port = Int(id.dropFirst(9)), (1...65535).contains(port) else { return false }
         return id == "emulator-\(port)"
     }
+    // Opaque ADB selectors, never shell fragments. This does NOT grant Stop:
+    // validID above deliberately remains emulator-only for destructive actions.
+    static func validADBSerial(_ id: String) -> Bool {
+        guard (1...255).contains(id.utf8.count) else { return false }
+        if id.hasPrefix("emulator-") { return validID(id, platform: "android") }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-[]%")
+        guard id.unicodeScalars.allSatisfy({ allowed.contains($0) }), let first = id.utf8.first,
+              (48...57).contains(first) || (65...90).contains(first) || (97...122).contains(first) || first == 91 else { return false }
+        return true
+    }
     private func checked(_ path: String, _ args: [String], timeout: Double) throws -> CommandResult {
         let result = try run(path, args, timeout)
         guard result.status == 0 else {

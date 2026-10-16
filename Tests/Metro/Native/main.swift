@@ -46,7 +46,7 @@ for serial in ["emulator-5554", "emulator-5556"] {
  expect(label == androidName, "read-only tool result supplies alias")
 }
 expect(calls.count == 2, "no unscoped or extra per-property command")
-for serial in ["", "emulator-05554", "emulator-5554;evil", "physical-device", "emulator-70000"] {
+for serial in ["", "emulator-05554", "emulator-5554;evil", "-physical-device", "emulator-70000"] {
  expect(AndroidMetroIdentity.read(adb:"/owned/adb",serial:serial,run:{_,_,_ in fatalError("invalid serial executed tool")}) == nil, "invalid serial never queried")
 }
 expect(AndroidMetroIdentity.read(adb:"/owned/adb",serial:b.id,run:{_,_,_ in CommandResult(status:1,output:properties,error:Data())}) == nil, "nonzero command result never supplies alias")

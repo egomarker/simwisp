@@ -117,7 +117,7 @@ final class ScrcpySession: @unchecked Sendable {
     }
     private var isCancelled: Bool { lock.withLock { cancelled } }
     private func tool(_ args: [String], timeout: Double = 4) throws -> CommandResult {
-        guard !lock.withLock({cancelled || stopping}), DeviceControl.validID(serial,platform:"android") else { throw WispError("Invalid or cancelled scrcpy session") }
+        guard !lock.withLock({cancelled || stopping}), DeviceControl.validADBSerial(serial) else { throw WispError("Invalid or cancelled scrcpy session") }
         let r = try run(adb,["-s",serial]+args,timeout);guard r.status==0 else{throw WispError("scrcpy ADB operation failed")};return r
     }
     static func arguments(version: String, scid: String, jar: String, video: Bool, controls: Bool, fps: Int, quality: Int, videoSize: ScrcpyVideoSize = .headless) -> [String] {
@@ -144,7 +144,8 @@ final class ScrcpySession: @unchecked Sendable {
                 notify();lifecycle.leave();work.leave()
             }
             do {
-                guard DeviceControl.validID(serial,platform:"android") else{throw WispError("Invalid Android serial")}
+                guard DeviceControl.validADBSerial(serial) else{throw WispError("Invalid Android serial")}
+                guard !video || DeviceControl.validID(serial,platform:"android") else{throw WispError("Physical Android devices use JPEG capture; scrcpy video is emulator-only")}
                 guard video || controls else{throw WispError("No scrcpy demand")}
                 let install=try installation();guard install.version==ScrcpyWire.version else{throw WispError("Unsupported scrcpy protocol")};lock.withLock{installed=true}
                 // Android's VBR quality floor otherwise rewrites the requested bitrate/QP.
@@ -275,6 +276,7 @@ final class ScrcpySession: @unchecked Sendable {
             // Appearance retains its existing serial-scoped command. Everything
             // else in this allowlist uses only the persistent control socket.
             guard ["touch_down","touch_move","touch_up","tap","drag","accessibility_swipe","key","text","home","back","menu","app_switcher","rotate"].contains(type) else{return false}
+            guard type != "rotate" || DeviceControl.validID(serial,platform:"android") else{throw WispError("Rotate the physical device itself")}
             guard let c=lock.withLock({!cancelled && !stopping && ready && failure==nil ? control:nil}) else{throw WispError("scrcpy input is not ready")}
             func n(_ key:String)->Double{clamp((m[key] as? NSNumber)?.doubleValue ?? 0)}
             func touch(_ action:UInt8,_ x:Double,_ y:Double,_ second:Bool=false)throws {

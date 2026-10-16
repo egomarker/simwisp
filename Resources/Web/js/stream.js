@@ -63,7 +63,7 @@ export class SimStream {
     this.#onBackends = onBackends ?? (() => {});
 
     this.settings = { fps, quality, data_saver, dev_w: canvas.width, dev_h: canvas.height };
-    if (backends) Object.assign(this.settings, { capture_backend: backends.capture, input_backend: backends.input });
+    if (backends) Object.assign(this.settings, { capture_backend: backends.capture, input_backend: backends.input, jpeg_scale: backends.scaling });
 
     this.#setupPointer();
     this.#connect();
@@ -84,7 +84,7 @@ export class SimStream {
 
   switchBackends(choices) {
     this.#cancelPointer();
-    Object.assign(this.settings, { capture_backend: choices.capture, input_backend: choices.input });
+    Object.assign(this.settings, { capture_backend: choices.capture, input_backend: choices.input, jpeg_scale: choices.scaling });
     // Reconnect only this device. Native retirement releases input and joins the
     // old server before the replacement starts; old socket callbacks are ignored.
     this.#connect();
@@ -305,7 +305,7 @@ export class SimStream {
     this.#firstFrame = false; this.#captureUnavailable = false; this.#liveTouch = false;
     this.#onStatus('connecting');
     const ws = new WebSocket(
-      `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/${this.#udid}?fps=${this.settings.fps}&quality=${this.settings.quality}&w=${this.#portraitW}&h=${this.#portraitH}&data_saver=${this.settings.data_saver ? 1 : 0}${this.settings.capture_backend ? '&capture_backend=' + encodeURIComponent(this.settings.capture_backend) + '&input_backend=' + encodeURIComponent(this.settings.input_backend) : ''}`
+      `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/${encodeURIComponent(this.#udid)}?fps=${this.settings.fps}&quality=${this.settings.quality}&w=${this.#portraitW}&h=${this.#portraitH}&data_saver=${this.settings.data_saver ? 1 : 0}${this.settings.capture_backend ? '&capture_backend=' + encodeURIComponent(this.settings.capture_backend) + '&input_backend=' + encodeURIComponent(this.settings.input_backend) : ''}${this.settings.jpeg_scale ? '&jpeg_scale=' + encodeURIComponent(this.settings.jpeg_scale) : ''}`
     );
     this.#ws = ws; ws.binaryType = 'arraybuffer';
     this.#connectTimer = setTimeout(() => {

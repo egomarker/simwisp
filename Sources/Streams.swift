@@ -45,7 +45,9 @@ final class StreamSession: @unchecked Sendable {
     // Service replacement must join every independent Android source/encoder.
     var usesScrcpy: Bool { scrcpy != nil || backendRetiring || jpeg != nil || jpegRetiring || raw != nil || rawRetiring }
     private var independentCapture: String? { backendChoice.capture == .raw ? "raw" : backendChoice.capture == .jpeg ? "jpeg" : nil }
-    private var isAndroid: Bool { devices.device(id)?.platform == "android" }
+    private let physicalAndroid: Bool
+    private let jpegScale: AndroidJPEGScale
+    private var isAndroid: Bool { physicalAndroid || devices.device(id)?.platform == "android" }
 
     private let nativeInputWorker: DispatchQueue
     private let worker: DispatchQueue
@@ -82,7 +84,13 @@ final class StreamSession: @unchecked Sendable {
     var onClose: (() -> Void)?
     init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
         self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation; self.rawDiscovery = rawDiscovery
+        physicalAndroid = devices.device(id)?.physicalAndroid == true
+        jpegScale = physicalAndroid ? .normalized(request.query["jpeg_scale"]) : .full
         backendChoice = AndroidBackendChoice(capture: request.query["capture_backend"], input: request.query["input_backend"])
+        if physicalAndroid {
+            if backendChoice.capture == .auto { backendChoice.capture = .jpeg }
+            if backendChoice.input == .auto { backendChoice.input = .scrcpy }
+        }
         initialScrcpySize = ScrcpyVideoSize(width:Int(request.query["w"] ?? "") ?? 0,height:Int(request.query["h"] ?? "") ?? 0) ?? .headless
         if let w=Int(request.query["w"] ?? ""), let h=Int(request.query["h"] ?? ""), (1...8192).contains(w), (1...8192).contains(h) { inputSizeHint=(w,h) }
         self.id = id; self.client = client; self.devices = devices; self.input = input; self.queue = queue; self.lifecycle = lifecycle
@@ -146,6 +154,15 @@ final class StreamSession: @unchecked Sendable {
             // TCP cannot retract old bytes. Reconnect rather than retain seconds
             // of stale video or an indefinitely blocked local write.
             client.close(); return
+        }
+        if physicalAndroid && devices.device(id) == nil {
+            if effectiveCapture != "unavailable" || effectiveInput != "unavailable" {
+                releaseAndroid(); releaseJPEG(); captureHasFrame=false; jpegFailed=true; backendResolved=true
+                effectiveCapture="unavailable"; effectiveInput="unavailable"
+                backendReason="Android device disconnected, offline or unauthorized; reconnect and reopen this view"
+                publishBackends()
+            }
+            notifyError(backendReason ?? "Android device unavailable"); return
         }
         if isAndroid {
             if paused { return }
@@ -286,7 +303,7 @@ final class StreamSession: @unchecked Sendable {
     private var backendSnapshot: [String: Any] {
         ["type":"android_backends","capture":backendChoice.capture.rawValue,"input":backendChoice.input.rawValue,
          "effective_capture":effectiveCapture,"effective_input":effectiveInput,"available":backendAvailable as Any? ?? NSNull(),
-         "reason":backendReason as Any? ?? NSNull(),"version":ScrcpyWire.version,
+         "reason":backendReason as Any? ?? NSNull(),"version":ScrcpyWire.version,"physical":physicalAndroid,"jpeg_scale":jpegScale.rawValue,
          "jpeg_available":jpegAvailable as Any? ?? NSNull(),"jpeg_quality":AndroidJPEGWire.quality,"raw_available":rawAvailable as Any? ?? NSNull()]
     }
     private func publishBackends() { client.sendJSON(backendSnapshot) }
@@ -303,6 +320,10 @@ final class StreamSession: @unchecked Sendable {
         effectiveCapture="starting";effectiveInput="starting";releaseAndroid();publishBackends()
     }
     private func desiredScrcpySize() -> ScrcpyVideoSize {
+        if physicalAndroid {
+            if let device=devices.device(id), let size=ScrcpyVideoSize(width:device.width,height:device.height) { return size }
+            return initialScrcpySize
+        }
         // Use authoritative host crop geometry, not dev_w/dev_h decoder-size
         // feedback (which would feed codec alignment back into the next budget).
         if let crop=devices.window(id)?.crop,
@@ -315,6 +336,15 @@ final class StreamSession: @unchecked Sendable {
         return lastScrcpyWindowSize ?? initialScrcpySize
     }
     private func prepareAndroid() -> Bool {
+        // Native capability boundary: hiding browser radios is not enough.
+        if physicalAndroid && (backendChoice.capture != .jpeg || backendChoice.input != .scrcpy) {
+            if !backendResolved {
+                backendReason="Physical Android devices require JPEG capture and scrcpy input"
+                effectiveCapture="unavailable";effectiveInput="unavailable";backendResolved=true
+                publishBackends();notifyError(backendReason!)
+            }
+            return false
+        }
         if backendRetiring || jpegRetiring || rawRetiring { return false }
         if let source=scrcpy {
             let s=source.state
@@ -376,6 +406,10 @@ final class StreamSession: @unchecked Sendable {
         let finish=jpegFinish;jpegFinish=nil
         old.stop { [weak self] in finish?();self?.jpegRetiring=false;self?.reschedule() }
     }
+    private func desiredJPEGMaxSize() -> Int {
+        let nativeEdge = desiredScrcpySize().maxSize
+        return physicalAndroid ? jpegScale.maxSize(nativeEdge: nativeEdge) : min(AndroidJPEGWire.maxEdge, nativeEdge)
+    }
     private func prepareJPEG() -> Bool {
         if jpegRetiring { return false }
         if jpegFailed { effectiveCapture="unavailable";return true }
@@ -385,7 +419,7 @@ final class StreamSession: @unchecked Sendable {
                 backendReason=error;releaseJPEG();publishBackends();return true
             }
             let desired=desiredScrcpySize(),now=monotonic()
-            if min(AndroidJPEGWire.maxEdge,desired.maxSize)==source.maxSize { pendingScrcpySize=nil }
+            if desiredJPEGMaxSize()==source.maxSize { pendingScrcpySize=nil }
             else if pendingScrcpySize != desired { pendingScrcpySize=desired;scrcpySizeChangedAt=now }
             let resized=pendingScrcpySize != nil && now-scrcpySizeChangedAt>=0.35
             // Keep the producer at the USER cap. Network adaptation only changes
@@ -404,7 +438,7 @@ final class StreamSession: @unchecked Sendable {
         }
         if capture != nil { releaseCapture() }
         backendStarted=monotonic();jpegAvailable=nil;requestKeyframe(newEpoch: true)
-        let source=AndroidJPEGSession(adb:adb,serial:id,fps:flow.targetFPS,maxSize:desiredScrcpySize().maxSize,network:queue,lifecycle:lifecycle,installation:jpegInstallation)
+        let source=AndroidJPEGSession(adb:adb,serial:id,fps:flow.targetFPS,maxSize:desiredJPEGMaxSize(),network:queue,lifecycle:lifecycle,installation:jpegInstallation)
         jpeg=source;jpegFinish=beginCaptureWork()
         source.onChange={ [weak self,weak source] in guard let self,let source,!self.closed,self.jpeg === source else { return };self.tick() }
         source.start();publishBackends();return false
@@ -554,12 +588,16 @@ final class StreamSession: @unchecked Sendable {
                 self.drainInput()
             }
         }
+        if physicalAndroid && (devices.device(id) == nil || !["touch_down","touch_move","touch_up","tap","drag","accessibility_swipe","key","text","home","back","menu","app_switcher"].contains(data["type"] as? String ?? "")) {
+            completion(["type":"input_error","message":"Device unavailable or control unsupported on physical Android"]);return
+        }
         if isAndroid {
             guard !paused, backendResolved, effectiveInput != "unavailable", captureHasFrame, lastError == nil else { completion(["type":"input_error","message":backendReason ?? "Android stream is not ready"]);return }
             if effectiveInput == "scrcpy", data["type"] as? String != "appearance", !(data["type"] as? String == "rotate" && effectiveCapture == "current"), let source=scrcpy {
                 nativeInputWorker.async { [weak self] in
                     do {
                         if try source.perform(data) { completion(nil) }
+                        else if self?.physicalAndroid == true { completion(["type":"input_error","message":"Unsupported physical-device control"]) }
                         else { self?.input.perform(data,id:self?.id ?? "",completion:completion) }
                     } catch {completion(["type":"input_error","message":error.localizedDescription])}
                 };return
@@ -576,6 +614,7 @@ final class StreamSession: @unchecked Sendable {
                 }
             };return
         }
+        guard !physicalAndroid else { completion(["type":"input_error","message":"Physical Android input connection unavailable"]);return }
         input.perform(data, id:id, completion:completion)
     }
     func stop(completion: @escaping () -> Void = {}) {

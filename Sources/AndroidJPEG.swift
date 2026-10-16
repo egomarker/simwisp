@@ -3,6 +3,17 @@ import Darwin
 import CoreImage
 import ImageIO
 
+// Physical-device-only source scaling. The helper consumes this edge before
+// creating its Android mirror/Bitmap and compressing JPEG70; never Mac-side resize.
+enum AndroidJPEGScale: String, CaseIterable {
+    case full = "1", half = "0.5", quarter = "0.25"
+    static func normalized(_ value: String?) -> Self { Self(rawValue: value ?? "") ?? .full }
+    func maxSize(nativeEdge: Int) -> Int {
+        let edge = min(8192, max(8, nativeEdge))
+        let divisor = self == .full ? 1.0 : self == .half ? 2.0 : 4.0
+        return min(AndroidJPEGWire.maxEdge, max(8, Int((Double(edge) / divisor).rounded())))
+    }
+}
 // Independent JPEGs are safe to replace, unlike interdependent H.264 P-frames.
 struct AndroidJPEGFrame {
     let bytes: Data, sequence: UInt64, capturedNS: UInt64
@@ -110,7 +121,7 @@ final class AndroidJPEGSession: @unchecked Sendable {
                 lock.withLock{finished=true};notify();work.leave();lifecycle.leave()
             }
             do {
-                guard DeviceControl.validID(serial,platform:"android") else{throw WispError("Invalid emulator JPEG serial")}
+                guard DeviceControl.validADBSerial(serial) else{throw WispError("Invalid Android JPEG serial")}
                 let jar=try installation()
                 guard FileManager.default.isReadableFile(atPath:jar) else{throw WispError("Emulator JPEG helper is unreadable")}
                 let remote="/data/local/tmp/"+name
