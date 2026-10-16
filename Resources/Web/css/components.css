@@ -736,7 +736,8 @@
 .add-search { height: 36px; }
 .add-close-btn { width: 32px; height: 32px; }
 .add-boot-btn { width: 30px; height: 30px; }
-.panel-telemetry { display: flex; align-items: center; gap: 6px; min-width: 0; min-height: 15px; }
+/* The 28px Backends hit target fits into the padding/gap, not the row height. */
+.panel-telemetry { display: flex; align-items: center; gap: 6px; min-width: 0; height: 15px; }
 .panel-status { font-size: 10px; color: var(--text-secondary); }
 .panel-actions { display: flex; align-items: center; justify-content: center; gap: 3px; padding: 3px; border: 1px solid var(--border-subtle); border-radius: 8px; background: var(--bg-stage); }
 .panel-actions .pill-sep { height: 16px; margin: 0 3px; }

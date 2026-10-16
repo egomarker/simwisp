@@ -1,7 +1,7 @@
 import fs from 'node:fs';import path from 'node:path';import {spawn,execFileSync} from 'node:child_process';
 const root=process.argv[2];const source=fs.realpathSync(process.cwd());if(!root||process.platform!=='darwin'||typeof WebSocket==='undefined')throw Error('Run on macOS with Node22 and a private output directory');
 if(!fs.existsSync(source+'/Sources/Accessibility.swift'))throw Error('Run from the project root');
-const report={host:execFileSync('/bin/hostname',{encoding:'utf8'}).trim(),canonical:source,fixtures:true,liveAppRestarted:false,checks:[],screenshots:[]};
+const report={host:execFileSync('/bin/hostname',{encoding:'utf8'}).trim(),canonical:source,fixtures:true,liveAppRestarted:false,checks:[],screenshots:[],toolbarGeometry:[]};
 const base='https://127.0.0.1:45151';const delay=ms=>new Promise(r=>setTimeout(r,ms));
 const status=async()=>await(await fetch(base+'/fixture/status')).json();
 const profile=path.join(root,'chrome-profile');
@@ -75,6 +75,14 @@ try{
   await check(size.name+' Android has no iOS Shake control',"!document.querySelector('[data-action=shake]')");
   await check(size.name+' Android controls have the requested order',"[...document.querySelectorAll('.panel-actions button:not([hidden])')].map(b=>b.dataset.action).join(',')==='rotate,home,back,app-switcher,menu,appear,two-finger,accessibility,kbd,close'");
   await check(size.name+' Android controls fit and remain pointer accessible',"(()=>{const p=document.querySelector('.sim-panel').getBoundingClientRect(),a=document.querySelector('.panel-actions').getBoundingClientRect();return a.left>=p.left&&a.right<=p.right&&a.bottom<=innerHeight&&[...document.querySelectorAll('.pill-btn:not([hidden])')].every(b=>{const r=b.getBoundingClientRect();return r.width>=32&&r.height>=32&&r.left>=a.left&&r.right<=a.right&&b.contains(document.elementFromPoint(r.left+r.width/2,r.top+r.height/2))})&&document.documentElement.scrollWidth<=innerWidth+1})()");
+  const toolbar=await evaluate("(()=>{const h=s=>document.querySelector(s).getBoundingClientRect().height;return {telemetry:h('.panel-telemetry'),controls:h('.controls-pill'),actions:h('.panel-actions'),backend:h('.backend-trigger')}})()");
+  report.toolbarGeometry.push({viewport:size.name,platform:'android',...toolbar});
+  await nativeCheck(size.name+' Android telemetry matches the compact 15px iOS row',async()=>Math.abs(toolbar.telemetry-15)<.1);
+  await check(size.name+' Backends retains its full 28px hit target without overlapping actions',"(()=>{const b=document.querySelector('.backend-trigger'),r=b.getBoundingClientRect(),p=document.querySelector('.controls-pill').getBoundingClientRect(),a=document.querySelector('.panel-actions').getBoundingClientRect(),x=r.left+r.width/2;return r.height===28&&r.top>=p.top&&r.bottom<a.top&&[r.top+1,r.bottom-1].every(y=>b.contains(document.elementFromPoint(x,y)))})()");
+  await pointerClick('.backend-trigger');
+  await check(size.name+' compact Backends opens without growing the footer',"document.querySelector('.backend-trigger').getAttribute('aria-expanded')==='true'&&!document.querySelector('.backend-popover').hidden&&Math.abs(document.querySelector('.controls-pill').getBoundingClientRect().height-"+toolbar.controls+")<.1");
+  await resizeKey('Escape');
+  await check(size.name+' compact Backends Escape returns keyboard focus',"document.querySelector('.backend-popover').hidden&&document.activeElement===document.querySelector('.backend-trigger')");
   await nativeCheck(size.name+' Android navigation is never sent on startup',async()=>(await status()).sessions.find(s=>s.id==='emulator-5554').inputs===0);
   for(const [action,type,title] of [['back','back','Back'],['app-switcher','app_switcher','App switcher'],['menu','menu','Menu']]){
    const selector='[data-action='+action+']',before=(await status()).sessions.find(s=>s.id==='emulator-5554');
@@ -226,6 +234,7 @@ try{
   await check(size.name+' Shake icon is bounded, decorative and named',"(()=>{const b=document.querySelector('[data-action=shake]'),s=b.querySelector('svg'),r=s.getBBox();return b.title==='Shake (Control–Command–Z)'&&b.getAttribute('aria-label')===b.title&&s.getAttribute('aria-hidden')==='true'&&s.getAttribute('viewBox')==='0 0 20 20'&&r.x>=.8&&r.y>=.8&&r.x+r.width<=19.2&&r.y+r.height<=19.2})()");
   await check(size.name+' all bottom buttons fit and accept pointer input',"(()=>{const p=document.querySelector('.sim-panel').getBoundingClientRect(),a=document.querySelector('.panel-actions').getBoundingClientRect();return a.left>=p.left&&a.right<=p.right&&a.bottom<=innerHeight&&[...document.querySelectorAll('.pill-btn:not([hidden])')].every(b=>{const r=b.getBoundingClientRect();return r.width>=32&&r.height>=32&&r.left>=a.left&&r.right<=a.right&&b.contains(document.elementFromPoint(r.left+r.width/2,r.top+r.height/2))})&&document.documentElement.scrollWidth<=innerWidth+1})()");
   await check(size.name+' existing iOS controls retain their order',"[...document.querySelectorAll('.panel-actions button:not([hidden])')].map(b=>b.dataset.action).join(',')==='rotate,home,shake,app-switcher,appear,kbd,close'");
+  await check(size.name+' iOS telemetry remains the compact 15px reference',"Math.abs(document.querySelector('.panel-telemetry').getBoundingClientRect().height-15)<.1");
   await nativeCheck(size.name+' Shake is never sent on startup',async()=>(await iosInfo()).inputs===0);
   const before=await iosInfo();await pointerClick('[data-action=shake]');
   await nativeCheck(size.name+' pointer sends exactly one Shake on the iOS socket',async()=>{const s=await iosInfo();return s.inputs===before.inputs+1&&JSON.stringify(s.last_inputs.at(-1))==='{"type":"shake"}'});
@@ -273,6 +282,14 @@ try{
  await navigate(1440,1000,false);
  await click('.device-item[data-udid="ios-fixture"]');await wait("document.querySelectorAll('.sim-panel').length===2&&document.querySelector('.sim-panel[data-udid=ios-fixture] .panel-status').textContent==='Live'");
  await pointerClick('.sim-panel[data-udid="emulator-5554"] [data-action=home]');
+ for(const theme of ['light','dark']){
+  await click('[data-theme-choice='+theme+']');await wait("document.documentElement.dataset.theme==='"+theme+"'");
+  const bars=await evaluate("[...document.querySelectorAll('.sim-panel')].map(p=>({id:p.dataset.udid,controls:p.querySelector('.controls-pill').getBoundingClientRect().height,telemetry:p.querySelector('.panel-telemetry').getBoundingClientRect().height,actions:p.querySelector('.panel-actions').getBoundingClientRect().height}))");
+  report.toolbarGeometry.push({viewport:'mixed-desktop',theme,bars});
+  await nativeCheck(theme+' mixed desktop Android footer matches iOS height',async()=>bars.length===2&&Math.abs(bars[0].controls-bars[1].controls)<.1&&Math.abs(bars[0].telemetry-bars[1].telemetry)<.1&&Math.abs(bars[0].actions-bars[1].actions)<.1);
+  await shot('desktop-matched-footer-'+theme);
+ }
+ await click('[data-theme-choice=light]');
  const mixedBefore=await status(),androidBefore=mixedBefore.sessions.find(s=>s.id==='emulator-5554');
  await pointerClick('.sim-panel[data-udid="ios-fixture"] [data-action=shake]');
  await nativeCheck('Mixed panels send Shake only to iOS despite prior Android focus',async()=>{const s=await status(),a=s.sessions.find(p=>p.id==='emulator-5554'),i=s.sessions.find(p=>p.id==='ios-fixture');return a.inputs===androidBefore.inputs&&i.inputs===1&&i.last_inputs[0].type==='shake'});
