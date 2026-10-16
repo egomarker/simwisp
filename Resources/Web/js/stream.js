@@ -24,6 +24,8 @@ export class SimStream {
   #awaitingRecovery = false; #recoveryEpoch = null; #recoveryAt = 0;
   #latestFrame = null; #renderRAF = 0; #lastRenderedTimestamp = -1;
   #portraitW; #portraitH; #isLandscape = false;
+  // Emulator scrcpy's unscaled native budget must survive scaled/headless reconnects.
+  #scrcpyBaseSize = null; #effectiveCapture = null;
   #onStatus; #onFirstFrame; #onOrientationChange; #onRotateStart; #onRotateEnd;
   #onStats; #onAccessibility; #onStopped; #onBackends; #cancelPointer = () => {}; #statsTimer = null;
   #stats = { frames: 0, bytes: 0, dropped: 0, lastFrames: 0, lastBytes: 0, lastAt: 0, fps: 0, bps: 0, avgFrame: 0 };
@@ -270,6 +272,9 @@ export class SimStream {
         this.send({ type: 'settings', dev_w: width, dev_h: height });
         this.#onOrientationChange(width, height);
       } else { this.#setOrientation(landscape); }
+      // Once another backend supplies real unscaled pixels, resume its existing
+      // reconnect geometry; do not carry a scrcpy-only budget into later modes.
+      if (this.#scrcpyBaseSize && this.#effectiveCapture !== 'scrcpy') this.#scrcpyBaseSize = null;
       // Odd capture sizes have even 4:2:0 padding; never show that padding.
       this.#ctx.drawImage(frame, 0, 0, width, height, 0, 0, this.#canvas.width, this.#canvas.height);
       this.#lastRenderedTimestamp = frame.timestamp; this.#stats.frames++;
@@ -304,8 +309,9 @@ export class SimStream {
     }
     this.#firstFrame = false; this.#captureUnavailable = false; this.#liveTouch = false;
     this.#onStatus('connecting');
+    const sourceSize = this.#scrcpyBaseSize ?? { width: this.#portraitW, height: this.#portraitH };
     const ws = new WebSocket(
-      `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/${encodeURIComponent(this.#udid)}?fps=${this.settings.fps}&quality=${this.settings.quality}&w=${this.#portraitW}&h=${this.#portraitH}&data_saver=${this.settings.data_saver ? 1 : 0}${this.settings.capture_backend ? '&capture_backend=' + encodeURIComponent(this.settings.capture_backend) + '&input_backend=' + encodeURIComponent(this.settings.input_backend) : ''}${this.settings.jpeg_scale ? '&jpeg_scale=' + encodeURIComponent(this.settings.jpeg_scale) : ''}`
+      `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/${encodeURIComponent(this.#udid)}?fps=${this.settings.fps}&quality=${this.settings.quality}&w=${sourceSize.width}&h=${sourceSize.height}&data_saver=${this.settings.data_saver ? 1 : 0}${this.settings.capture_backend ? '&capture_backend=' + encodeURIComponent(this.settings.capture_backend) + '&input_backend=' + encodeURIComponent(this.settings.input_backend) : ''}${this.settings.jpeg_scale ? '&jpeg_scale=' + encodeURIComponent(this.settings.jpeg_scale) : ''}`
     );
     this.#ws = ws; ws.binaryType = 'arraybuffer';
     this.#connectTimer = setTimeout(() => {
@@ -343,6 +349,13 @@ export class SimStream {
         if (msg.type === 'device_stopping') {
           this.destroy(); this.#onStopped();
         } else if (msg.type === 'android_backends') {
+          this.#effectiveCapture = msg.effective_capture;
+          if (msg.physical === false && ['auto', 'scrcpy'].includes(msg.capture) &&
+              msg.capture === (this.settings.capture_backend ?? 'auto') && msg.input === (this.settings.input_backend ?? 'auto') &&
+              (msg.jpeg_scale ?? '1') === (this.settings.jpeg_scale ?? '1') &&
+              [msg.scrcpy_base_width, msg.scrcpy_base_height].every(n => Number.isInteger(n) && n >= 8 && n <= 8192)) {
+            this.#scrcpyBaseSize = { width: msg.scrcpy_base_width, height: msg.scrcpy_base_height };
+          }
           this.#onBackends(msg);
         } else if (msg.type === 'video_config') {
           this.#configureVideo(msg, ws);

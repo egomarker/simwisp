@@ -3,14 +3,17 @@ import Darwin
 import CoreImage
 import ImageIO
 
-// Physical-device-only source scaling. The helper consumes this edge before
-// creating its Android mirror/Bitmap and compressing JPEG70; never Mac-side resize.
-enum AndroidJPEGScale: String, CaseIterable {
+// Source scaling for physical JPEG/scrcpy and emulator scrcpy before guest encoding.
+// Scrcpy owns aspect-ratio/codec alignment and maps its video-space touch packets.
+enum AndroidCaptureScale: String, CaseIterable {
     case full = "1", half = "0.5", quarter = "0.25"
     static func normalized(_ value: String?) -> Self { Self(rawValue: value ?? "") ?? .full }
+    private var divisor: Double { self == .full ? 1 : self == .half ? 2 : 4 }
+    func scrcpySize(_ size: ScrcpyVideoSize) -> ScrcpyVideoSize {
+        ScrcpyVideoSize(width: max(8, Int((Double(size.width) / divisor).rounded())), height: max(8, Int((Double(size.height) / divisor).rounded())))!
+    }
     func maxSize(nativeEdge: Int) -> Int {
         let edge = min(8192, max(8, nativeEdge))
-        let divisor = self == .full ? 1.0 : self == .half ? 2.0 : 4.0
         return min(AndroidJPEGWire.maxEdge, max(8, Int((Double(edge) / divisor).rounded())))
     }
 }

@@ -4,15 +4,15 @@ let openMenu = null;
 const icon = content => `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${content}</svg>`;
 export const backendIcon = icon('<path d="M4 7h4m4 0h8M4 17h8m4 0h4"/><circle cx="10" cy="7" r="2"/><circle cx="14" cy="17" r="2"/>');
 export function backendChoice(value, physical = false) {
-  if (physical) return { capture: 'jpeg', scaling: MODES.scaling.includes(value?.scaling) ? value.scaling : '1', input: 'scrcpy' };
-  return { capture: MODES.capture.includes(value?.capture) ? value.capture : 'auto', input: MODES.input.includes(value?.input) ? value.input : 'auto' };
+  if (physical) return { capture: value?.capture === 'scrcpy' ? 'scrcpy' : 'jpeg', scaling: MODES.scaling.includes(value?.scaling) ? value.scaling : '1', input: 'scrcpy' };
+  return { capture: MODES.capture.includes(value?.capture) ? value.capture : 'auto', input: MODES.input.includes(value?.input) ? value.input : 'auto', scaling: MODES.scaling.includes(value?.scaling) ? value.scaling : '1' };
 }
 // Browser-local, stable AVD identity: neither credentials nor reusable ADB serials.
 export class AndroidBackends {
   #trigger; #menu; #choice; #key; #change; #physical; #modes; #listeners = []; #disposed = false;
   #state = { effective_capture: 'starting', effective_input: 'starting', available: false, reason: null };
   constructor(trigger, name, avd, change, { physical = false } = {}) {
-    this.#physical = physical; this.#modes = physical ? { capture: ['jpeg'], scaling: MODES.scaling, input: ['scrcpy'] } : { capture: MODES.capture, input: MODES.input };
+    this.#physical = physical; this.#modes = physical ? { capture: ['jpeg', 'scrcpy'], scaling: MODES.scaling, input: ['scrcpy'] } : { capture: MODES.capture, scaling: MODES.scaling, input: MODES.input };
     this.#trigger = trigger; this.#change = change;
     this.#key = PREFIX + encodeURIComponent(String(avd || name).slice(0, 256));
     try { this.#choice = backendChoice(JSON.parse(localStorage.getItem(this.#key)), physical); } catch { this.#choice = backendChoice(null, physical); }
@@ -21,9 +21,9 @@ export class AndroidBackends {
     menu.id = `android-backends-${++AndroidBackends.nextID}`;
     trigger.setAttribute('aria-controls', menu.id); trigger.setAttribute('aria-haspopup', 'dialog'); trigger.setAttribute('aria-expanded', 'false');
     const field = (kind, title, symbol, labels) => `<section class="backend-field"><div class="backend-field-heading"><span class="backend-field-label">${symbol}${title}</span><span class="backend-effective" data-effective="${kind}" aria-live="polite"></span></div><div class="backend-options${kind === 'capture' ? ' backend-capture-options' : ''}" role="radiogroup" aria-label="${title} backend">${this.#modes[kind].map(mode => `<button type="button" role="radio" aria-checked="false" tabindex="-1" data-kind="${kind}" data-choice="${mode}">${labels[MODES[kind].indexOf(mode)]}</button>`).join('')}</div></section>`;
-    menu.innerHTML = `<header class="backend-header"><div><h2>Android backends</h2><p class="backend-device"></p></div><button class="backend-close" type="button" aria-label="Close Android backends">${icon('<path d="m7 7 10 10M17 7 7 17"/>')}</button></header><div class="backend-availability"><span class="availability-dot"></span><span class="backend-availability-text"></span><span class="availability-caption">On this Mac</span></div><div class="backend-warning" role="status" hidden></div>${field('capture', 'Capture', icon('<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/>'), ['Auto', 'scrcpy', 'Mac window', 'JPEG', 'Raw'])}${physical ? field('scaling', 'Scaling', icon('<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M10 4v6H4m16 4h-6v6"/>'), ['x1', 'x0.5', 'x0.25']) : ''}${field('input', 'Input', icon('<path d="m6 3 12 10-6 1-3 6-3-17Z"/>'), ['Auto', 'scrcpy', 'Current'])}<p class="backend-explainer">Auto prefers scrcpy and falls back to the current method. JPEG and experimental Raw are manual-only. Raw uses the authenticated emulator-host RGBA API → Mac H.264, without JPEG.</p><footer class="backend-footer">${icon('<rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 18h4"/>')}<span>Only affects this emulator</span></footer>`;
+    menu.innerHTML = `<header class="backend-header"><div><h2>Android backends</h2><p class="backend-device"></p></div><button class="backend-close" type="button" aria-label="Close Android backends">${icon('<path d="m7 7 10 10M17 7 7 17"/>')}</button></header><div class="backend-availability"><span class="availability-dot"></span><span class="backend-availability-text"></span><span class="availability-caption">On this Mac</span></div><div class="backend-warning" role="status" hidden></div>${field('capture', 'Capture', icon('<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/>'), ['Auto', 'scrcpy', 'Mac window', 'JPEG', 'Raw'])}${field('scaling', 'Scaling', icon('<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M10 4v6H4m16 4h-6v6"/>'), ['x1', 'x0.5', 'x0.25'])}${field('input', 'Input', icon('<path d="m6 3 12 10-6 1-3 6-3-17Z"/>'), ['Auto', 'scrcpy', 'Current'])}<p class="backend-explainer">Auto prefers scrcpy and falls back to the current method. JPEG and experimental Raw are manual-only. Raw uses the authenticated emulator-host RGBA API → Mac H.264, without JPEG.</p><footer class="backend-footer">${icon('<rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 18h4"/>')}<span>Only affects this emulator</span></footer>`;
     if (physical) {
-      menu.querySelector('.backend-explainer').textContent = 'Physical Android devices use JPEG70 → Mac H.264 and scrcpy control-only input. Requires Android14+ and an already authorized USB or Wi-Fi ADB connection. Scaling resizes on Android before JPEG encoding and transmission; touch still uses the full display. Rotate the phone itself.';
+      menu.querySelector('.backend-explainer').textContent = 'Physical Android devices use JPEG70 → Mac H.264 (Android14+) or direct scrcpy H.264, with scrcpy input over an already authorized USB or Wi-Fi ADB connection. Scaling resizes on Android before JPEG/H.264 encoding and transmission; scrcpy may round for codec alignment. Touch maps to the full display. Rotate the phone itself.';
       menu.querySelector('.backend-footer span').textContent = 'Only affects this device';
     }
     menu.querySelector('.backend-device').textContent = name;
@@ -59,7 +59,7 @@ export class AndroidBackends {
     if (this.#disposed || value?.type !== 'android_backends') return;
     // Stale configuration messages must not undo a just-selected preference.
     if (value.capture !== this.#choice.capture || value.input !== this.#choice.input) return;
-    if (this.#physical && (value.jpeg_scale ?? '1') !== this.#choice.scaling) return;
+    if ((this.#physical || ['auto', 'scrcpy'].includes(this.#choice.capture)) && (value.jpeg_scale ?? '1') !== this.#choice.scaling) return;
     const allowed = ['starting','current','scrcpy','unavailable'];
     if (![...allowed,'jpeg','raw'].includes(value.effective_capture) || !allowed.includes(value.effective_input)) return;
     this.#state = { raw_available: typeof value.raw_available === 'boolean' ? value.raw_available : null, jpeg_available: typeof value.jpeg_available === 'boolean' ? value.jpeg_available : null, effective_capture: value.effective_capture, effective_input: value.effective_input, available: typeof value.available === 'boolean' ? value.available : null, reason: typeof value.reason === 'string' ? value.reason.slice(0, 1000) : null };
@@ -73,11 +73,14 @@ export class AndroidBackends {
     if (this.#physical && jpeg) m.querySelector('.backend-availability-text').textContent = available === true ? 'Android JPEG available' : available === false ? 'Android JPEG unavailable' : 'Checking Android JPEG…';
     for (const kind of Object.keys(this.#modes)) {
       if (kind === 'scaling') {
-        m.querySelector('[data-effective="scaling"]').textContent = 'Before JPEG';
+        const supported = this.#physical || this.#choice.capture === 'scrcpy' || (this.#choice.capture === 'auto' && s.effective_capture !== 'current');
+        const field = m.querySelector('[data-kind="scaling"]').closest('.backend-field');
+        field.hidden = !supported; field.style.display = supported ? '' : 'none';
+        m.querySelector('[data-effective="scaling"]').textContent = jpeg ? 'Before JPEG' : 'Before H.264';
         for (const b of m.querySelectorAll('[data-kind="scaling"]')) {
           const selected = b.dataset.choice === this.#choice.scaling;
           b.setAttribute('aria-checked', String(selected)); b.tabIndex = selected ? 0 : -1;
-          b.title = 'Resize both dimensions on Android by x' + b.dataset.choice + ' before JPEG encoding and transmission; input uses full display coordinates';
+          b.title = 'Resize both dimensions on Android by x' + b.dataset.choice + ' before ' + (jpeg ? 'JPEG' : 'H.264') + ' encoding and transmission; touch maps to the full display';
         }
         continue;
       }
@@ -86,7 +89,7 @@ export class AndroidBackends {
       badge.className = 'backend-effective' + (value === 'current' || value === 'starting' ? ' current' : value === 'unavailable' ? ' error' : '');
       for (const b of m.querySelectorAll(`[data-kind="${kind}"]`)) {
         const selected = b.dataset.choice === this.#choice[kind]; b.setAttribute('aria-checked', String(selected)); b.tabIndex = selected ? 0 : -1;
-        b.title = this.#physical ? kind === 'capture' ? 'Android JPEG quality70 → Mac H.264; Android14+ required' : 'Persistent scrcpy input only; no Android video encoder or shaping changes' : b.dataset.choice === 'raw' ? 'Experimental emulator-only authenticated RGBA stream; no JPEG. Local raw traffic may be large; CPU savings are not guaranteed' : b.dataset.choice === 'jpeg' ? 'Manual-only Android emulator JPEG quality70, decoded and encoded with Mac VideoToolbox; Android14+ required' : b.dataset.choice === 'current' ? kind === 'capture' ? 'ScreenCaptureKit window capture' : 'Mac mouse events + existing ADB commands' : b.dataset.choice === 'auto' ? 'Prefer compatible scrcpy; otherwise use the current method' : 'Always use scrcpy; report errors instead of falling back';
+        b.title = this.#physical ? kind === 'capture' ? b.dataset.choice === 'scrcpy' ? 'Direct Android H.264; no JPEG or Mac re-encode; codec support required' : 'Android JPEG quality70 → Mac H.264; Android14+ required' : 'Persistent scrcpy touch/keyboard/navigation; no clipboard, power or shaping-property changes' : b.dataset.choice === 'raw' ? 'Experimental emulator-only authenticated RGBA stream; no JPEG. Local raw traffic may be large; CPU savings are not guaranteed' : b.dataset.choice === 'jpeg' ? 'Manual-only Android emulator JPEG quality70, decoded and encoded with Mac VideoToolbox; Android14+ required' : b.dataset.choice === 'current' ? kind === 'capture' ? 'ScreenCaptureKit window capture' : 'Mac mouse events + existing ADB commands' : b.dataset.choice === 'auto' ? 'Prefer compatible scrcpy; otherwise use the current method' : 'Always use scrcpy; report errors instead of falling back';
       }
     }
     const warning = m.querySelector('.backend-warning'); warning.hidden = !s.reason; warning.textContent = s.reason || '';

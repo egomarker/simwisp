@@ -50,12 +50,13 @@ if(role==='cli'){
     console.log('mOverrideDisplayInfo=DisplayInfo{"fixture", displayId 0, real '+(display.width??320)+' x '+(display.height??640)+', rotation 0}');
   }
   else if(cmd.includes('com.genymobile.scrcpy.Server')){
-    fs.writeFileSync(root+'/options.json',JSON.stringify({video:cmd.includes('video=true'),serial:args[1]}));record({kind:'process',pid:process.pid});
-    setInterval(()=>{},1000);
+    fs.writeFileSync(root+'/options.json',JSON.stringify({video:!cmd.includes('video=false'),serial:args[1],max_size:Number(cmd.find(v=>v.startsWith('max_size=')).split('=')[1]),fps:Number(cmd.find(v=>v.startsWith('max_fps=')).split('=')[1])}));record({kind:'process',pid:process.pid});
+    const mode=fs.existsSync(root+'/scrcpy-mode.json')?JSON.parse(fs.readFileSync(root+'/scrcpy-mode.json','utf8')):{};
+    if(mode.native_error){process.stderr.write('stack corruption detected (-fstack-protector)\nAborted\n');setTimeout(()=>process.exit(134),40)}else setInterval(()=>{},1000);
   }
 }else{
   const fixture=JSON.parse(fs.readFileSync(root+'/video.json','utf8')),performanceTest=fs.existsSync(root+'/performance');let pair=null;const sockets=new Set();
-  const session=()=>{const d=Buffer.alloc(12);d.writeUInt32BE(0x80000000);d.writeUInt32BE(320,4);d.writeUInt32BE(640,8);return d};
+  const session=(w=320,h=640)=>{const d=Buffer.alloc(12);d.writeUInt32BE(0x80000000);d.writeUInt32BE(w,4);d.writeUInt32BE(h,8);return d};
   function packet(hex,index,config=false,key=false){const b=Buffer.from(hex,'hex'),h=Buffer.alloc(12);h.writeBigUInt64BE((config?1n<<62n:key?1n<<61n:0n)|BigInt(Math.round(index*1000000/(performanceTest?60:30))));h.writeUInt32BE(b.length,8);return Buffer.concat([h,b])}
   const server=net.createServer(async socket=>{
     sockets.add(socket);socket.on('close',()=>sockets.delete(socket));socket.on('error',()=>{});
@@ -63,12 +64,20 @@ if(role==='cli'){
     if(!fs.existsSync(root+'/options.json')){socket.destroy();return}
     const opt=JSON.parse(fs.readFileSync(root+'/options.json','utf8'));
     if(opt.video&&!pair){
-      pair={v:socket,index:0,timer:null};socket.write(Buffer.concat([Buffer.from([0]),Buffer.from('h264'),session(),packet(fixture.config,0,true)]));
-      const current=pair;const send=()=>{if(socket.destroyed||fs.existsSync(root+'/hold-video'))return;const f=fixture.frames[current.index%fixture.frames.length];socket.write(packet(f.key?fixture.config+f.payload:f.payload,current.index,false,f.key));current.index++};
-      send();if(performanceTest){let next=performance.now()+1000/60;const pump=()=>{send();next+=1000/60;current.timer=setTimeout(pump,Math.max(0,next-performance.now()))};current.timer=setTimeout(pump,1000/60)}else{current.timer=setInterval(send,33)}socket.on('close',()=>{clearTimeout(current.timer);if(pair===current)pair=null});
+      pair={v:socket,index:0,timer:null,dimensions:''};const current=pair;
+      const mode=()=>fs.existsSync(root+'/scrcpy-mode.json')?JSON.parse(fs.readFileSync(root+'/scrcpy-mode.json','utf8')):{};
+      const choose=()=>{const m=mode();if(!m.scaled)return{w:320,h:640,media:fixture,m};
+        const bw=m.width??320,bh=m.height??640,r=Math.min(1,opt.max_size/Math.max(bw,bh));
+        let w=Math.max(8,Math.round(bw*r)),h=Math.max(8,Math.round(bh*r));if(m.align8){w=w&~7;h=h&~7}if(m.rotation)[w,h]=[h,w];
+        const all=JSON.parse(fs.readFileSync(root+'/phone-video.json','utf8')),media=all[w+'x'+h];if(!media)throw Error('No synthetic H264 fixture '+w+'x'+h);return{w,h,media,m}};
+      const initial=choose();socket.write(Buffer.concat([Buffer.from([0]),Buffer.from(initial.m.bad_codec?'hevc':'h264')]));
+      const send=()=>{if(socket.destroyed||fs.existsSync(root+'/hold-video'))return;const{w,h,media,m}=choose();if(m.disconnect||m.native_error){socket.destroy();return}if(m.idle)return;
+        const dims=w+'x'+h;if(current.dimensions!==dims){current.dimensions=dims;current.index=0;socket.write(Buffer.concat([session(w,h),packet(media.config,0,true)]));record({kind:'video_session',serial:opt.serial,width:w,height:h,max_size:opt.max_size})}
+        const f=media.frames[current.index%media.frames.length];socket.write(packet(f.key?media.config+f.payload:f.payload,current.index,false,f.key));current.index++};
+      send();if(performanceTest){let next=performance.now()+1000/60;const pump=()=>{send();next+=1000/60;current.timer=setTimeout(pump,Math.max(0,next-performance.now()))};current.timer=setTimeout(pump,1000/60)}else{current.timer=setInterval(send,initial.m.scaled?Math.max(1,Math.round(1000/opt.fps)):33)}socket.on('close',()=>{clearTimeout(current.timer);if(pair===current)pair=null});
     }else{
       const current=pair;if(!opt.video)socket.write(Buffer.from([0]));let buffer=Buffer.alloc(0);
-      socket.on('data',data=>{buffer=Buffer.concat([buffer,data]);while(buffer.length){const t=buffer[0],len=t===0?14:t===2?32:t===1?(buffer.length>=5?5+buffer.readUInt32BE(1):Infinity):1;if(buffer.length<len)break;const p=buffer.subarray(0,len);buffer=buffer.subarray(len);record({kind:'control',serial:opt.serial,type:t,hex:p.toString('hex'),action:t===2?p[1]:null});if(t===17&&current&&!current.v.destroyed){current.index=0;current.v.write(Buffer.concat([session(),packet(fixture.config,0,true)]));}}});
+      socket.on('data',data=>{buffer=Buffer.concat([buffer,data]);while(buffer.length){const t=buffer[0],len=t===0?14:t===2?32:t===1?(buffer.length>=5?5+buffer.readUInt32BE(1):Infinity):1;if(buffer.length<len)break;const p=buffer.subarray(0,len);buffer=buffer.subarray(len);record({kind:'control',serial:opt.serial,type:t,hex:p.toString('hex'),action:t===2?p[1]:null});if(t===17&&current&&!current.v.destroyed){current.index=0;current.dimensions='';}}});
     }
   });server.listen(0,'127.0.0.1',()=>{fs.writeFileSync(root+'/peer.json',JSON.stringify({port:server.address().port}));console.log('peer ready')});
   process.on('SIGTERM',()=>{for(const s of sockets)s.destroy();server.close(()=>process.exit(0));setTimeout(()=>process.exit(1),500).unref()});

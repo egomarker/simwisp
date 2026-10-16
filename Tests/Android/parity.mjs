@@ -33,12 +33,12 @@ try{
   await cdp('Network.setCookie',{name:'simwisp_session',value:cookie,url:base,secure:true,httpOnly:true,sameSite:'Strict'});
   await cdp('Page.navigate',{url:base});await until('fixture page',()=>ev("document.querySelector('.device-item')!==null"));
   // Even a larger client canvas must not override the authoritative Mac crop.
-  await connect(1080,1920);let d=await budget(320,640,200000);
+  await connect(1080,1920);let d=await budget(320,640,500000);
   check('host pixel budget wins over browser canvas',d.max_size===640);
-  check('server receives aligned source arguments',launches().at(-1).args.includes('max_size=640')&&launches().at(-1).args.includes('video_bit_rate=200000'));
-  check('quality1 requests normal CBR2/max I/P QP44',launches().at(-1).args.includes('video_codec_options=profile=1,max-bframes=0,i-frame-interval=1,bitrate-mode=2,video-qp-i-max=44,video-qp-p-max=44'));
-  check('requested QP/mode are observable, not accepted codec format',d.requested_qp_max===44&&d.requested_bitrate_mode===2);
-  check('video startup verified shaping property before launch',d.format_shaping_disabled===true&&events().filter(e=>e.kind==='command').findIndex(e=>e.args.includes('getprop'))<events().filter(e=>e.kind==='command').findIndex(e=>e.args.includes('com.genymobile.scrcpy.Server')));
+  check('server receives aligned source arguments',launches().at(-1).args.includes('max_size=640')&&launches().at(-1).args.includes('video_bit_rate=500000'));
+  check('quality1 requests phone Baseline/default codec policy',launches().at(-1).args.includes('video_codec_options=profile=1')&&!launches().at(-1).args.some(a=>/bitrate-mode=|qp-|i-frame-interval=/.test(a)));
+  check('diagnostics honestly report no requested QP or rate-control override',d.requested_qp_max===null&&d.requested_bitrate_mode===null);
+  check('video startup never reads or writes device-wide codec shaping',d.format_shaping_disabled===null&&!events().some(e=>e.kind==='command'&&(e.args.includes('setprop')||e.args.includes('getprop'))));
   check('actual encoded dimensions are observable',d.video_width===320&&d.video_height===640);
   check('source byte counters are real encoded data',d.source_video_bytes>0&&d.source_keyframe_bytes>0&&d.source_keyframe_bytes<=d.source_video_bytes);
   await until('scaled pixels actually render',()=>ev('parityCanvas.width===320&&parityCanvas.height===640'));
@@ -46,10 +46,10 @@ try{
   // Quality and resize affect only this source, without changing global settings.
   await ev('parityStream.updateSettings({quality:95})');await budget(320,640,1975308);
   check('quality95 preserves legacy area scaling',launches().at(-1).args.includes('video_bit_rate=1975308'));
-  check('other qualities retain default QP settings',(await api()).capture_counters.requested_qp_max===null&&(await api()).capture_counters.requested_bitrate_mode===null&&launches().at(-1).args.includes('video_codec_options=profile=1,max-bframes=0,i-frame-interval=1'));
-  await ev('parityStream.updateSettings({quality:1})');await budget(320,640,200000);
-  check('quality1 applies the requested200kbps/QP44 trial',true);
-  fs.writeFileSync(root+'/window-size.json',JSON.stringify({width:480,height:960}));await budget(480,960,200000);
+  check('other qualities retain default QP settings',(await api()).capture_counters.requested_qp_max===null&&(await api()).capture_counters.requested_bitrate_mode===null&&launches().at(-1).args.includes('video_codec_options=profile=1'));
+  await ev('parityStream.updateSettings({quality:1})');await budget(320,640,500000);
+  check('quality1 returns to the shared500kbps minimum for this source size',true);
+  fs.writeFileSync(root+'/window-size.json',JSON.stringify({width:480,height:960}));await budget(480,960,500000);
   check('host resize changes the native long-edge limit',launches().at(-1).args.includes('max_size=960'));
   const resizeLaunches=launches().length;
   await ev('parityStream.updateSettings({dev_w:320,dev_h:640})');await sleep(1000);
@@ -59,11 +59,11 @@ try{
   fs.writeFileSync(root+'/headless','1');await sleep(1800);
   check('window loss retains the last known pixel budget',(await api()).capture_counters.target_width===480&&launches().length===resizeLaunches);
   check('headless capture remains streaming',(await api()).state==='Streaming');
-  await closeStream();await connect(432,960);await budget(432,960,200000);
+  await closeStream();await connect(432,960);await budget(432,960,500000);
   check('new headless session uses initial browser dimensions',launches().at(-1).args.includes('max_size=960'));
-  await closeStream();await connect(0,0);await budget(360,800,200000);
+  await closeStream();await connect(0,0);await budget(360,800,500000);
   check('invalid initial dimensions use bounded UI fallback',launches().at(-1).args.includes('max_size=800'));
-  remove('headless');remove('window-size.json');await budget(320,640,200000);
+  remove('headless');remove('window-size.json');await budget(320,640,500000);
   check('a window appearing later becomes authoritative',true);
   await closeStream();await connect(320,640,1,'current','scrcpy');
   await until('independent control-only source',async()=>{const s=await api();return s?.state==='Streaming'&&s.android_backends.effective_capture==='current'&&s.android_backends.effective_input==='scrcpy'});

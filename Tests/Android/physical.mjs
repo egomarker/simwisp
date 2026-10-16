@@ -58,7 +58,7 @@ try{
   check('phone toolbar omits simulator Rotate and appearance',await ev("!document.querySelector('[data-action=rotate]')&&!document.querySelector('[data-action=appear]')"));
   await ev("document.querySelector('.backend-trigger').click()");
   check('physical Scaling row exists directly below Capture',await ev("(()=>{const groups=[...document.querySelectorAll('.backend-field')];return groups.map(g=>g.querySelector('.backend-field-label').textContent).join(',')==='Capture,Scaling,Input'&&document.querySelectorAll('[data-kind=scaling]').length===3})()"));
-  check('phone backend UI exposes only JPEG and scrcpy input',await ev("document.querySelectorAll('[data-kind=capture]').length===1&&document.querySelector('[data-kind=capture][data-choice=jpeg]')?.getAttribute('aria-checked')==='true'&&document.querySelectorAll('[data-kind=input]').length===1&&!!document.querySelector('[data-kind=input][data-choice=scrcpy]')"));
+  check('physical Capture offers JPEG and scrcpy video',await ev("document.querySelectorAll('[data-kind=capture]').length===2&&!!document.querySelector('[data-kind=capture][data-choice=scrcpy]')&&document.querySelector('[data-kind=capture][data-choice=jpeg]')?.getAttribute('aria-checked')==='true'&&document.querySelectorAll('[data-kind=input]').length===1&&!!document.querySelector('[data-kind=input][data-choice=scrcpy]')"));
   check('phone backend explanation and active badge are accurate',await ev("document.querySelector('.backend-explainer').textContent.includes('USB or Wi-Fi')&&document.querySelector('[data-effective=capture]').textContent==='Using JPEG70 → H.264'"));
   for(const action of ['home','back','app-switcher']){
     const n=events().filter(e=>e.kind==='control'&&e.type===0).length;
@@ -152,7 +152,7 @@ try{
   check('disconnect never invokes legacy input',legacy().length===0&&stoppedWire>=wire);
   await directClose();for(const f of ['device-offline','jpeg-mode.json','window-size.json'])remove(f);put('display.json',{width:1080,height:2400});
   // Explicit unsupported requests must fail before any producer is started.
-  for(const [capture,input]of [['raw','scrcpy'],['current','scrcpy'],['scrcpy','scrcpy'],['jpeg','current']]){
+  for(const [capture,input]of [['raw','scrcpy'],['current','scrcpy'],['scrcpy','current'],['jpeg','current']]){
     const before={jpeg:launches().length,control:controls().length};await direct(ids[0],capture,input);
     await until('native capability refusal '+capture+'/'+input,async()=>(await live())?.android_backends.effective_capture==='unavailable');await sleep(200);
     check('native rejects forged '+capture+'/'+input+' without producer',(await live()).frames===0&&launches().length===before.jpeg&&controls().length===before.control);
@@ -177,7 +177,7 @@ try{
   await cdp('Page.reload');await until('emulator inventory ready',()=>ev("document.querySelector('.device-item')!==null"));
   await ev("document.querySelector('.device-item').click()");await until('emulator panel streams',async()=>(await live())?.frames>2);
   await ev("document.querySelector('.backend-trigger').click()");
-  check('Scaling absent from emulator UI; five capture/three input choices unchanged',await ev("document.querySelectorAll('[data-kind=scaling]').length===0&&document.querySelectorAll('[data-kind=capture]').length===5&&document.querySelectorAll('[data-kind=input]').length===3"));
+  check('emulator scrcpy gains Scaling without changing capture/input choices',await ev("document.querySelectorAll('[data-kind=scaling]').length===3&&document.querySelectorAll('[data-kind=capture]').length===5&&document.querySelectorAll('[data-kind=input]').length===3"));
   await ev("document.querySelector('[data-action=close]').click()");await until('emulator fixture retired',async()=>!await live());
   // Intentionally interleaved native inventory: sort only the rendered sidebar.
   put('sidebar-inventory.json',{reverse:false});await api('/api/sims');await cdp('Page.reload');

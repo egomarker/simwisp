@@ -73,6 +73,23 @@ final class ScrcpySocket {
     deinit { close() }
 }
 
+// Bound native startup diagnostics in memory; never retain video or an output file.
+final class ScrcpyServerOutput {
+    private let lock=NSLock()
+    private var tail=Data()
+    static let capacity=8192
+    func append(_ bytes:Data){lock.withLock{if bytes.count>=Self.capacity{tail=Data(bytes.suffix(Self.capacity))}else{let excess=max(0,tail.count+bytes.count-Self.capacity);if excess>0{tail.removeFirst(excess)};tail.append(bytes)}}}
+    var count:Int{lock.withLock{tail.count}}
+    func summary(serial:String)->String {
+        let bytes=lock.withLock{tail}
+        let text=String(String.UnicodeScalarView(String(decoding:bytes,as:UTF8.self).unicodeScalars.filter{$0.value>=32 || $0.value==10}))
+            .replacingOccurrences(of:serial,with:"<device>")
+            .replacingOccurrences(of:"/data/local/tmp/[^\\s]+",with:"<scrcpy helper>",options:.regularExpression)
+        let lines=text.components(separatedBy:.newlines).map{$0.trimmingCharacters(in:.whitespacesAndNewlines)}.filter{!$0.isEmpty}
+        return String(lines.suffix(4).joined(separator:"; ").suffix(1000))
+    }
+}
+
 // One process/tunnel per selected device. Never launches the scrcpy desktop app,
 // installs dependencies, changes clipboard/power, or uses an unscoped ADB call.
 final class ScrcpySession: @unchecked Sendable {
@@ -88,13 +105,13 @@ final class ScrcpySession: @unchecked Sendable {
     let video: Bool, controls: Bool
     let videoSize: ScrcpyVideoSize
     private let fps: Int, quality: Int
+    private var physicalAndroid: Bool { !serial.hasPrefix("emulator-") }
     private var cancelled = false, stopping = false, ready = false, finished = false, everReady = false, installed = false
     private let work = DispatchGroup()
     private var failure: String?, buffer = ScrcpyFrames(), sockets: [ScrcpySocket] = []
     private var control: ScrcpySocket?, size = (0,0)
     private var physicalRevision: UInt64 = 0, physicalRefreshing = false
     private var physicalRefreshes = 0, physicalError: String?
-    private var shapingDisabled = false
     private var pressed: (Double, Double)?, gestureSize = (0,0), secondFinger = false
     private var noticePending = false, lastReset = -Double.infinity
     private var receivedFrames = 0, resetRequests = 0
@@ -104,9 +121,9 @@ final class ScrcpySession: @unchecked Sendable {
     init(adb: String, serial: String, video: Bool, controls: Bool, fps: Int, quality: Int, videoSize: ScrcpyVideoSize = .headless, network: DispatchQueue, lifecycle: DispatchGroup, installation: @escaping Installation = ScrcpyInstallation.find, run: @escaping (String,[String],Double) throws -> CommandResult = { try command($0,$1,timeout:$2) }) {
         self.adb=adb;self.serial=serial;self.video=video;self.controls=controls;self.fps=fps;self.quality=quality;self.videoSize=videoSize;self.network=network;self.lifecycle=lifecycle;self.installation=installation;self.run=run
     }
-    var state: (ready: Bool, error: String?, size: (Int,Int), finished: Bool, connected: Bool, installed: Bool) { lock.withLock { (ready && !stopping, failure, size, finished, everReady, installed) } }
+    var state: (ready: Bool, error: String?, size: (Int,Int), finished: Bool, connected: Bool, installed: Bool) { lock.withLock { (ready && !stopping, finished ? failure : nil, size, finished, everReady, installed) } }
     var hasFrame: Bool { lock.withLock { buffer.count > 0 } }
-    var diagnostics: [String: Any] { lock.withLock { ["source_frames": receivedFrames, "source_video_bytes": receivedBytes, "source_keyframe_bytes": keyframeBytes, "video_width": size.0, "video_height": size.1, "target_width": videoSize.width, "target_height": videoSize.height, "max_size": videoSize.maxSize, "target_bitrate_bps": videoSize.bitRate(quality: quality), "requested_qp_max": (video && quality == 1 ? 44 as Any : NSNull()), "requested_bitrate_mode": (video && quality == 1 ? 2 as Any : NSNull()), "format_shaping_disabled": (video ? shapingDisabled as Any : NSNull()), "queued_frames": buffer.count, "dropped_frames": buffer.dropped, "reset_requests": resetRequests, "generation": buffer.generation, "last_frame_age_ms": lastFrameAt.map { max(0, (monotonic() - $0) * 1000) } as Any? ?? NSNull()] } }
+    var diagnostics: [String: Any] { lock.withLock { ["source_frames": receivedFrames, "source_video_bytes": receivedBytes, "source_keyframe_bytes": keyframeBytes, "video_width": size.0, "video_height": size.1, "target_width": videoSize.width, "target_height": videoSize.height, "max_size": videoSize.maxSize, "target_bitrate_bps": videoSize.bitRate(quality: quality), "requested_qp_max": NSNull(), "requested_bitrate_mode": NSNull(), "format_shaping_disabled": NSNull(), "queued_frames": buffer.count, "dropped_frames": buffer.dropped, "reset_requests": resetRequests, "generation": buffer.generation, "last_frame_age_ms": lastFrameAt.map { max(0, (monotonic() - $0) * 1000) } as Any? ?? NSNull()] } }
     var inputDiagnostics: [String: Any] { lock.withLock {
         ["width": size.0, "height": size.1, "geometry_refreshes": physicalRefreshes,
          "geometry_refresh_pending": physicalRefreshing, "geometry_refresh_error": physicalError as Any? ?? NSNull()]
@@ -120,11 +137,19 @@ final class ScrcpySession: @unchecked Sendable {
         guard !lock.withLock({cancelled || stopping}), DeviceControl.validADBSerial(serial) else { throw WispError("Invalid or cancelled scrcpy session") }
         let r = try run(adb,["-s",serial]+args,timeout);guard r.status==0 else{throw WispError("scrcpy ADB operation failed")};return r
     }
-    static func arguments(version: String, scid: String, jar: String, video: Bool, controls: Bool, fps: Int, quality: Int, videoSize: ScrcpyVideoSize = .headless) -> [String] {
+    static func arguments(version: String, scid: String, jar: String, video: Bool, controls: Bool, fps: Int, quality: Int, videoSize: ScrcpyVideoSize = .headless, physical: Bool = false) -> [String] {
         let rate=videoSize.bitRate(quality:quality)
-        // Quality1 requests normal MediaCodec CBR (2), not frame-dropping CBR (3).
-        // I/P QP is a ceiling, not fixed QP; other qualities retain their default mode.
-        let codecOptions="profile=1,max-bframes=0,i-frame-interval=1" + (video && quality == 1 ? ",bitrate-mode=2,video-qp-i-max=44,video-qp-p-max=44" : "")
+        if physical && video {
+            // Samsung codec code can overflow on app_process argv >=255 bytes.
+            // Pinned5.0.1 defaults retain video/control/H264/cleanup and all wire
+            // metadata. Baseline excludes B-frames; never request stock High profile.
+            // Retain explicit power/clipboard/audio protections. Native recovery
+            // remains immediate; automatic GOP uses the pinned server default.
+            return ["shell","CLASSPATH="+jar,"app_process","/","com.genymobile.scrcpy.Server",version,"scid="+scid,"tunnel_forward=true","audio=false","send_device_meta=false","clipboard_autosync=false","power_on=false","max_size=\(videoSize.maxSize)","max_fps=\(min(60,max(1,fps)))","video_bit_rate=\(rate)","log_level=warn","video_codec_options=profile=1"]
+        }
+        // Video uses the same Baseline/default-GOP/QP/rate-control policy as phones.
+        // Preserve unused video options in existing control-only launches; no encoder runs.
+        let codecOptions=video ? "profile=1" : "profile=1,max-bframes=0,i-frame-interval=1"
         // Keep control enabled internally for RESET_VIDEO even with Current input.
         return ["shell","CLASSPATH="+jar,"app_process","/","com.genymobile.scrcpy.Server",version,"scid="+scid,"tunnel_forward=true","audio=false","video=\(video)","control=true","send_device_meta=false","send_dummy_byte=true","send_stream_meta=true","send_frame_meta=true","clipboard_autosync=false","power_on=false","cleanup=true","video_codec=h264","video_codec_options="+codecOptions,"max_size=\(videoSize.maxSize)","max_fps=\(min(60,max(1,fps)))","video_bit_rate=\(rate)","log_level=warn"]
     }
@@ -132,12 +157,16 @@ final class ScrcpySession: @unchecked Sendable {
         lifecycle.enter(); work.enter()
         worker.async { [self] in
             var forward: String?, jar: String?, process: Process?, pipe: Pipe?
-            let drain=DispatchGroup()
+            let drain=DispatchGroup(), outputDrain=DispatchGroup(), serverOutput=ScrcpyServerOutput()
             defer {
-                let owned = lock.withLock { () -> [ScrcpySocket] in ready=false;finished=true;return sockets }
+                let owned = lock.withLock { () -> [ScrcpySocket] in ready=false;return sockets }
                 owned.forEach{$0.interrupt()};drain.wait();owned.forEach{$0.close()}
                 if let process, process.isRunning { process.terminate(); let end=monotonic()+0.5;while process.isRunning && monotonic()<end{Thread.sleep(forTimeInterval:0.02)};if process.isRunning{Darwin.kill(process.processIdentifier,SIGKILL)};process.waitUntilExit() }
-                pipe?.fileHandleForReading.readabilityHandler=nil;try? pipe?.fileHandleForReading.close()
+                try? pipe?.fileHandleForWriting.close()
+                outputDrain.wait()
+                try? pipe?.fileHandleForReading.close()
+                let detail=serverOutput.summary(serial:serial)
+                lock.withLock { if let error=failure,!detail.isEmpty{failure=error+": "+detail};finished=true }
                 // Only this session's port/file; never remove-all or kill-server.
                 if let forward { _ = try? run(adb,["-s",serial,"forward","--remove",forward],2) }
                 if let jar { _ = try? run(adb,["-s",serial,"shell","rm","-f",jar],2) }
@@ -145,28 +174,25 @@ final class ScrcpySession: @unchecked Sendable {
             }
             do {
                 guard DeviceControl.validADBSerial(serial) else{throw WispError("Invalid Android serial")}
-                guard !video || DeviceControl.validID(serial,platform:"android") else{throw WispError("Physical Android devices use JPEG capture; scrcpy video is emulator-only")}
                 guard video || controls else{throw WispError("No scrcpy demand")}
                 let install=try installation();guard install.version==ScrcpyWire.version else{throw WispError("Unsupported scrcpy protocol")};lock.withLock{installed=true}
-                // Android's VBR quality floor otherwise rewrites the requested bitrate/QP.
-                // This property is device-wide, survives session cleanup, and may require
-                // a debuggable emulator. Fail visibly instead of silently using shaping.
-                if video {
-                    do {
-                        _ = try tool(["shell","setprop","debug.stagefright.enableshaping","0"])
-                        let value = try tool(["shell","getprop","debug.stagefright.enableshaping"]).text.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard value == "0" else { throw WispError("Property readback was not 0") }
-                        lock.withLock { shapingDisabled = true }
-                    } catch { throw WispError("Cannot disable Android VBR format shaping (debug.stagefright.enableshaping); scrcpy capture was not started") }
-                }
+                // Do not read/write device-wide codec shaping properties. An older
+                // build's override is not silently reset; restoring it is owner-controlled.
                 let scid=String(format:"%08x",UInt32.random(in:1...0x7fff_ffff)),remote="/data/local/tmp/simwisp-scrcpy-"+scid+".jar"
+                let options=Self.arguments(version:install.version,scid:scid,jar:remote,video:video,controls:controls,fps:fps,quality:quality,videoSize:videoSize,physical:physicalAndroid)
+                if physicalAndroid && video && options.dropFirst(2).joined(separator:" ").utf8.count>=255 { throw WispError("Phone scrcpy launch exceeds Samsung command-length safety budget") }
                 jar=remote;_ = try tool(["push",install.server,remote],timeout:8)
                 let f=try tool(["forward","tcp:0","localabstract:scrcpy_"+scid]).text.trimmingCharacters(in:.whitespacesAndNewlines)
                 guard let port=UInt16(f),port>0 else{throw WispError("Invalid scrcpy forward port")};forward="tcp:"+f
                 if !video { try refreshPhysicalSize() }
-                let p=Process(),output=Pipe();p.executableURL=URL(fileURLWithPath:adb);p.arguments=["-s",serial]+Self.arguments(version:install.version,scid:scid,jar:remote,video:video,controls:controls,fps:fps,quality:quality,videoSize:videoSize);p.standardInput=FileHandle.nullDevice;p.standardOutput=output;p.standardError=output
-                // Drain and discard logs; never retain unbounded tool output.
-                output.fileHandleForReading.readabilityHandler={h in _=h.availableData};pipe=output;process=p;try p.run()
+                let p=Process(),output=Pipe();p.executableURL=URL(fileURLWithPath:adb);p.arguments=["-s",serial]+options;p.standardInput=FileHandle.nullDevice;p.standardOutput=output;p.standardError=output
+                pipe=output;process=p;try p.run()
+                try? output.fileHandleForWriting.close()
+                outputDrain.enter()
+                DispatchQueue.global(qos:.utility).async {
+                    defer{outputDrain.leave()}
+                    while true{let bytes=output.fileHandleForReading.availableData;if bytes.isEmpty{break};serverOutput.append(bytes)}
+                }
                 let deadline=monotonic()+8
                 func connect(first: Bool) throws -> ScrcpySocket {
                     while !isCancelled && monotonic()<deadline && p.isRunning {
@@ -181,14 +207,14 @@ final class ScrcpySession: @unchecked Sendable {
                 let v = video ? try connect(first:true) : nil
                 let c = try connect(first:!video);lock.withLock{control=c;ready=true;everReady=true};notify()
                 // No unsolicited clipboard traffic; disconnects still terminate the session.
-                drain.enter();work.enter();lifecycle.enter();DispatchQueue.global(qos:.utility).async{[self] in defer{drain.leave();work.leave();lifecycle.leave()};do{while !isCancelled{_ = try c.read(1,cancelled:{self.isCancelled})}}catch{if !isCancelled{lock.withLock{failure="scrcpy control disconnected"};lock.withLock{sockets}.forEach{$0.interrupt()};notify()}}}
+                drain.enter();work.enter();lifecycle.enter();DispatchQueue.global(qos:.utility).async{[self] in defer{drain.leave();work.leave();lifecycle.leave()};do{while !isCancelled{_ = try c.read(1,cancelled:{self.isCancelled})}}catch{if !isCancelled{lock.withLock{if failure==nil{failure="scrcpy control disconnected"}};lock.withLock{sockets}.forEach{$0.interrupt()}}}}
                 if let v {
                     let codec=try v.read(4,cancelled:{self.isCancelled},deadline:deadline);guard codec==Data("h264".utf8) else{throw WispError("scrcpy did not provide H.264")}
                     try readVideo(v)
                 } else { while !isCancelled && p.isRunning && lock.withLock({failure==nil}){Thread.sleep(forTimeInterval:0.05)} }
                 c.interrupt();_ = drain.wait(timeout:.now()+1)
                 if !isCancelled { throw WispError("scrcpy server stopped unexpectedly") }
-            }catch{if !isCancelled{lock.withLock{failure=error.localizedDescription};notify()}}
+            }catch{if !isCancelled{lock.withLock{failure=error.localizedDescription}}}
         }
     }
     private func readVideo(_ socket: ScrcpySocket) throws {

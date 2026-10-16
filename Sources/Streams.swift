@@ -46,7 +46,7 @@ final class StreamSession: @unchecked Sendable {
     var usesScrcpy: Bool { scrcpy != nil || backendRetiring || jpeg != nil || jpegRetiring || raw != nil || rawRetiring }
     private var independentCapture: String? { backendChoice.capture == .raw ? "raw" : backendChoice.capture == .jpeg ? "jpeg" : nil }
     private let physicalAndroid: Bool
-    private let jpegScale: AndroidJPEGScale
+    private let captureScale: AndroidCaptureScale
     private var isAndroid: Bool { physicalAndroid || devices.device(id)?.platform == "android" }
 
     private let nativeInputWorker: DispatchQueue
@@ -85,8 +85,10 @@ final class StreamSession: @unchecked Sendable {
     init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
         self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation; self.rawDiscovery = rawDiscovery
         physicalAndroid = devices.device(id)?.physicalAndroid == true
-        jpegScale = physicalAndroid ? .normalized(request.query["jpeg_scale"]) : .full
-        backendChoice = AndroidBackendChoice(capture: request.query["capture_backend"], input: request.query["input_backend"])
+        // Preserve the wire key; emulator scaling is admitted only for scrcpy/Auto.
+        let requestedBackend = AndroidBackendChoice(capture: request.query["capture_backend"], input: request.query["input_backend"])
+        captureScale = physicalAndroid || [AndroidCaptureMode.auto, .scrcpy].contains(requestedBackend.capture) ? .normalized(request.query["jpeg_scale"]) : .full
+        backendChoice = requestedBackend
         if physicalAndroid {
             if backendChoice.capture == .auto { backendChoice.capture = .jpeg }
             if backendChoice.input == .auto { backendChoice.input = .scrcpy }
@@ -301,10 +303,16 @@ final class StreamSession: @unchecked Sendable {
         }
     }
     private var backendSnapshot: [String: Any] {
-        ["type":"android_backends","capture":backendChoice.capture.rawValue,"input":backendChoice.input.rawValue,
+        var value: [String: Any] = ["type":"android_backends","capture":backendChoice.capture.rawValue,"input":backendChoice.input.rawValue,
          "effective_capture":effectiveCapture,"effective_input":effectiveInput,"available":backendAvailable as Any? ?? NSNull(),
-         "reason":backendReason as Any? ?? NSNull(),"version":ScrcpyWire.version,"physical":physicalAndroid,"jpeg_scale":jpegScale.rawValue,
+         "reason":backendReason as Any? ?? NSNull(),"version":ScrcpyWire.version,"physical":physicalAndroid,"jpeg_scale":captureScale.rawValue,
          "jpeg_available":jpegAvailable as Any? ?? NSNull(),"jpeg_quality":AndroidJPEGWire.quality,"raw_available":rawAvailable as Any? ?? NSNull()]
+        if !physicalAndroid && [AndroidCaptureMode.auto, .scrcpy].contains(backendChoice.capture) {
+            // This is the unscaled native budget, never rounded decoder feedback.
+            let base = lastScrcpyWindowSize ?? initialScrcpySize
+            value["scrcpy_base_width"] = base.width; value["scrcpy_base_height"] = base.height
+        }
+        return value
     }
     private func publishBackends() { client.sendJSON(backendSnapshot) }
     private func releaseAndroid(completion: @escaping () -> Void = {}) {
@@ -321,8 +329,8 @@ final class StreamSession: @unchecked Sendable {
     }
     private func desiredScrcpySize() -> ScrcpyVideoSize {
         if physicalAndroid {
-            if let device=devices.device(id), let size=ScrcpyVideoSize(width:device.width,height:device.height) { return size }
-            return initialScrcpySize
+            let size = devices.device(id).flatMap { ScrcpyVideoSize(width: $0.width, height: $0.height) } ?? initialScrcpySize
+            return backendChoice.capture == .scrcpy ? captureScale.scrcpySize(size) : size
         }
         // Use authoritative host crop geometry, not dev_w/dev_h decoder-size
         // feedback (which would feed codec alignment back into the next budget).
@@ -332,14 +340,16 @@ final class StreamSession: @unchecked Sendable {
            let size=ScrcpyVideoSize(width:Int(crop.width.rounded()),height:Int(crop.height.rounded())) {
             lastScrcpyWindowSize=size
         }
-        // Losing a window must not resize or disable a headless source.
-        return lastScrcpyWindowSize ?? initialScrcpySize
+        // Cache only the unscaled host budget; scale it once for video, never for
+        // JPEG/Raw/Mac capture or control-only Auto fallback.
+        let base = lastScrcpyWindowSize ?? initialScrcpySize
+        return [AndroidCaptureMode.auto, .scrcpy].contains(backendChoice.capture) && captureFallback == nil ? captureScale.scrcpySize(base) : base
     }
     private func prepareAndroid() -> Bool {
         // Native capability boundary: hiding browser radios is not enough.
-        if physicalAndroid && (backendChoice.capture != .jpeg || backendChoice.input != .scrcpy) {
+        if physicalAndroid && (![AndroidCaptureMode.jpeg, .scrcpy].contains(backendChoice.capture) || backendChoice.input != .scrcpy) {
             if !backendResolved {
-                backendReason="Physical Android devices require JPEG capture and scrcpy input"
+                backendReason="Physical Android devices require JPEG or scrcpy capture and scrcpy input"
                 effectiveCapture="unavailable";effectiveInput="unavailable";backendResolved=true
                 publishBackends();notifyError(backendReason!)
             }
@@ -408,7 +418,7 @@ final class StreamSession: @unchecked Sendable {
     }
     private func desiredJPEGMaxSize() -> Int {
         let nativeEdge = desiredScrcpySize().maxSize
-        return physicalAndroid ? jpegScale.maxSize(nativeEdge: nativeEdge) : min(AndroidJPEGWire.maxEdge, nativeEdge)
+        return physicalAndroid ? captureScale.maxSize(nativeEdge: nativeEdge) : min(AndroidJPEGWire.maxEdge, nativeEdge)
     }
     private func prepareJPEG() -> Bool {
         if jpegRetiring { return false }

@@ -115,3 +115,7 @@ test-android-physical:
 .PHONY: test-android-raw
 test-android-raw:
 	@ANDROID_RAW=1 NODE='$(NODE)' Tests/Android/run.sh
+
+.PHONY: test-android-emulator-scrcpy
+test-android-emulator-scrcpy:
+	@ANDROID_EMULATOR_SCRCPY=1 NODE='$(NODE)' Tests/Android/run.sh
