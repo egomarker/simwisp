@@ -12,6 +12,7 @@ cleanup(){
  rm -rf "$root"
 }
 trap cleanup EXIT
+"$NODE" Tests/Metro/retention.mjs
 "$NODE" Tests/Metro/policy.mjs
 "$NODE" Tests/Metro/fake-metro.mjs > "$root/metro.log" 2>&1 & metro_pid=$!
 sources=();for file in Sources/*.swift;do [[ "$file" == Sources/SimwispApp.swift ]] || sources+=("$file");done

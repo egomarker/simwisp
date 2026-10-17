@@ -104,6 +104,11 @@ test-android-jpeg-surface:
 test-android-jpeg: test-android-jpeg-surface
 	@ANDROID_JPEG=1 NODE='$(NODE)' Tests/Android/run.sh
 
+.PHONY: test-raw-storage
+test-raw-storage:
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-raw-storage-tests.XXXXXX); trap 'rm -rf "$$root"' EXIT; \
+	 xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/H264SPS.swift Sources/Video.swift Sources/ScrcpyProtocol.swift Sources/EmulatorRawWire.swift Tests/Android/RawStorage.swift Tests/Android/Storage/main.swift -o "$$root/tests"; "$$root/tests"
+
 .PHONY: test-raw-cpu
 test-raw-cpu:
 	@Tests/Android/run-raw-benchmark.sh

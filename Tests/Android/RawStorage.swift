@@ -1,9 +1,65 @@
 import Foundation
 import CoreImage
 
+
+// Capacity checks inspect reachable spare blocks, not noisy process RSS or a
+// logical message high-water mark. Reflection stays local to this ownership test.
+func runRawRetentionTests()throws->Int {
+    var checks=0
+    func check(_ ok:Bool,_ name:String)throws{guard ok else{throw WispError("Raw retention: "+name)};checks+=1}
+    func spare(_ parser:EmulatorRawWire.Messages)->[Int] {
+        let pool=Mirror(reflecting:parser).children.first{$0.label=="pool"}!.value
+        let blocks=Mirror(reflecting:pool).children.first{$0.label=="spare"}!.value
+        return Mirror(reflecting:blocks).children.map{Mirror(reflecting:$0.value).children.first{$0.label=="capacity"}!.value as! Int}
+    }
+    func feed(_ parser:EmulatorRawWire.Messages,_ count:Int,_ value:UInt8=71,_ emit:(EmulatorRawWire.Bytes)throws->Void={_ in})throws {
+        var header=Data([0]);header.scrcpyAppend(UInt32(count));try parser.append(header,emit)
+        let chunk=Data(repeating:value,count:65536)
+        for offset in stride(from:0,to:count,by:65536){try parser.append(chunk.prefix(min(65536,count-offset)),emit)}
+    }
+    let large=8*1024*1024,small=65536,p=EmulatorRawWire.Messages()
+    var owners=[EmulatorRawWire.Bytes]()
+    for _ in 0..<3{try feed(p,large){owners.append($0)}}
+    try check(spare(p).isEmpty,"checked-out buffers are not spare")
+    owners.removeAll()
+    try check(spare(p).reduce(0,+)==3*large,"fixture retains three large reusable slabs")
+    for _ in 0..<63{try feed(p,small)}
+    try check(spare(p).reduce(0,+)==3*large,"brief downsize preserves reuse before hysteresis")
+    try feed(p,small)
+    try check(spare(p).allSatisfy{$0<=small*2} && !spare(p).isEmpty,"sustained downsize releases oversized idle slabs")
+    let allocations=p.storageCounters.0
+    for _ in 0..<200{try feed(p,small){try check($0[0]==71 && $0[small-1]==71,"small bytes survive trimming")}}
+    try check(p.storageCounters.0==allocations,"stable smaller messages reuse without allocation churn")
+    // A transient small or zero-length message must not shrink normal buffers.
+    let alternating=EmulatorRawWire.Messages()
+    try feed(alternating,large)
+    for _ in 0..<4{for _ in 0..<32{try feed(alternating,small);try feed(alternating,0)};try feed(alternating,large)}
+    try check(alternating.storageCounters.0==1,"brief/alternating sizes and inactivity keep large slab reusable")
+    // Checked-out buffers survive a downsize; only their eventual last release
+    // may discard them, including Data views released on another queue.
+    let delayed=EmulatorRawWire.Messages(),q=DispatchQueue(label:"raw-retention-last-release"),release=DispatchSemaphore(value:0)
+    var leases=[Data]()
+    for n in 1...3{try feed(delayed,large,UInt8(n)){leases.append($0.data)}}
+    func releaseLater(_ owned:[Data]){q.async{release.wait();for (n,d) in owned.enumerated(){precondition(d.count==large && d.first==UInt8(n+1) && d.last==UInt8(n+1),"leased bytes overwritten by trim")};withExtendedLifetime(owned){}}}
+    releaseLater(leases);leases.removeAll()
+    for _ in 0..<100{try feed(delayed,small)}
+    try check(delayed.storageCounters.0==4,"live leases remain inside original four-slot bound")
+    release.signal();q.sync{}
+    try check(spare(delayed).allSatisfy{$0<=small*2},"oversized late-returned leases are freed, not recached")
+    let lateAllocations=delayed.storageCounters.0
+    for _ in 0..<100{try feed(delayed,small)}
+    try check(delayed.storageCounters.0==lateAllocations,"late release preserves steady small reuse")
+    // Moderate changes within a factor of two never require shrink/reallocate.
+    let moderate=EmulatorRawWire.Messages();try feed(moderate,200000)
+    for _ in 0..<130{try feed(moderate,150000)}
+    try check(moderate.storageCounters.0==1,"rounded nearby size changes keep existing capacity")
+    print("\(checks) RAW sustained-downsize/lease/reuse retention checks passed")
+    return checks
+}
+
 // Synthetic bytes only. Exercise slab ownership independently of HTTP/2 timing.
 func runRawStorageTests()throws->Int {
-    var checks=0
+    var checks=try runRawRetentionTests()
     func check(_ ok:Bool,_ name:String)throws {guard ok else{throw WispError("Raw ownership: "+name)};checks+=1}
     func reject(_ name:String,_ body:()throws->Void)throws {do{try body()}catch{checks+=1;return};throw WispError("Raw ownership accepted "+name)}
     func packet(_ data:Data)->Data {var p=Data([0]);p.scrcpyAppend(UInt32(data.count));p.append(data);return p}

@@ -7,15 +7,25 @@ export function loadConsoleStyles() {
   });
 }
 export class ConsoleBuffer {
+  // Clear evicted references immediately; offset compaction only reclaims slots.
   entries = []; bytes = 0; dropped = 0; offset = 0;
   push(entry, reserved = 0) {
     const bytes = new TextEncoder().encode(JSON.stringify(entry)).length;
     if (bytes > 5_242_880) { this.dropped++; return; }
     this.entries.push({ entry, bytes }); this.bytes += bytes;
-    while (this.entries.length > this.offset && (this.entries.length - this.offset > 5000 || this.bytes + reserved > 5_242_880)) { this.bytes -= this.entries[this.offset++].bytes; this.dropped++; }
+    while (this.entries.length > this.offset && (this.entries.length - this.offset > 5000 || this.bytes + reserved > 5_242_880)) {
+      const index = this.offset++;
+      this.bytes -= this.entries[index].bytes; this.entries[index] = null; this.dropped++;
+    }
     if (this.offset > 1024) { this.entries = this.entries.slice(this.offset); this.offset = 0; }
   }
-  trim(reserved=0){while(this.entries.length>this.offset&&this.bytes+reserved>5_242_880){this.bytes-=this.entries[this.offset++].bytes;this.dropped++;}if(this.offset>1024){this.entries=this.entries.slice(this.offset);this.offset=0;}}
+  trim(reserved=0){
+    while(this.entries.length>this.offset&&this.bytes+reserved>5_242_880){
+      const index=this.offset++;
+      this.bytes-=this.entries[index].bytes;this.entries[index]=null;this.dropped++;
+    }
+    if(this.offset>1024){this.entries=this.entries.slice(this.offset);this.offset=0;}
+  }
   get values() { return this.entries.slice(this.offset).map(v => v.entry); }
   clear() { this.entries = []; this.offset = 0; this.bytes = 0; this.dropped = 0; }
 }

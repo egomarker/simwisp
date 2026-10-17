@@ -90,23 +90,49 @@ enum EmulatorRawWire {
     fileprivate final class SlabPool {
         private let lock=NSLock()
         private var spare=[Block](), slots=0, allocations:UInt64=0, reuses:UInt64=0
+        private var preferredCapacity=0, smallerPeak=0, smallerRequests=0
         // Assembling + pending + current encode, with one spare. Bound includes
         // checked-out leases; a retaining consumer cannot grow memory forever.
         static let limit=4
         var counters:(UInt64,UInt64) { lock.withLock { (allocations,reuses) } }
+        // Only sustained requests below half the previous capacity shrink the
+        // spare set. Brief geometry changes keep CPU-saving reuse; no timer or
+        // per-frame allocation. Checked-out leases are never touched.
+        private var spareCeiling:Int { min(maxMessage,max(65536,preferredCapacity*2)) }
+        private func demand(_ capacity:Int) {
+            if capacity>preferredCapacity {
+                preferredCapacity=capacity;smallerPeak=0;smallerRequests=0
+            } else if capacity*2<preferredCapacity {
+                smallerPeak=max(smallerPeak,capacity);smallerRequests+=1
+                if smallerRequests>=64 {
+                    preferredCapacity=smallerPeak;smallerPeak=0;smallerRequests=0
+                    for i in spare.indices.reversed() where spare[i].capacity>spareCeiling {
+                        spare.remove(at:i);slots-=1
+                    }
+                }
+            } else { smallerPeak=0;smallerRequests=0 }
+        }
         func take(_ count:Int)throws->Lease {
             try lock.withLock {
+                let capacity=min(maxMessage,(count+65535) & ~65535)
+                demand(capacity)
                 if let i=spare.firstIndex(where:{$0.capacity>=count}) {
                     reuses &+= 1; return Lease(spare.remove(at:i),pool:self)
                 }
                 if !spare.isEmpty { spare.removeLast(); slots-=1 }
                 guard slots<Self.limit else { throw WispError("Emulator raw message ownership exceeds bound") }
-                let capacity=min(maxMessage,(count+65535) & ~65535)
                 let block=Block(capacity); slots+=1; allocations &+= 1
                 return Lease(block,pool:self)
             }
         }
-        func recycle(_ block:Block) { lock.withLock { spare.append(block) } }
+        func recycle(_ block:Block) {
+            lock.withLock {
+                // Last release can arrive from the encoder after downsizing.
+                // Retire only that now-unused block, and release its slot.
+                if block.capacity>spareCeiling { slots-=1 }
+                else { spare.append(block) }
+            }
+        }
     }
     struct Bytes {
         fileprivate let lease:Lease?

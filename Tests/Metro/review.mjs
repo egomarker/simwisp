@@ -1,6 +1,7 @@
 import fs from 'node:fs';import path from 'node:path';import tls from 'node:tls';import crypto from 'node:crypto';import{spawn,execFileSync}from'node:child_process';
 import{reviewSourceLocations}from'./source-location.mjs';
 import{reviewConsoleScroll}from'./scroll.mjs';
+import{reviewConsoleRetention}from'./retention.mjs';
 import{reviewObjectAPI,reviewObjectTrees,reviewObjectComponent}from'./objects.mjs';
 const root=process.argv[2],base='https://127.0.0.1:45152',a='00000000-0000-4000-8000-000000000001',b='00000000-0000-4000-8000-000000000002';
 const report={canonical:fs.realpathSync(process.cwd()),checks:[],screenshots:[],realMetro:false,realDevices:false,realPTY:false,trustModified:false};let cookie='',chrome,cdpWS;
@@ -77,6 +78,7 @@ try{
  assert('Two streams share live thirty-second discovery cadence',(await metro()).requests-idleScans>=2&&(await metro()).requests-idleScans<=3);
  await admin('emit',{text:'Safe <img src=x onerror=window.__injected=true>',level:'warn'});await admin('emit',{text:'Fixture exception',exception:true});await wait("document.querySelector('.console-list').textContent.includes('Fixture exception')");await check('Log/exception/source escaped as text',"!window.__injected&&!document.querySelector('.console-list img')&&document.querySelector('.console-list').textContent.includes('<img')&&!!document.querySelector('.console-details')");
  await reviewSourceLocations({root,cdp,evaluate,check,delay,shot});
+ const retention=await evaluate(`(async()=>{const{ConsoleBuffer}=await import('/js/metro-console.js');return (${reviewConsoleRetention.toString()})(ConsoleBuffer)})()`);for(const c of retention.checks)assert('Browser retention: '+c.name,c.passed);report.consoleRetention=retention;
  await reviewConsoleScroll({root,cdp,evaluate,check,delay,shot});
  await reviewObjectTrees({root,admin,metro,cdp,evaluate,check,delay,shot,wait});
  await reviewObjectComponent({root,evaluate,check});
