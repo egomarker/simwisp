@@ -202,7 +202,9 @@ final class StreamSession: @unchecked Sendable {
         }
         guard !paused, !configuring, !encoding, !sending, let capture, now >= nextFrame else { return }
         if !flow.hasCapacity { flow.congested(now: now); return }
-        guard flow.beginFrame(now: now) else { return }
+        // Match JPEG/RAW: small timer delays must not accumulate into FPS loss.
+        // Larger stalls still rebase once, without replaying missed work.
+        guard flow.beginFrame(now: now, maintainCadence: true) else { return }
         encoding = true
         let requestedQuality = quality, requestedFPS = fps, requestedKey = forceKeyframe, requestedSaver = dataSaver, epoch = videoEpoch
         worker.async { [weak self] in

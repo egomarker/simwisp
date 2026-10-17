@@ -9,6 +9,16 @@ func report(_ epoch: UInt32, _ id: UInt32, pending: Int = 0, queue: Int = 0, age
     StreamFeedback(["epoch": epoch, "frame_id": id, "pending_frames": pending, "decode_queue": queue, "oldest_pending_ms": age])!
 }
 
+// Contract-check the actual Mac-window admission site, not just the optional
+// helper mode: otherwise the deterministic cadence checks can pass while the
+// window encoder still accumulates every small wakeup delay.
+let streamSource = try String(contentsOfFile: "Sources/Streams.swift", encoding: .utf8)
+let tickStart = streamSource.range(of: "private func tick() {")!.upperBound
+let tickEnd = streamSource.range(of: "private func deliver(", range: tickStart..<streamSource.endIndex)!.lowerBound
+let windowTick = streamSource[tickStart..<tickEnd].filter { !$0.isWhitespace }
+check("Mac-window call site enables bounded local encoder cadence",
+      windowTick.contains("guardflow.beginFrame(now:now,maintainCadence:true)else{return}"))
+
 // A deterministic packet/feedback timeline with 40, 100 and 400ms round trips.
 // Native frame deadlines continue at 60fps; no individual frame ACK exists.
 for rtt in [0.04, 0.1, 0.4] {
@@ -87,29 +97,51 @@ for (key, bad) in [("epoch", -1 as Any), ("epoch", 4_294_967_296), ("frame_id", 
 }
 var missing = valid; missing.removeValue(forKey: "frame_id")
 check("incomplete telemetry rejected", StreamFeedback(missing) == nil)
-// JPEG-only local encoding: timer lateness must not compound into <55FPS.
-// Existing default-policy checks above continue to cover Mac/scrcpy behavior.
+// All locally encoded sources (Mac window, JPEG and RAW) share this mode.
+// Preserve the default-policy behavior for other callers, checked above.
 for fps in [1,15,30,60] {
     var paced=StreamFlow(fps:fps,quality:20)
     let period=1/Double(fps),start=1.0,jitter=period/20
-    check("JPEG first cadence admission",paced.beginFrame(now:start,maintainCadence:true))
+    check("Local encoder first cadence admission",paced.beginFrame(now:start,maintainCadence:true))
     var previous=start
     for _ in 0..<600 {
         let due=paced.nextFrame+jitter
-        check("JPEG early callback leaves slot available",!paced.beginFrame(now:paced.nextFrame-period/10,maintainCadence:true))
-        check("JPEG jittered deadline admitted",paced.beginFrame(now:due,maintainCadence:true))
-        check("JPEG no immediate repeat or burst",!paced.beginFrame(now:due,maintainCadence:true) && due-previous>=period*0.75)
+        check("Local encoder early callback leaves slot available",!paced.beginFrame(now:paced.nextFrame-period/10,maintainCadence:true))
+        check("Local encoder jittered deadline admitted",paced.beginFrame(now:due,maintainCadence:true))
+        check("Local encoder no immediate repeat or burst",!paced.beginFrame(now:due,maintainCadence:true) && due-previous>=period*0.75)
         previous=due
     }
-    check("JPEG scheduler jitter does not accumulate",abs(paced.nextFrame-(start+601*period))<0.00001)
+    check("Local encoder scheduler jitter does not accumulate",abs(paced.nextFrame-(start+601*period))<0.00001)
     for gap in [period/3,period,5.0] {
         let late=paced.nextFrame+gap
-        check("JPEG missed deadline rebases once",paced.beginFrame(now:late,maintainCadence:true) && abs(paced.nextFrame-late-period)<0.00001)
-        check("JPEG missed intervals never replayed",!paced.beginFrame(now:late+period/2,maintainCadence:true))
+        check("Local encoder missed deadline rebases once",paced.beginFrame(now:late,maintainCadence:true) && abs(paced.nextFrame-late-period)<0.00001)
+        check("Local encoder missed intervals never replayed",!paced.beginFrame(now:late+period/2,maintainCadence:true))
     }
     let deadline=paced.nextFrame
     _ = paced.recordSend(epoch:1,id:1,bytes:StreamFlow.maxBytes,now:deadline)
-    check("JPEG full transport cannot spend encoder deadline",!paced.beginFrame(now:deadline,maintainCadence:true) && paced.nextFrame==deadline)
+    check("Local encoder full transport cannot spend encoder deadline",!paced.beginFrame(now:deadline,maintainCadence:true) && paced.nextFrame==deadline)
+}
+// Sub-quarter-frame jitter retains phase; larger stalls (including long idle,
+// pause or backpressure) rebase exactly once rather than replaying missed work.
+for fps in [1, 15, 30, 60] {
+    let period = 1 / Double(fps), epsilon = period / 1_000_000
+    for jitter in [0.0, period / 20, period / 4 - epsilon, period / 4 + epsilon, period, 5.0] {
+        var paced = StreamFlow(fps: fps, quality: 20)
+        check("Local encoder boundary starts", paced.beginFrame(now: 10, maintainCadence: true))
+        let deadline = paced.nextFrame, now = deadline + jitter
+        check("Local encoder boundary admits work", paced.beginFrame(now: now, maintainCadence: true))
+        let expected = jitter < period / 4 ? deadline + period : now + period
+        check("Local encoder quarter-frame threshold preserves or rebases phase", abs(paced.nextFrame - expected) < epsilon)
+        check("Local encoder boundary never catches up immediately", !paced.beginFrame(now: now, maintainCadence: true))
+    }
+    var paced = StreamFlow(fps: fps, quality: 20)
+    check("Local encoder blocked start", paced.beginFrame(now: 10, maintainCadence: true))
+    check("Local encoder fills transport budget", paced.recordSend(epoch: 1, id: 1, bytes: StreamFlow.maxBytes, now: 10))
+    let deadline = paced.nextFrame, resumed = deadline + 5
+    check("Local encoder blocked wake preserves deadline", !paced.beginFrame(now: resumed, maintainCadence: true) && paced.nextFrame == deadline)
+    check("Local encoder cumulative feedback releases budget", paced.feedback(report(1, 1), currentEpoch: 1, now: resumed))
+    check("Local encoder resumes after backpressure without old phase", paced.beginFrame(now: resumed, maintainCadence: true) && abs(paced.nextFrame - resumed - period) < epsilon)
+    check("Local encoder backpressure resume cannot burst", !paced.beginFrame(now: resumed + period / 2, maintainCadence: true))
 }
 let result: [String: Any] = ["passed": true, "checks": checks, "simulated_rtt_ms": [40,100,400], "real_network": false, "real_capture": false, "real_input": false]
 if let output = ProcessInfo.processInfo.environment["TEST_OUTPUT"] {

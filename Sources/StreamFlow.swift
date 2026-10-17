@@ -54,9 +54,9 @@ struct StreamFlow {
     mutating func beginFrame(now: Double, maintainCadence: Bool = false) -> Bool {
         guard now >= nextFrame, hasCapacity else { return false }
         let period = 1 / Double(fps)
-        // JPEG's local encoder must not accumulate small timer-wakeup delays
-        // on every frame. Keep that phase only for <1/4-frame jitter; larger
-        // misses rebase without catch-up bursts. Other callers are unchanged.
+        // Local Mac-window/JPEG/RAW encoders must not accumulate small timer
+        // delays on every frame. Keep phase only for <1/4-frame jitter; larger
+        // misses rebase without catch-up bursts. The default stays unchanged.
         nextFrame = maintainCadence && nextFrame > 0 && now - nextFrame < period / 4 ? nextFrame + period : now + period
         return true
     }
