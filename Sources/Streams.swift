@@ -13,6 +13,15 @@ final class StreamSession: @unchecked Sendable {
     private let scrcpyInstallation: ScrcpySession.Installation
     private let jpegInstallation: AndroidJPEGSession.Installation
     private let rawDiscovery: AndroidRawSession.Discovery
+    private let makeNative: NativeCapture.Factory
+    private let iosCaptureMode: IOSCaptureMode
+    private let nativeScale:IOSCaptureScale
+    private var nativeSourceSize=(0,0)
+    private var native: NativeCapture?
+    private var nativeRetiring=false, nativeFailed=false
+    private var lastNativeGeneration:UInt64?
+    private var nativeReason:String?
+    private var nativeEffective="starting"
     private var raw: AndroidRawSession?
     private var rawFinish: (() -> Void)?
     private var rawRetiring = false, rawFailed = false
@@ -42,8 +51,9 @@ final class StreamSession: @unchecked Sendable {
     private var lastScrcpyWindowSize: ScrcpyVideoSize?
     private var pendingScrcpySize: ScrcpyVideoSize?
     private var scrcpySizeChangedAt = 0.0
-    // Service replacement must join every independent Android source/encoder.
-    var usesScrcpy: Bool { scrcpy != nil || backendRetiring || jpeg != nil || jpegRetiring || raw != nil || rawRetiring }
+    // Service replacement must join independent Android AND Native iOS sources.
+    var usesScrcpy: Bool { scrcpy != nil || backendRetiring || jpeg != nil || jpegRetiring || raw != nil || rawRetiring || native != nil || nativeRetiring }
+    var usesNativeCapture: Bool { iosCaptureMode == .native }
     private var independentCapture: String? { backendChoice.capture == .raw ? "raw" : backendChoice.capture == .jpeg ? "jpeg" : nil }
     private let physicalAndroid: Bool
     private let captureScale: AndroidCaptureScale
@@ -82,8 +92,10 @@ final class StreamSession: @unchecked Sendable {
     private let accessibility: AccessibilitySession
     private var started = monotonic()
     var onClose: (() -> Void)?
-    init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
-        self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation; self.rawDiscovery = rawDiscovery
+    init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeNative: @escaping NativeCapture.Factory = { NativeCapture(udid:$0) }, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
+        self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation; self.rawDiscovery = rawDiscovery; self.makeNative = makeNative
+        iosCaptureMode = .selected(request.query["capture_backend"],platform:devices.device(id)?.platform ?? "")
+        nativeScale = iosCaptureMode == .native ? .normalized(request.query["native_scale"]) : .full
         physicalAndroid = devices.device(id)?.physicalAndroid == true
         // Preserve the wire key; emulator scaling is admitted only for scrcpy/Auto.
         let requestedBackend = AndroidBackendChoice(capture: request.query["capture_backend"], input: request.query["input_backend"])
@@ -114,13 +126,14 @@ final class StreamSession: @unchecked Sendable {
         client.onMessage = { [weak self] text in self?.message(dictionary(Data(text.utf8))) }
         client.onClose = { [weak self] in self?.stop() }
         client.sendJSON(["type": "input_capabilities", "live_touch": true, "video_flow": "paced-v1"])
+        if !isAndroid { publishIOSCapture() }
         if let window = devices.window(id) { client.sendJSON(["type": "rotated", "landscape": window.landscape]) }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), leeway: .microseconds(100))
         timer.setEventHandler { [weak self] in self?.tick() }; timer.resume(); self.timer = timer
     }
     var snapshot: [String: Any] {
-        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "data_saver": dataSaver, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (captureHasFrame ? "Streaming" : "Starting")), "uptime": Int(monotonic() - started), "capture_counters": effectiveCapture == "scrcpy" ? (scrcpy?.diagnostics ?? [:]) : effectiveCapture == "jpeg" ? (jpeg?.diagnostics ?? [:]) : effectiveCapture == "raw" ? (raw?.diagnostics ?? [:]) : (capture?.counters ?? [:]), "input_counters": effectiveInput == "scrcpy" ? (scrcpy?.inputDiagnostics ?? [:]) : [:], "sent_fps": sentFPS, "target_fps": flow.targetFPS, "last_encode_ms": lastEncodeMS, "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending, "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS, "accessibility": accessibility.snapshot, "android_backends": isAndroid ? backendSnapshot : [:]]
+        ["id": id, "name": devices.device(id)?.name ?? id, "platform": devices.device(id)?.platform ?? "ios", "peer": client.peer, "fps": fps, "quality": quality, "data_saver": dataSaver, "frames": frameCount, "state": lastError ?? (paused ? "Paused" : (captureHasFrame ? "Streaming" : "Starting")), "uptime": Int(monotonic() - started), "ios_capture": isAndroid ? [:] : iosCaptureSnapshot, "capture_counters": iosCaptureMode == .native ? (native?.diagnostics ?? [:]) : effectiveCapture == "scrcpy" ? (scrcpy?.diagnostics ?? [:]) : effectiveCapture == "jpeg" ? (jpeg?.diagnostics ?? [:]) : effectiveCapture == "raw" ? (raw?.diagnostics ?? [:]) : (capture?.counters ?? [:]), "input_counters": effectiveInput == "scrcpy" ? (scrcpy?.inputDiagnostics ?? [:]) : [:], "sent_fps": sentFPS, "target_fps": flow.targetFPS, "last_encode_ms": lastEncodeMS, "unreceived_frames": flow.count, "unreceived_bytes": flow.bytes, "receiver_pending_frames": flow.receiverPending, "receiver_decode_queue": flow.receiverQueue, "receiver_oldest_ms": flow.receiverOldestMS, "accessibility": accessibility.snapshot, "android_backends": isAndroid ? backendSnapshot : [:]]
     }
     // One-shot deadlines avoid quantizing 16.67 ms frames onto 16 ms polling
     // ticks. Local encode/write completions wake it; receiver RTT never gates
@@ -129,7 +142,7 @@ final class StreamSession: @unchecked Sendable {
         guard !closed else { return }
         let now = monotonic()
         var deadline = now + 0.25
-        if videoReady && !paused && !configuring && !encoding && !sending && flow.hasCapacity {
+        if videoReady && !paused && !configuring && !encoding && !sending && flow.hasCapacity && !(iosCaptureMode == .native && (nativeFailed || nativeRetiring)) {
             if effectiveCapture == "scrcpy" && backendResolved {
                 // scrcpy pushes already encoded AUs; do not pace them twice.
                 if scrcpy?.hasFrame == true { deadline = now }
@@ -190,6 +203,9 @@ final class StreamSession: @unchecked Sendable {
                 return
             }
         }
+        if iosCaptureMode == .native {
+            if !paused { encodeNative() }; return
+        }
         guard let window = devices.window(id) else {
             if capture != nil { releaseCapture() }
             notifyError("Device window unavailable"); nextFrame = now + 0.5; return
@@ -231,6 +247,13 @@ final class StreamSession: @unchecked Sendable {
         if isAndroid && (effectiveCapture == "scrcpy" || effectiveCapture == "jpeg" || effectiveCapture == "raw") && (lastVideoSize.0 != frame.width || lastVideoSize.1 != frame.height) {
             if (effectiveCapture == "jpeg" || effectiveCapture == "raw") && lastVideoSize.0>0 { scrcpy?.invalidatePhysicalSize() }
             lastVideoSize=(frame.width,frame.height);client.sendJSON(["type":"rotated","landscape":frame.width>frame.height])
+        }
+        if iosCaptureMode == .native && lastVideoSize != (frame.width,frame.height) {
+            input.cancel(id) // end an old-orientation gesture before mapping new pixels
+            lastVideoSize=(frame.width,frame.height);client.sendJSON(["type":"rotated","landscape":frame.width>frame.height])
+        }
+        if !isAndroid && iosCaptureMode == .window && nativeEffective != "current" {
+            nativeEffective="current";publishIOSCapture()
         }
         let packetBytes = frame.payload.count + 24
         guard flow.canSend(bytes: packetBytes) else {
@@ -540,6 +563,55 @@ final class StreamSession: @unchecked Sendable {
             }
         }
     }
+    private var iosCaptureSnapshot:[String:Any] {
+        ["type":"ios_capture","capture":iosCaptureMode.rawValue,"effective_capture":nativeFailed ? "unavailable":nativeEffective,"reason":nativeReason as Any? ?? NSNull(),"input":"window","native_scale":nativeScale.rawValue]
+    }
+    private func publishIOSCapture() { client.sendJSON(iosCaptureSnapshot) }
+    private func releaseNative() {
+        guard let old=native else{return}
+        native=nil;nativeRetiring=true;captureHasFrame=false;nativeSourceSize=(0,0);old.cancel()
+        let finish=beginCaptureWork()
+        worker.async { [self] in
+            old.stop()
+            queue.async { self.nativeRetiring=false;finish();self.reschedule() }
+        }
+    }
+    private func encodeNative() {
+        guard !nativeFailed,!nativeRetiring,!encoding,!sending,!paused else{return}
+        // Never start/reconnect for a device no longer present in inventory.
+        guard devices.device(id)?.platform == "ios" else {
+            nativeFailed=true;nativeReason="Selected iOS Simulator is unavailable";releaseNative();publishIOSCapture();notifyError(nativeReason!);return
+        }
+        guard flow.hasCapacity else{flow.congested(now:monotonic());return}
+        let admitted=monotonic()
+        guard flow.beginFrame(now:admitted,maintainCadence:true) else{return}
+        if native==nil { native=makeNative(id);lastNativeGeneration=nil }
+        guard let source=native else{return};encoding=true
+        let q=quality,f=fps,key=forceKeyframe,saver=dataSaver,epoch=videoEpoch,finish=beginCaptureWork()
+        worker.async { [self] in
+            let start=monotonic()
+            let result=Result{try source.h264(quality:q,fps:f,forceKeyframe:key,dataSaver:saver,scaling:self.nativeScale)}
+            queue.async {
+                self.encoding=false;self.lastEncodeMS=(monotonic()-start)*1000
+                defer{finish();self.reschedule()}
+                guard !self.closed,!self.paused,self.native === source,self.videoEpoch==epoch else{return}
+                switch result {
+                case .success(let video):
+                    guard let video else {
+                        if source.diagnostics["cached_image_available"] as? Bool != true {self.captureHasFrame=false;if self.nativeEffective != "starting" {self.nativeEffective="starting";self.publishIOSCapture()}};return
+                    }
+                    if self.nativeSourceSize != (video.sourceWidth,video.sourceHeight) {
+                        self.input.cancel(self.id);self.nativeSourceSize=(video.sourceWidth,video.sourceHeight)
+                    }
+                    if self.lastNativeGeneration != video.generation {self.requestKeyframe(newEpoch:true);self.lastNativeGeneration=video.generation}
+                    if self.nativeEffective != "native" {self.nativeEffective="native";self.publishIOSCapture()}
+                    self.deliver(video.frame,epoch:self.videoEpoch)
+                case .failure(let error):
+                    self.nativeFailed=true;self.nativeReason=error.localizedDescription;self.notifyError(error.localizedDescription);self.releaseNative();self.publishIOSCapture()
+                }
+            }
+        }
+    }
     private func notifyError(_ message: String) {
         if lastError != message { lastError = message; client.sendJSON(["type": "capture_error", "message": message]); log("\(id): \(message)") }
     }
@@ -579,7 +651,7 @@ final class StreamSession: @unchecked Sendable {
                 if changed { backendSettingsAt = monotonic() + 0.35 }
             }
             if let value = data["data_saver"] as? Bool, value != dataSaver { dataSaver = value; requestKeyframe() }
-            if let value = data["stream_paused"] as? Bool, value != paused { paused = value; requestKeyframe(newEpoch: true); if isAndroid { resetAndroid() } }
+            if let value = data["stream_paused"] as? Bool, value != paused { paused = value; requestKeyframe(newEpoch: true); if isAndroid { resetAndroid() }; if iosCaptureMode == .native { releaseNative();nativeFailed=false;nativeReason=nil;nativeEffective="starting";publishIOSCapture() } }
             if let value = data["accessibility_enabled"] as? Bool { accessibility.update(paneOpen: value, streamActive: value && accessibilityStreamReady, subscription: data["accessibility_subscription"] as? Int) }
         } else {
             guard DeviceInput.supportedTypes.contains(type) else { return }
@@ -602,6 +674,13 @@ final class StreamSession: @unchecked Sendable {
         }
         if physicalAndroid && (devices.device(id) == nil || !["touch_down","touch_move","touch_up","tap","drag","accessibility_swipe","key","text","home","back","menu","app_switcher"].contains(data["type"] as? String ?? "")) {
             completion(["type":"input_error","message":"Device unavailable or control unsupported on physical Android"]);return
+        }
+        if iosCaptureMode == .native && ["touch_down","touch_move","touch_up","tap","drag","accessibility_swipe"].contains(data["type"] as? String ?? "") {
+            guard !paused,captureHasFrame,lastError==nil,let window=devices.window(id),nativeSourceSize.0>0,nativeSourceSize.1>0,
+                  window.landscape == (nativeSourceSize.0>nativeSourceSize.1),
+                  abs(window.crop.width/window.crop.height-Double(nativeSourceSize.0)/Double(nativeSourceSize.1))<0.08 else {
+                input.cancel(id);completion(["type":"input_error","message":"Native video needs a matching visible Simulator window for touch input"]);return
+            }
         }
         if isAndroid {
             guard !paused, backendResolved, effectiveInput != "unavailable", captureHasFrame, lastError == nil else { completion(["type":"input_error","message":backendReason ?? "Android stream is not ready"]);return }
@@ -632,7 +711,7 @@ final class StreamSession: @unchecked Sendable {
     func stop(completion: @escaping () -> Void = {}) {
         if !closed {
             closed = true; accessibility.stop()
-            timer?.cancel(); timer = nil; pendingInput.removeAll(); input.cancel(id); releaseAndroid(); releaseJPEG(); releaseRaw(); releaseCapture(); onClose?(); onClose = nil
+            timer?.cancel(); timer = nil; pendingInput.removeAll(); input.cancel(id); releaseAndroid(); releaseJPEG(); releaseRaw(); releaseNative(); releaseCapture(); onClose?(); onClose = nil
         }
         // Await only this device's capture work, including an in-flight configure.
         // Other simulator captures do not delay or get stopped by this request.

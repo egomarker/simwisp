@@ -17,6 +17,7 @@ final class Service {
     private let scrcpyInstallation: ScrcpySession.Installation
     private let jpegInstallation: AndroidJPEGSession.Installation
     private let rawDiscovery: AndroidRawSession.Discovery
+    private let makeNative: NativeCapture.Factory
     private let captureStopTimeout: Double
     private var streams: [String: StreamSession] = [:] // network queue owns registry
     private var retiring: [String: [StreamSession]] = [:] // disconnected/replaced captures still cleaning up
@@ -29,9 +30,9 @@ final class Service {
     private var usage = Usage() // sampled on the network queue for diagnostics only
     private var panelState: [String: Any] = ["visible": false, "refresh_timer": false, "refreshes": 0]
     var stateChanged: ((String) -> Void)?
-    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory, devices: Devices? = nil, input: DeviceInput? = nil, metroEndpoint: URL = URL(string: "http://127.0.0.1:8081/json/list")!, captureStopTimeout: Double = 20, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
+    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory, devices: Devices? = nil, input: DeviceInput? = nil, metroEndpoint: URL = URL(string: "http://127.0.0.1:8081/json/list")!, captureStopTimeout: Double = 20, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeNative: @escaping NativeCapture.Factory = { NativeCapture(udid:$0) }, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
         self.pairingStateURL = pairingStateURL; self.tlsDirectory = tlsDirectory
-        self.settings = settings; self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation; self.rawDiscovery = rawDiscovery; self.captureStopTimeout = captureStopTimeout
+        self.settings = settings; self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation; self.rawDiscovery = rawDiscovery; self.makeNative = makeNative; self.captureStopTimeout = captureStopTimeout
         let selectedDevices = devices ?? Devices(settings: settings)
         self.devices = selectedDevices; self.input = input ?? DeviceInput(devices: selectedDevices)
         terminals = TerminalManager(settings: settings, network: server.queue)
@@ -90,7 +91,7 @@ final class Service {
         let previous = streams.removeValue(forKey: id)
         let waitForBackend = previous?.usesScrcpy == true
         if let old = previous { retire(old); old.client.close() }
-        let session = StreamSession(id: id, client: client, request: request, settings: settings, devices: devices, input: input, queue: server.queue, lifecycle: lifecycle, scrcpyInstallation: scrcpyInstallation, jpegInstallation: jpegInstallation, rawDiscovery: rawDiscovery, makeCapture: makeCapture)
+        let session = StreamSession(id: id, client: client, request: request, settings: settings, devices: devices, input: input, queue: server.queue, lifecycle: lifecycle, scrcpyInstallation: scrcpyInstallation, jpegInstallation: jpegInstallation, rawDiscovery: rawDiscovery, makeNative: makeNative, makeCapture: makeCapture)
         session.onClose = { [weak self, weak session] in
             guard let self, let session, self.streams[id] === session else { return }
             self.streams.removeValue(forKey: id); self.retire(session)
@@ -98,7 +99,19 @@ final class Service {
         }
         streams[id] = session; devices.setStreamingDemand(true)
         client.onClose = { [weak session] in session?.stop() }
-        if let old = previous, waitForBackend { old.stop { [weak self, weak session] in
+        // A socket can close (or be replaced repeatedly) before its capture
+        // finishes retiring. Joining only 'previous' loses that older work.
+        // Native transitions join ALL same-device retirements, not other devices;
+        // Android-only replacement policy remains unchanged.
+        let nativeTransition = session.usesNativeCapture || (retiring[id] ?? []).contains { $0.usesNativeCapture }
+        if nativeTransition {
+            let barrier=DispatchGroup()
+            for old in retiring[id] ?? [] { barrier.enter();old.stop { barrier.leave() } }
+            barrier.notify(queue:server.queue) { [weak self,weak session] in
+                guard let self,let session,self.streams[id] === session,!client.isClosed else{return}
+                session.start()
+            }
+        } else if let old = previous, waitForBackend { old.stop { [weak self, weak session] in
             guard let self, let session, self.streams[id] === session, !client.isClosed else { return };session.start()
         } } else { session.start() }
     }

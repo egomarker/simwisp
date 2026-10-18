@@ -13,8 +13,10 @@ build:
 	xcrun clang -O2 -Wall -Wextra -Werror -isysroot '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/TerminalHost.c -o '$(APP)/Contents/MacOS/SimwispShell'
 	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 $(SOURCES) -o '$(APP)/Contents/MacOS/Simwisp'
 	@cp Resources/Info.plist '$(APP)/Contents/Info.plist'
+	@rm -rf '$(APP)/Contents/Resources/Web'
 	@cp -R Resources/Web '$(APP)/Contents/Resources/'
 	@cp Resources/device-sizes.json '$(APP)/Contents/Resources/'
+	@cp -R Resources/Native '$(APP)/Contents/Resources/'
 	@rm -f '$(APP)/Contents/Resources/UPSTREAM-LICENSE'
 	codesign --force --sign - --identifier io.simwisp.shell '$(APP)/Contents/MacOS/SimwispShell'
 	codesign --force --sign - --identifier io.simwisp.app -r '=designated => identifier "io.simwisp.app"' '$(APP)'
@@ -124,3 +126,13 @@ test-android-raw:
 .PHONY: test-android-emulator-scrcpy
 test-android-emulator-scrcpy:
 	@ANDROID_EMULATOR_SCRCPY=1 NODE='$(NODE)' Tests/Android/run.sh
+
+.PHONY: test-native test-native-browser
+test-native:
+	@NODE='$(NODE)' Tests/Native/run.sh
+test-native-browser:
+	@NATIVE_BROWSER=1 NODE='$(NODE)' Tests/Native/run.sh
+
+.PHONY: test-backend-ui
+test-backend-ui:
+	@TEST_OUTPUT="$(TEST_OUTPUT)" "$(NODE)" Tests/Browser/backend-copy.mjs

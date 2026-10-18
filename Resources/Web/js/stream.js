@@ -65,7 +65,7 @@ export class SimStream {
     this.#onBackends = onBackends ?? (() => {});
 
     this.settings = { fps, quality, data_saver, dev_w: canvas.width, dev_h: canvas.height };
-    if (backends) Object.assign(this.settings, { capture_backend: backends.capture, input_backend: backends.input, jpeg_scale: backends.scaling });
+    if (backends) Object.assign(this.settings, { capture_backend: backends.capture, input_backend: backends.input, jpeg_scale: backends.scaling, native_scale: backends.nativeScaling });
 
     this.#setupPointer();
     this.#connect();
@@ -86,7 +86,7 @@ export class SimStream {
 
   switchBackends(choices) {
     this.#cancelPointer();
-    Object.assign(this.settings, { capture_backend: choices.capture, input_backend: choices.input, jpeg_scale: choices.scaling });
+    Object.assign(this.settings, { capture_backend: choices.capture, input_backend: choices.input, jpeg_scale: choices.scaling, native_scale: choices.nativeScaling });
     // Reconnect only this device. Native retirement releases input and joins the
     // old server before the replacement starts; old socket callbacks are ignored.
     this.#connect();
@@ -311,7 +311,7 @@ export class SimStream {
     this.#onStatus('connecting');
     const sourceSize = this.#scrcpyBaseSize ?? { width: this.#portraitW, height: this.#portraitH };
     const ws = new WebSocket(
-      `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/${encodeURIComponent(this.#udid)}?fps=${this.settings.fps}&quality=${this.settings.quality}&w=${sourceSize.width}&h=${sourceSize.height}&data_saver=${this.settings.data_saver ? 1 : 0}${this.settings.capture_backend ? '&capture_backend=' + encodeURIComponent(this.settings.capture_backend) + '&input_backend=' + encodeURIComponent(this.settings.input_backend) : ''}${this.settings.jpeg_scale ? '&jpeg_scale=' + encodeURIComponent(this.settings.jpeg_scale) : ''}`
+      `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/${encodeURIComponent(this.#udid)}?fps=${this.settings.fps}&quality=${this.settings.quality}&w=${sourceSize.width}&h=${sourceSize.height}&data_saver=${this.settings.data_saver ? 1 : 0}${this.settings.capture_backend ? '&capture_backend=' + encodeURIComponent(this.settings.capture_backend) + '&input_backend=' + encodeURIComponent(this.settings.input_backend) : ''}${this.settings.jpeg_scale ? '&jpeg_scale=' + encodeURIComponent(this.settings.jpeg_scale) : ''}${this.settings.capture_backend === 'native' && this.settings.native_scale ? '&native_scale=' + encodeURIComponent(this.settings.native_scale) : ''}`
     );
     this.#ws = ws; ws.binaryType = 'arraybuffer';
     this.#connectTimer = setTimeout(() => {
@@ -348,6 +348,8 @@ export class SimStream {
         const msg = JSON.parse(e.data);
         if (msg.type === 'device_stopping') {
           this.destroy(); this.#onStopped();
+        } else if (msg.type === 'ios_capture') {
+          this.#onBackends(msg);
         } else if (msg.type === 'android_backends') {
           this.#effectiveCapture = msg.effective_capture;
           if (msg.physical === false && ['auto', 'scrcpy'].includes(msg.capture) &&

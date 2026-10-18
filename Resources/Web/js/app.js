@@ -1,6 +1,7 @@
 import { fetchInfo, fetchSims, fetchAvailableDevices, bootSim, bootAvd, stopSim, fetchStopStatus, requestPermission } from './api.js';
 import { SimStream } from './stream.js';
 import { AndroidBackends, backendIcon } from './android-backends.js';
+import { IOSCapture } from './ios-capture.js';
 import { initTheme } from './theme.js';
 import { MetroDiscovery, consoleIdentity, resolveConsole } from './metro-discovery.js';
 
@@ -654,6 +655,8 @@ function addSimPanel(udid, name, w, h, platform) {
     button.addEventListener('click', firstOpen);
   }
 
+  if (platform === 'ios') panel.backends = new IOSCapture(pillEl.querySelector('.backend-trigger'), name, udid, choices => panel.stream?.switchBackends(choices));
+
   rebuildDividers();
 
   // ── ResizeObserver ──
@@ -927,7 +930,7 @@ function createPill(udid, name, platform, physical = false) {
   pill.className = 'controls-pill';
   pill.innerHTML = `
     <div class="panel-telemetry"><span class="status-dot"></span><span class="panel-status">Connecting</span>
-      ${platform === 'android' ? '<button type="button" class="backend-trigger" title="Android backends" aria-label="Android backends">' + backendIcon + '<span>Backends</span></button>' : ''}
+      ${platform === 'android' ? '<button type="button" class="backend-trigger" title="Android backends" aria-label="Android backends">' + backendIcon + '<span>Backends</span></button>' : platform === 'ios' ? '<button type="button" class="backend-trigger" title="iOS backends" aria-label="iOS backends">' + backendIcon + '<span>Backends</span></button>' : ''}
       <span class="stream-stats" title="Stream stats">— fps · — KB/s</span>
     </div>
     <div class="panel-actions" role="group" aria-label="Simulator controls">

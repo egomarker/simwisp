@@ -1,0 +1,25 @@
+SimulatorView
+Copyright 2026 Yuta Ooka (https://github.com/subdiox)
+
+This product includes software developed at tddworks (https://github.com/tddworks/baguette).
+The CoreSimulator + SimulatorKit runtime bridge (`CoreSimulatorRuntime`, `SimDeviceResolver`)
+and the IOSurface framebuffer streaming logic (`SimulatorFramebuffer`) are derived from
+baguette's `Sources/Baguette/Infrastructure/Simulator/CoreSimulators.swift` and
+`Sources/Baguette/Infrastructure/Screen/SimulatorKitScreen.swift`, both Apache 2.0 licensed.
+
+Modifications:
+- Repackaged as a standalone library with a public AppKit/SwiftUI surface.
+- Removed CLI-specific scaffolding (logging, error reporting via stderr, host-side
+  domain types, gesture registry, HTTP server integration).
+- Switched concurrency model to Swift 6 actors / @MainActor isolation; eliminated
+  @unchecked Sendable and nonisolated(unsafe) static state.
+
+Simwisp Native capture compatibility implementation (2026)
+Runtime selector architecture informed by subdiox/SimKit at
+74c895ea and the owner-supplied SimFramebufferProbe / FPSBenchmark Xcode16
+compatibility probes. No SimKit runtime dependency is bundled.
+Simwisp modifications: guarded Objective-C signature checks, explicit opt-in
+per-simulator selection, pull-only polling with no private callback registration,
+bounded immutable BGRA/BGRX snapshots and shared H.264/HTTPS lifecycle integration.
+Original upstream attribution above is preserved; its modification list describes
+upstream SimKit, not additional features supplied by Simwisp.
