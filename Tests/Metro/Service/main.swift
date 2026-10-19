@@ -150,7 +150,7 @@ try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: 
 var settings = Settings(); settings.port = 45152; settings.shareLAN = false; settings.terminalEnabled = true
 settings.projectDirectory = root.path; settings.androidSDK = root.appendingPathComponent("sdk").path; settings.pairingToken = "isolated-device-stop-token"
 let control = DeviceControl(adb: fakeADB.path, launches: world.launches, windows: world.windows, run: world.run, wait: world.wait, clock: { world.clock })
-let devices = Devices(settings: settings, control: control, discovery: world.discovery, boot: world.boot)
+let devices = Devices(settings: settings, control: control, discovery: world.discovery, boot: { id, _ in try world.boot(id) })
 let service = Service(settings: settings, pairingStateURL: root.appendingPathComponent("pairing-state.json"), tlsDirectory: root.appendingPathComponent("tls"), devices: devices, metroEndpoint: URL(string: "http://127.0.0.1:45153/json/list")!, captureStopTimeout: 1.5, scrcpyInstallation: { throw WispError("Isolated fixture: scrcpy unavailable") }, makeCapture: { window in
     let native = FakeStream(window.title)
     return WindowCapture(target: window, makeStream: { capture in native.capture = capture; return native })

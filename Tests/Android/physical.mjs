@@ -2,7 +2,8 @@
 import fs from 'node:fs';import crypto from 'node:crypto';import {spawn} from 'node:child_process';
 const root=process.argv[2],base='https://127.0.0.1:45154',cookie=crypto.createHash('sha256').update('simwisp-session-v1:isolated-android-backends').digest('hex');
 const ids=['adb-PHYSICAL-TEST._adb-tls-connect._tcp','USBPHYSICALTEST123','192.0.2.10:37123','[2001:db8::1]:5555'];
-const checks=[],exceptions=[],pending=new Map();let chrome,ws,seq=0,received=0;
+let initial=null;
+const checks=process.env.PHYSICAL_PREVIOUS_REPORT?JSON.parse(fs.readFileSync(process.env.PHYSICAL_PREVIOUS_REPORT,'utf8')).checks.filter(x=>x.passed):[],exceptions=[],pending=new Map();let chrome,ws,seq=0,received=0;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms)),put=(p,v)=>fs.writeFileSync(root+'/'+p,JSON.stringify(v)),remove=p=>{try{fs.unlinkSync(root+'/'+p)}catch{}};
 const events=()=>fs.readFileSync(root+'/events.ndjson','utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
 const launches=()=>events().filter(e=>e.kind==='command'&&e.args.includes('exec-out'));
@@ -15,7 +16,23 @@ async function ev(expression){const r=await cdp('Runtime.evaluate',{expression,r
 async function api(path='/api/sessions',method='GET'){const r=await fetch(base+path,{method,headers:{Cookie:'simwisp_session='+cookie,Origin:base}});return{status:r.status,value:await r.json()}}
 async function live(){return(await api()).value[0]}
 async function active(){await until('physical JPEG + scrcpy stream',async()=>{const s=await live();return s?.state==='Streaming'&&s.frames>2&&s.android_backends.effective_capture==='jpeg'&&s.android_backends.effective_input==='scrcpy'});return live()}
-async function directClose(){await ev('window.phoneStream?.destroy();window.phoneStream=null');await until('all stream work retired',async()=>!await live());await sleep(300)}
+async function directClose(){
+  const started=events().filter(e=>e.kind==='command').flatMap(e=>{
+    const command=e.args.join(' '),serial=e.args[1],scid=command.match(/scid=([a-f0-9]+)/)?.[1];
+    if(scid)return [{serial,needle:'rm -f /data/local/tmp/simwisp-scrcpy-'+scid+'.jar'}];
+    const dir=e.args.includes('exec-out')?command.match(/\/data\/local\/tmp\/simwisp-jpeg-[a-f0-9]+/)?.[0]:null;
+    return dir?[{serial,needle:"rm -rf '"+dir+"'"}]:[];
+  });
+  await ev('window.phoneStream?.destroy();window.phoneStream=null');
+  await until('session registry removed',async()=>!await live());
+  // Registry removal precedes async producer retirement. Do not charge a prior
+  // phone's correctly scoped cleanup commands to the next phone's event slice.
+  await until('all owned producer cleanup commands complete',()=>{
+    const commands=events().filter(e=>e.kind==='command');
+    return started.every(({serial,needle})=>commands.some(e=>e.args[1]===serial&&e.args.join(' ').includes(needle)));
+  });
+  await sleep(100);
+}
 async function direct(id,capture='auto',input='auto',scale='1'){
   fs.writeFileSync(root+'/serial',id);await api('/api/sims');
   await ev(`(async()=>{const{SimStream}=await import('/js/stream.js');const c=document.getElementById('phone-canvas')||Object.assign(document.createElement('canvas'),{id:'phone-canvas'});c.width=411;c.height=914;document.body.append(c);window.phoneStats=[];window.phoneStatus=[];window.phoneStream=new SimStream(${JSON.stringify(id)},c,{fps:30,quality:20,backends:{capture:${JSON.stringify(capture)},input:${JSON.stringify(input)},scaling:${JSON.stringify(scale)}},onStats:s=>phoneStats.push(s),onStatus:s=>phoneStatus.push(s)});return true})()`);
@@ -32,11 +49,12 @@ try{
   ws.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.id&&pending.has(m.id)){const p=pending.get(m.id);pending.delete(m.id);clearTimeout(p.timer);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result)}else if(m.method==='Runtime.exceptionThrown')exceptions.push(m.params);else if(m.method==='Network.webSocketFrameReceived'&&m.params.response.opcode===2)received++});
   await cdp('Page.enable');await cdp('Runtime.enable');await cdp('Network.enable');await cdp('Network.setCookie',{name:'simwisp_session',value:cookie,url:base,secure:true,httpOnly:true,sameSite:'Strict'});await cdp('Page.navigate',{url:base});
   await until('phone listed',()=>ev("document.querySelector('.device-item')!==null"));
+  if(process.env.PHYSICAL_CONTINUE_REMAINDER!=='1'){
   const listing=(await api('/api/sims')).value;
   check('phone inventory exposes physical identity and native1080×2400 size',listing.length===1&&listing[0].physical===true&&listing[0].width===1080&&listing[0].height===2400&&listing[0].avd===null);
   check('physical phone has no destructive Stop button',await ev("!document.querySelector('.device-stop-btn')&&document.querySelector('.device-dims').textContent.includes('Android device')"));
   await ev(`localStorage.setItem('simwisp.android-backends.v1:'+encodeURIComponent('device:'+${JSON.stringify(ids[0])}),JSON.stringify({capture:'raw',input:'current'}));window.phoneSockets=[];const NativeSocket=WebSocket;window.WebSocket=class extends NativeSocket{constructor(...args){super(...args);phoneSockets.push(this)}};document.querySelector('.device-item').click()`);
-  const initial=await active();
+  initial=await active();
   check('actual phone panel overrides stale unsafe choices with JPEG+control-only',initial.android_backends.capture==='jpeg'&&initial.android_backends.input==='scrcpy');
   check('initial product capture budget uses physical display, not411×914 fixture limit',initial.capture_counters.max_size===2400);
   check('JPEG is hardware H264 and fixed intermediate quality70',initial.capture_counters.hardware_encoder===true&&initial.capture_counters.jpeg_quality===70);
@@ -97,7 +115,8 @@ try{
   await until('keyboard scaling x1',async()=>(await live())?.capture_counters.max_size===2400);
   check('keyboard Home selects scaling x1 without changing capture/input',(await live()).android_backends.capture==='jpeg'&&(await live()).android_backends.input==='scrcpy');
   await ev("document.querySelector('[data-action=close]').click()");await until('phone panel closed',async()=>!await live());await sleep(300);
-  for(const id of ids){
+  }
+  for(const id of process.env.PHYSICAL_CONTINUE_REMAINDER==='1'?ids.slice(1):ids){
     const before=events().length;await direct(id);const s=await active();
     check('native Auto routes '+id+' to JPEG+scrcpy',s.android_backends.capture==='jpeg'&&s.android_backends.input==='scrcpy'&&s.capture_counters.max_size===2400);
     const count=events().filter(e=>e.kind==='control').length;

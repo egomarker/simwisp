@@ -24,6 +24,9 @@ final class World {
     var listTimeouts: [Double] = [], androidState = "device"
     var onSnapshot: ((Int) -> Void)?, onQuit: (() -> Void)?, onInventory: ((Int) -> Void)?
     var inventories = 0, selectionReliable: Bool?
+    var processTarget: AndroidEmulatorProcess?, processAlive = false, processReadFails = false, processSignalRefused = false
+    var processSignals: [Int32] = [], signalledPIDs: [pid_t] = []
+    var onProcessSignal: ((Int32) -> Void)?, onBeforeSignal: (() -> Void)?, onADBList: (() -> Void)?
     let launches = DeviceLaunches()
     var control: DeviceControl!
     init(adb: String? = "/fixture/adb") {
@@ -42,7 +45,15 @@ final class World {
                 // The native effect makes this same fresh identity/window check.
                 guard reliable, refs.isEmpty, apps == [pid], !quitRefused else { return false }
                 quits += 1; return true
-            }), run: { [unowned self] path, args, timeout in
+            }), emulatorProcesses: AndroidEmulatorProcessEffects(resolve: { [unowned self] _ in processTarget },
+                isRunning: { [unowned self] target in
+                    if processReadFails { throw WispError("fixture process identity unreadable") }
+                    return processAlive && processTarget == target
+                }, signal: { [unowned self] _, target, number in
+                    onBeforeSignal?()
+                    guard !processSignalRefused, processAlive, processTarget == target else { return false }
+                    processSignals.append(number); signalledPIDs.append(target.pid); onProcessSignal?(number); return true
+                }), run: { [unowned self] path, args, timeout in
                 commands.append([path] + args)
                 if args == ["simctl", "list", "devices", "--json"] {
                     inventories += 1; onInventory?(inventories)
@@ -61,6 +72,7 @@ final class World {
                     return result()
                 }
                 if args == ["devices"] {
+                    onADBList?()
                     listTimeouts.append(timeout); time += min(timeout, listDuration)
                     if failList || listFailures > 0 { listFailures = max(0, listFailures - 1); return result(status: 1, error: "fixture inventory failed") }
                     if let listOverride { return result(output: listOverride) }
@@ -477,7 +489,142 @@ for change in ["otherBooted", "selectedBooted", "inventoryError", "invalidInvent
 }
 let raceChecks = checks - raceStart
 
-let report: [String: Any] = ["passed": true, "checks": checks, "adapterChecks": adapterChecks, "newRaceChecks": raceChecks, "realDeviceActions": false, "realWindowActions": false, "realAppQuit": false]
+let launchStart = checks
+for (body, mode) in [("", DeviceLaunchMode.windowed), ("{}", .windowed), ("{\"mode\":\"windowed\"}", .windowed), ("{\"mode\":\"headless\"}", .headless)] {
+    expect(try DeviceLaunchMode.parse(Data(body.utf8)) == mode, "closed launch-mode parser accepts backward-compatible object")
+}
+for body in ["[]", "null", "{", "{\"mode\":true}", "{\"mode\":1}", "{\"mode\":null}", "{\"mode\":\"HEADLESS\"}", "{\"mode\":\"bad\"}"] {
+    do { _ = try DeviceLaunchMode.parse(Data(body.utf8)); expect(false, "invalid launch mode rejected") } catch { expect(true, "invalid launch object rejected before effect") }
+}
+for mode in [DeviceLaunchMode.windowed, .headless] {
+    var commands: [[String]] = [], spawned: [[String]] = []
+    let control = DeviceControl(adb: nil, run: { path, args, _ in commands.append([path] + args); return CommandResult(status: 0, output: Data(), error: Data()) }, launch: { path, args in spawned.append([path] + args) })
+    try control.boot(a, platform: "ios", mode: mode)
+    expect(commands.first == ["/usr/bin/xcrun", "simctl", "boot", a], "iOS boot always targets exact UUID")
+    expect(commands.count == (mode == .headless ? 1 : 2), "headless iOS never opens Simulator")
+    if mode == .windowed { expect(commands.last == ["/usr/bin/open", "-a", "Simulator", "--args", "-CurrentDeviceUDID", a], "windowed Run retains selected Simulator-window opening") }
+    expect(spawned.isEmpty, "iOS never launches Android")
+    commands = []
+    try control.boot("Pixel_6_API_36", platform: "android", mode: mode, emulator: "/fixture/emulator")
+    expect(commands.isEmpty, "Android launch issues no simctl or host input")
+    expect(spawned == [["/usr/bin/nohup", "/fixture/emulator", "-avd", "Pixel_6_API_36"] + (mode == .headless ? ["-no-window", "-no-boot-anim", "-gpu", "host"] : ["-no-snapshot-load"])], "Android launch preserves args and adds no-window only for headless")
+}
+do {
+    var calls = 0
+    let control = DeviceControl(adb: nil, run: { _, _, _ in calls += 1; return CommandResult(status: 1, output: Data(), error: Data("inert boot failure".utf8)) }, launch: { _, _ in expect(false, "no launch effect") })
+    do { try control.boot(a, platform: "ios"); expect(false, "failed boot throws") } catch { expect(calls == 1, "failed boot never opens native window") }
+    do { try control.boot("booted", platform: "ios", mode: .headless); expect(false, "invalid selector") } catch { expect(calls == 1, "unvalidated iOS selector never invokes command") }
+    do { try control.boot("known-avd", platform: "android", mode: .headless); expect(false, "missing emulator") } catch { expect(calls == 1, "missing emulator fails without host actions") }
+}
+let launchChecks = checks - launchStart
+
+// The real regression: ADB acknowledges "emu kill" but the host emulator
+// remains alive. Every process/command/signal effect below is inert.
+let fallbackStart = checks
+let fallbackDevice = Device(id: "emulator-5554", name: "Pixel 6 API 36", platform: "android", width: 0, height: 0, avd: "Pixel_6_API_36")
+let fixtureEmulator = "/fixture/sdk/emulator/emulator"
+func emulatorProcess(pid: pid_t = 4242, start: UInt64 = 100, uid: uid_t = geteuid(), executable: String = "/fixture/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless", args: [String] = ["emulator", "-avd", "Pixel_6_API_36", "-no-window"]) -> AndroidEmulatorProcess {
+    AndroidEmulatorProcess(pid: pid, uid: uid, startSeconds: start, startMicroseconds: 42, executable: executable, arguments: args)
+}
+func hungEmulator() -> World {
+    let world = World(); world.neverRemoveADB = true; world.processTarget = emulatorProcess(); world.processAlive = true; return world
+}
+for exitSignal in [SIGTERM, SIGKILL] {
+    let world = hungEmulator()
+    world.onProcessSignal = { signal in if signal == exitSignal { world.processAlive = false; world.android.removeAll { $0 == fallbackDevice.id } } }
+    let output = try world.control.stop(fallbackDevice)
+    expect(output["state"] as? String == "stopped", "hung emulator is confirmed stopped after fallback")
+    expect(world.processSignals == (exitSignal == SIGTERM ? [SIGTERM] : [SIGTERM, SIGKILL]), "one TERM then at most one KILL; never kill after graceful exit")
+    expect(world.signalledPIDs.allSatisfy { $0 == 4242 } && world.android == ["emulator-5556"], "signals/ADB affect only selected emulator, not second device or crashpad")
+    expect(world.commands.filter { $0.contains("kill") }.count == 1, "fallback never resends adb emu kill")
+    expect(world.time == (exitSignal == SIGTERM ? 8 : 10), "bounded grace before escalating")
+    expect((output["forced"] as? Bool == true) == (exitSignal == SIGKILL), "forced shutdown explicitly reported")
+    if exitSignal == SIGKILL { expect(output["warning"] is String, "force-stop warns about unsaved state") }
+    expect(world.snapshots == 0 && world.quits == 0 && world.closeIDs.isEmpty, "Android process fallback never touches iOS GUI")
+}
+do {
+    let world = hungEmulator(); world.neverRemoveADB = false; world.onADBList = { world.processAlive = false }
+    expect((try world.control.stop(fallbackDevice))["state"] as? String == "stopped" && world.processSignals.isEmpty, "normal shutdown never sends host signals")
+}
+do {
+    let world = hungEmulator(); world.neverRemoveADB = false
+    world.onProcessSignal = { _ in world.processAlive = false }
+    expect((try world.control.stop(fallbackDevice))["state"] as? String == "stopped" && world.processSignals == [SIGTERM], "ADB absence alone is not success while identified host process survives")
+    expect(world.time == 8, "host process receives full normal shutdown grace even after ADB disconnect")
+}
+do {
+    let world = hungEmulator(); let output = try world.control.stop(fallbackDevice)
+    expect(output["state"] as? String == "pending" && output["window_closed"] as? Bool == false, "no false success if force-stop still unconfirmed")
+    expect(world.processSignals == [SIGTERM, SIGKILL] && world.time == 13, "hung fallback has strict 8+2+3 second budget and two signals maximum")
+    let calls = world.commands.count
+    expect((try world.control.androidStopStatus(fallbackDevice.id))["state"] as? String == "pending", "GET confirmation remains read-only")
+    expect(world.processSignals.count == 2 && world.commands.count == calls + 1, "refresh never repeats fallback signals")
+    world.android.removeAll { $0 == fallbackDevice.id }
+    expect((try world.control.androidStopStatus(fallbackDevice.id))["state"] as? String == "pending", "GET still waits for host process when ADB disappears")
+    world.processAlive = false
+    expect((try world.control.androidStopStatus(fallbackDevice.id))["state"] as? String == "stopped", "GET confirms only after ADB and process exit")
+}
+for problem in ["noIdentity", "identityUnreadable", "signalRefused", "reusedPID", "reusedPort"] {
+    let world = hungEmulator()
+    if problem == "noIdentity" { world.processTarget = nil }
+    if problem == "identityUnreadable" { world.processReadFails = true }
+    if problem == "signalRefused" { world.processSignalRefused = true }
+    if problem == "reusedPID" { world.onBeforeSignal = { world.processTarget = emulatorProcess(start: 200) } }
+    if problem == "reusedPort" { world.onBeforeSignal = { world.processTarget = emulatorProcess(pid: 4243) } }
+    let output = try world.control.stop(fallbackDevice)
+    expect(output["state"] as? String == "pending" && output["warning"] is String, "\(problem) fails closed with explanation")
+    expect(world.processSignals.isEmpty && world.android == ["emulator-5554", "emulator-5556"], "\(problem) cannot signal any process")
+}
+do {
+    let world = hungEmulator()
+    world.onProcessSignal = { _ in world.processTarget = emulatorProcess(start: 200) }
+    expect((try world.control.stop(fallbackDevice))["state"] as? String == "pending", "process replaced after TERM stays pending")
+    expect(world.processSignals == [SIGTERM], "PID replacement between TERM and KILL cannot receive KILL")
+}
+do {
+    let world = hungEmulator(); world.onProcessSignal = { _ in world.processAlive = false }
+    expect((try world.control.stop(fallbackDevice))["state"] as? String == "pending", "process exit with lingering ADB transport is not success")
+    expect(world.processSignals == [SIGTERM], "already exited process is not force-killed")
+}
+do {
+    let world = hungEmulator(); world.failADB = true
+    world.onProcessSignal = { _ in world.processAlive = false; world.android.removeAll { $0 == fallbackDevice.id } }
+    expect((try world.control.stop(fallbackDevice))["state"] as? String == "stopped" && world.processSignals == [SIGTERM], "failed console command still permits safely identified local fallback")
+}
+// Test the production native adapter's parsing/allowlist without host signals.
+expect(try NativeAndroidEmulatorProcess.listeningPID("p4242\nf39\nn127.0.0.1:5554\nf42\nn[::1]:5554\n", port: 5554) == 4242, "dual-stack console uniquely identifies one PID")
+expect(try NativeAndroidEmulatorProcess.listeningPID("", port: 5554) == nil, "empty listener inventory has no owner")
+for malformed in ["p4242\nn127.0.0.1:5554\np4243\nn[::1]:5554", "p4242\nn127.0.0.1:55540", "p4242\nn*:5554", "p0\nn127.0.0.1:5554", "p1\nn127.0.0.1:5554", "p-9\nn127.0.0.1:5554", "n127.0.0.1:5554", "p4242", "unexpected"] {
+    do { _ = try NativeAndroidEmulatorProcess.listeningPID(malformed, port: 5554); expect(false, "ambiguous/malformed console owner") } catch { expect(true, "unsafe console owner refused") }
+}
+expect(NativeAndroidEmulatorProcess.matches(emulatorProcess(), device: fallbackDevice, emulator: fixtureEmulator), "exact configured-SDK qemu/AVD/user accepted")
+for bad in [emulatorProcess(uid: geteuid() + 1), emulatorProcess(executable: "/other/sdk/emulator/qemu/darwin-aarch64/qemu-system-aarch64-headless"), emulatorProcess(executable: "/fixture/sdk/emulator/crashpad_handler"), emulatorProcess(executable: "/fixture/sdk/platform-tools/adb"), emulatorProcess(args: ["qemu", "-avd", "Pixel_6_API_360"]), emulatorProcess(args: ["qemu", "-avd", "Pixel_6_API_36", "-avd", "Other"]), emulatorProcess(args: ["qemu", "-avd"])] {
+    expect(!NativeAndroidEmulatorProcess.matches(bad, device: fallbackDevice, emulator: fixtureEmulator), "wrong SDK/user/AVD or non-qemu process rejected; crashpad never selected")
+}
+for bad in [device("physical-123", platform: "android"), device("emulator-5554", platform: "android"), device()] {
+    expect(!NativeAndroidEmulatorProcess.matches(emulatorProcess(), device: bad, emulator: fixtureEmulator), "physical/iOS/unknown-AVD device cannot authorize process fallback")
+}
+for arch in ["aarch64", "x86_64"] { for suffix in ["", "-headless"] {
+    let value = emulatorProcess(executable: "/fixture/sdk/emulator/qemu/darwin-\(arch)/qemu-system-\(arch)\(suffix)")
+    expect(NativeAndroidEmulatorProcess.matches(value, device: fallbackDevice, emulator: fixtureEmulator), "windowed/headless known qemu binary accepted")
+} }
+func argvData(_ argv: [String], environment: String = "SECRET=not-an-argument") -> Data {
+    var count = Int32(argv.count); var data = withUnsafeBytes(of: &count) { Data($0) }
+    data.append(Data("/fixture/emulator\0\0\0".utf8)); data.append(Data((argv.joined(separator: "\0") + "\0" + environment + "\0").utf8)); return data
+}
+let argv = ["qemu", "-avd", "AVD name with spaces", "", "-no-window"]
+expect(try NativeAndroidEmulatorProcess.arguments(argvData(argv)) == argv, "native argv parser handles spaces/empty args and excludes environment")
+for malformed in [Data(), Data([0, 0, 0, 0, 0]), Data([2, 0, 0, 0, 65]), Data(argvData(["qemu", "-avd"]).prefix(10))] {
+    do { _ = try NativeAndroidEmulatorProcess.arguments(malformed); expect(false, "invalid argv buffer") } catch { expect(true, "invalid argv buffer refused") }
+}
+if let own = try NativeAndroidEmulatorProcess.read(getpid()) {
+    expect(own.pid == getpid() && own.uid == geteuid() && !own.arguments.isEmpty, "native adapter reads only this inert test process identity")
+    expect(try NativeAndroidEmulatorProcess.read(getpid()) == own, "same PID start-time/path/argv identity stable")
+    expect(!NativeAndroidEmulatorProcess.matches(own, device: fallbackDevice, emulator: fixtureEmulator), "test process can never masquerade as emulator")
+} else { expect(false, "test process identity must be readable") }
+let fallbackChecks = checks - fallbackStart
+
+let report: [String: Any] = ["passed": true, "checks": checks, "adapterChecks": adapterChecks, "newRaceChecks": raceChecks, "launchChecks": launchChecks, "androidFallbackChecks": fallbackChecks, "realDeviceActions": false, "realWindowActions": false, "realAppQuit": false]
 if let output = ProcessInfo.processInfo.environment["TEST_OUTPUT"], !output.isEmpty {
     let root = URL(fileURLWithPath: output, isDirectory: true); try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys, .prettyPrinted]).write(to: root.appendingPathComponent("device-control-review.json"))

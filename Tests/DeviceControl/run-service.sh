@@ -4,11 +4,13 @@ set -euo pipefail
 : "${NODE:=node}"
 root=$(mktemp -d /tmp/simwisp-device-service-tests.XXXXXX)
 pid=''
+rawpid=''
 cleanup() {
  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
   curl --silent --cacert "$root/tls/root.pem" -X POST https://127.0.0.1:45152/fixture/release-all >/dev/null || true
   kill -TERM "$pid"; wait "$pid" || true
  fi
+ if [[ -n "$rawpid" ]] && kill -0 "$rawpid" 2>/dev/null; then kill -TERM "$rawpid"; wait "$rawpid" || true; fi
  if [[ -n "${TEST_OUTPUT:-}" ]]; then mkdir -p "$TEST_OUTPUT"; cp "$root"/*.png "$root"/device-service-review.json "$root"/service.log "$TEST_OUTPUT"/ 2>/dev/null || true; fi
  rm -rf "$root"
 }
@@ -17,6 +19,11 @@ sources=()
 for file in Sources/*.swift; do [[ "$file" == Sources/SimwispApp.swift ]] || sources+=("$file"); done
 xcrun swiftc -swift-version 5 -O "${sources[@]}" Tests/DeviceControl/Service/main.swift -o "$root/service"
 cp -R Resources/Web "$root/Web"
+if [[ "${HEADLESS_REVIEW:-}" == 1 ]]; then
+ "$NODE" Tests/Android/raw-peer.mjs "$root" > "$root/raw-peer.log" 2>&1 & rawpid=$!
+ for ((i=0;i<100;i++)); do [[ -f "$root/raw-peer.json" ]] && break; sleep .05; done
+ [[ -f "$root/raw-peer.json" ]] || { cat "$root/raw-peer.log" >&2; exit 1; }
+fi
 "$root/service" "$root" > "$root/service.log" 2>&1 & pid=$!
 for ((i=0;i<200;i++)); do
  grep -q 'Isolated device-control service ready' "$root/service.log" && break

@@ -25,16 +25,18 @@ export async function fetchAvailableDevices() {
   return _fetch('/api/devices').catch(() => []);
 }
 
-export async function bootSim(udid) {
-  return _fetch(`/api/boot/${udid}`, { method: 'POST' });
+export async function bootSim(udid, mode = 'windowed') {
+  return _fetch(`/api/boot/${encodeURIComponent(udid)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }),
+  }, 70_000);
 }
 
-export async function bootAvd(avd) {
+export async function bootAvd(avd, mode = 'windowed') {
   return _fetch('/api/boot-avd', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ avd }),
-  });
+    body: JSON.stringify({ avd, mode }),
+  }, 70_000);
 }
 
 export async function stopSim(id) {

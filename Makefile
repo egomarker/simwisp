@@ -6,7 +6,7 @@ TEST_BUILD ?= build/tests
 ARCH := $(shell uname -m)
 SDK := $(shell xcrun --sdk macosx --show-sdk-path)
 
-.PHONY: build check test test-pairing test-accessibility test-input test-capture test-device-control test-video test-video-quality test-sps test-stream-flow test-decoder test-tls test-browser-accessibility test-browser-device-control test-metro-native test-metro-console run clean install
+.PHONY: build check test test-pairing test-accessibility test-input test-capture test-device-control test-video test-video-quality test-sps test-stream-flow test-decoder test-tls test-browser-accessibility test-browser-device-control test-browser-headless test-metro-native test-metro-console run clean install
 build:
 	@mkdir -p '$(APP)/Contents/MacOS' '$(APP)/Contents/Resources'
 	@scripts/build-android-jpeg.sh '$(APP)/Contents/Resources/simwisp-jpeg.jar'
@@ -78,6 +78,8 @@ test-browser-accessibility:
 	@NODE='$(NODE)' Tests/Browser/run.sh
 test-browser-device-control:
 	@NODE='$(NODE)' Tests/DeviceControl/run-service.sh
+test-browser-headless:
+	@HEADLESS_REVIEW=1 NODE='$(NODE)' Tests/DeviceControl/run-service.sh
 run: build
 	open '$(APP)'
 install:

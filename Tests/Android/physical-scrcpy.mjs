@@ -2,7 +2,7 @@
 import fs from 'node:fs';import crypto from 'node:crypto';import {spawn} from 'node:child_process';
 const root=process.argv[2],base='https://127.0.0.1:45154',cookie=crypto.createHash('sha256').update('simwisp-session-v1:isolated-android-backends').digest('hex');
 const ids=['adb-PHYSICAL-TEST._adb-tls-connect._tcp','USBPHYSICALTEST123','192.0.2.10:37123','[2001:db8::1]:5555'];
-const checks=[],exceptions=[],pending=new Map();let chrome,ws,seq=0,received=0;const packets=[];
+const checks=process.env.PHYSICAL_SCRCPY_PREVIOUS_REPORT?JSON.parse(fs.readFileSync(process.env.PHYSICAL_SCRCPY_PREVIOUS_REPORT,'utf8')).checks.filter(c=>c.passed):[],exceptions=[],pending=new Map();let chrome,ws,seq=0,received=0;const packets=[];let noJPEG=0;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms)),put=(p,v)=>fs.writeFileSync(root+'/'+p,JSON.stringify(v)),remove=p=>{try{fs.unlinkSync(root+'/'+p)}catch{}};
 const events=()=>fs.readFileSync(root+'/events.ndjson','utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
 const launches=()=>events().filter(e=>e.kind==='command'&&e.args.includes('exec-out'));
@@ -40,7 +40,9 @@ try{
   ws.addEventListener('message',e=>{const m=JSON.parse(e.data);if(m.id&&pending.has(m.id)){const p=pending.get(m.id);pending.delete(m.id);clearTimeout(p.timer);m.error?p.reject(Error(JSON.stringify(m.error))):p.resolve(m.result)}else if(m.method==='Runtime.exceptionThrown')exceptions.push(m.params);else if(m.method==='Network.webSocketFrameReceived'&&m.params.response.opcode===2){received++;if(packets.length<4000)packets.push(Buffer.from(m.params.response.payloadData,'base64'))}});
   await cdp('Page.enable');await cdp('Runtime.enable');await cdp('Network.enable');await cdp('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
   await cdp('Network.setCookie',{name:'simwisp_session',value:cookie,url:base,secure:true,httpOnly:true,sameSite:'Strict'});await cdp('Page.navigate',{url:base});await until('physical phone',()=>ev("document.querySelector('.device-item')!==null"));
-  await ev("window.phoneSockets=[];const NativeSocket=WebSocket;window.WebSocket=class extends NativeSocket{constructor(...a){super(...a);phoneSockets.push(this)}};document.querySelector('.device-item').click()");
+  await ev("window.phoneSockets=[];const NativeSocket=WebSocket;window.WebSocket=class extends NativeSocket{constructor(...a){super(...a);phoneSockets.push(this)}};");
+  if(process.env.PHYSICAL_SCRCPY_REMAINDER!=='1'){
+  await ev("document.querySelector('.device-item').click()");
   await until('default JPEG',async()=>(await live())?.android_backends.effective_capture==='jpeg'&&(await live())?.frames>2);
   check('physical default remains JPEG',(await live()).android_backends.capture==='jpeg');
   const beforeJPEG=launches().length;await select('capture','scrcpy');await matching('1',320,640);
@@ -104,11 +106,14 @@ try{
   for(const bad of ['0','2','NaN','0.5;id']){await direct(ids[0],'scrcpy','scrcpy',bad);await matching('1',320,640);check('invalid scrcpy scale normalizes x1 '+bad,(await live()).capture_counters.max_size===640);await directClose()}
   put('physical-size.json',{width:300,height:640});put('scrcpy-mode.json',{scaled:true,width:300,height:640,align8:true});await direct(ids[0],'scrcpy','scrcpy','0.5');await matching('0.5',144,320);
   check('codec-aligned scrcpy output dimensions are accepted without stretching',(await live()).capture_counters.target_width===150&&(await live()).input_counters.width===144);await directClose();
-  put('physical-size.json',{width:320,height:640});put('scrcpy-mode.json',{scaled:true});fs.writeFileSync(root+'/unavailable','1');const noJPEG=launches().length,missing=serverStarts().length;
+  put('physical-size.json',{width:320,height:640});put('scrcpy-mode.json',{scaled:true});fs.writeFileSync(root+'/unavailable','1');noJPEG=launches().length;const missing=serverStarts().length;
   await direct(ids[0],'scrcpy','scrcpy','0.5');await until('missing dependency visible',async()=>(await live())?.android_backends.effective_capture==='unavailable');
   check('missing physical scrcpy never starts/falls back to JPEG or host window',(await live()).frames===0&&launches().length===noJPEG&&serverStarts().length===missing&&(await live()).android_backends.effective_input==='unavailable');await directClose();remove('unavailable');
+  }
+  noJPEG=launches().length;
   put('scrcpy-mode.json',{scaled:true,native_error:true});await direct(ids[0],'scrcpy','scrcpy');
   await until('native phone error retained',async()=>(await live())?.android_backends.effective_capture==='unavailable');
+  await until('native output detail published after asynchronous drain',async()=>{const reason=(await live())?.android_backends?.reason;return reason?.includes('stack corruption detected')&&reason?.includes('Aborted')});
   check('real native server output survives generic socket disconnect',(await live()).android_backends.reason.includes('stack corruption detected')&&(await live()).android_backends.reason.includes('Aborted'));await directClose();
   put('scrcpy-mode.json',{scaled:true,bad_codec:true});await direct(ids[0],'scrcpy','scrcpy');await until('incompatible phone codec visible',async()=>(await live())?.android_backends.effective_capture==='unavailable');
   check('incompatible codec fails closed without alternate capture',launches().length===noJPEG&&(await live()).android_backends.reason.includes('H.264'));await directClose();

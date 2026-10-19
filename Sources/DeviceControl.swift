@@ -2,6 +2,17 @@ import Foundation
 import AppKit
 import ApplicationServices
 
+enum DeviceLaunchMode: String {
+    case windowed, headless
+    static func parse(_ body: Data) throws -> Self {
+        if body.isEmpty { return .windowed } // Existing empty POST remains windowed.
+        guard let value = try JSONSerialization.jsonObject(with: body) as? [String: Any] else { throw WispError("Expected a launch object") }
+        guard let raw = value["mode"] else { return .windowed }
+        guard let name = raw as? String, let mode = Self(rawValue: name) else { throw WispError("Launch mode must be windowed or headless") }
+        return mode
+    }
+}
+
 // Only explicit device actions use this tracker. No discovery/idle timer.
 final class DeviceLaunches {
     private let lock = NSLock()
@@ -63,17 +74,134 @@ struct SimulatorWindowEffects {
     }
 }
 
+// A console port selects a local emulator; a PID alone or an AVD name does not.
+// Capture start time before asking ADB to stop, then revalidate before each signal.
+struct AndroidEmulatorProcess: Equatable {
+    let pid: pid_t, uid: uid_t
+    let startSeconds: UInt64, startMicroseconds: UInt64
+    let executable: String, arguments: [String]
+}
+struct AndroidEmulatorProcessEffects {
+    let resolve: (Device) throws -> AndroidEmulatorProcess?
+    let isRunning: (AndroidEmulatorProcess) throws -> Bool
+    let signal: (Device, AndroidEmulatorProcess, Int32) throws -> Bool
+    // Injected controllers/fixtures never acquire live process authority implicitly.
+    static let none = Self(resolve: { _ in nil }, isRunning: { _ in false }, signal: { _, _, _ in false })
+    static func live(emulator: String?) -> Self {
+        guard let emulator else { return .none }
+        return Self(resolve: { try NativeAndroidEmulatorProcess.resolve($0, emulator: emulator) },
+                    isRunning: { try NativeAndroidEmulatorProcess.read($0.pid) == $0 },
+                    signal: { device, target, number in
+            guard target.pid > 1, [SIGTERM, SIGKILL].contains(number),
+                  try NativeAndroidEmulatorProcess.resolve(device, emulator: emulator) == target,
+                  try NativeAndroidEmulatorProcess.read(target.pid) == target else { return false }
+            // Positive, freshly checked PID only: never a process group, name,
+            // ADB server, crash reporter, or another emulator on a reused port.
+            if Darwin.kill(target.pid, number) == 0 { return true }
+            if errno == ESRCH { return false }
+            throw WispError("Could not terminate the selected emulator: \(String(cString: strerror(errno)))")
+        })
+    }
+}
+enum NativeAndroidEmulatorProcess {
+    static func listeningPID(_ text: String, port: Int) throws -> pid_t? {
+        guard text.utf8.count <= 65536 else { throw WispError("Emulator port inventory is too large") }
+        var current: pid_t?, listeners = Set<pid_t>()
+        for line in text.split(separator: "\n") {
+            if line.first == "p" {
+                guard let pid = pid_t(line.dropFirst()), pid > 1 else { throw WispError("Invalid emulator port owner") }
+                current = pid
+            } else if line.first == "n" {
+                guard let pid = current, ["n127.0.0.1:\(port)", "n[::1]:\(port)"].contains(String(line)) else {
+                    throw WispError("Uncertain emulator console listener")
+                }
+                listeners.insert(pid)
+            } else if line.first != "f" { throw WispError("Unreadable emulator port inventory") }
+        }
+        guard listeners.count <= 1, text.isEmpty || !listeners.isEmpty else { throw WispError("Ambiguous emulator console owner") }
+        return listeners.first
+    }
+    static func arguments(_ data: Data) throws -> [String] {
+        guard data.count >= 5, data.count <= 1_048_576 else { throw WispError("Unreadable emulator arguments") }
+        let count = data.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }
+        guard (1...4096).contains(count) else { throw WispError("Invalid emulator argument count") }
+        let bytes = [UInt8](data); var at = 4
+        guard let end = bytes[at...].firstIndex(of: 0) else { throw WispError("Missing emulator executable") }
+        at = end + 1
+        while at < bytes.count && bytes[at] == 0 { at += 1 }
+        var result = [String]()
+        for _ in 0..<count {
+            guard at < bytes.count, let end = bytes[at...].firstIndex(of: 0),
+                  let value = String(bytes: bytes[at..<end], encoding: .utf8) else { throw WispError("Truncated emulator arguments") }
+            result.append(value); at = end + 1
+        }
+        return result // Environment following argv is never inspected or retained.
+    }
+    static func read(_ pid: pid_t) throws -> AndroidEmulatorProcess? {
+        guard pid > 1 else { throw WispError("Invalid emulator PID") }
+        var info = proc_bsdinfo(); let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else {
+            if errno == ESRCH { return nil }; throw WispError("Cannot inspect emulator process identity")
+        }
+        if info.pbi_status == SZOMB { return nil }
+        var path = [CChar](repeating: 0, count: 4096)
+        guard proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { throw WispError("Cannot inspect emulator executable") }
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid], bytes = [UInt8](repeating: 0, count: 1_048_576), length = bytes.count
+        guard sysctl(&mib, u_int(mib.count), &bytes, &length, nil, 0) == 0 else { throw WispError("Cannot inspect emulator arguments") }
+        let argv = try arguments(Data(bytes.prefix(length)))
+        var after = proc_bsdinfo()
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &after, size) == size,
+              after.pbi_pid == info.pbi_pid, after.pbi_uid == info.pbi_uid,
+              after.pbi_start_tvsec == info.pbi_start_tvsec, after.pbi_start_tvusec == info.pbi_start_tvusec else {
+            throw WispError("Emulator identity changed during inspection")
+        }
+        return AndroidEmulatorProcess(pid: pid, uid: info.pbi_uid, startSeconds: info.pbi_start_tvsec,
+                                      startMicroseconds: info.pbi_start_tvusec, executable: String(cString: path), arguments: argv)
+    }
+    static func matches(_ target: AndroidEmulatorProcess, device: Device, emulator: String) -> Bool {
+        guard DeviceControl.validID(device.id, platform: device.platform), device.platform == "android",
+              target.uid == geteuid(), let avd = device.avd, !avd.isEmpty else { return false }
+        let directory = URL(fileURLWithPath: emulator).resolvingSymlinksInPath().deletingLastPathComponent()
+        let executables = ["aarch64", "x86_64"].flatMap { arch in
+            ["", "-headless"].map { directory.appendingPathComponent("qemu/darwin-\(arch)/qemu-system-\(arch)\($0)").path }
+        }
+        let avdFlags = target.arguments.indices.filter { target.arguments[$0] == "-avd" }
+        guard executables.contains(URL(fileURLWithPath: target.executable).resolvingSymlinksInPath().path),
+              avdFlags.count == 1, let index = avdFlags.first, index + 1 < target.arguments.count else { return false }
+        return target.arguments[index + 1] == avd
+    }
+    static func resolve(_ device: Device, emulator: String) throws -> AndroidEmulatorProcess? {
+        guard device.platform == "android", DeviceControl.validID(device.id, platform: "android"),
+              let port = Int(device.id.dropFirst(9)), device.avd != nil else { return nil }
+        let result = try command("/usr/sbin/lsof", ["-nP", "-a", "-iTCP:\(port)", "-sTCP:LISTEN", "-Fpn"], timeout: 1)
+        if result.status == 1, result.output.isEmpty, result.error.isEmpty { return nil }
+        guard result.status == 0, let pid = try listeningPID(result.text, port: port), let target = try read(pid) else {
+            throw WispError("Cannot identify the selected emulator process")
+        }
+        return matches(target, device: device, emulator: emulator) ? target : nil
+    }
+}
+
 final class DeviceControl {
     let launches: DeviceLaunches
     private let adb: String?
     private let run: (String, [String], Double) throws -> CommandResult
     private let windows: SimulatorWindowEffects
+    private let emulatorProcesses: AndroidEmulatorProcessEffects
+    private let androidStopLock = NSLock()
+    private var androidStopTargets: [String: AndroidEmulatorProcess] = [:]
+    private let launch: (String, [String]) throws -> Void
     private let wait: (Double) -> Void
     private let clock: () -> Double
     init(adb: String?, launches: DeviceLaunches = DeviceLaunches(), windows: SimulatorWindowEffects = .live,
+         emulatorProcesses: AndroidEmulatorProcessEffects = .none,
          run: @escaping (String, [String], Double) throws -> CommandResult = { try command($0, $1, timeout: $2) },
-         wait: @escaping (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }, clock: @escaping () -> Double = monotonic) {
-        self.adb = adb; self.launches = launches; self.windows = windows; self.run = run; self.wait = wait; self.clock = clock
+         launch: @escaping (String, [String]) throws -> Void = { path, args in
+             let p = Process(); p.executableURL = URL(fileURLWithPath: path); p.arguments = args
+             p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice; try p.run()
+         }, wait: @escaping (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }, clock: @escaping () -> Double = monotonic) {
+        self.adb = adb; self.launches = launches; self.windows = windows; self.emulatorProcesses = emulatorProcesses
+        self.run = run; self.launch = launch; self.wait = wait; self.clock = clock
     }
     static func validID(_ id: String, platform: String) -> Bool {
         if platform == "ios" { return UUID(uuidString: id) != nil }
@@ -98,6 +226,18 @@ final class DeviceControl {
             throw WispError(message.isEmpty ? "Device operation failed (exit \(result.status))" : message)
         }
         return result
+    }
+    // Launch by inventory identity, independently of capture/input or host windows.
+    func boot(_ id: String, platform: String, mode: DeviceLaunchMode = .windowed, emulator: String? = nil) throws {
+        if platform == "android" {
+            guard let emulator else { throw WispError("Android Emulator not found") }
+            let args = [emulator, "-avd", id] + (mode == .headless ? ["-no-window", "-no-boot-anim", "-gpu", "host"] : ["-no-snapshot-load"])
+            try launch("/usr/bin/nohup", args)
+        } else {
+            guard platform == "ios", Self.validID(id, platform: platform) else { throw WispError("Invalid simulator identifier") }
+            _ = try checked("/usr/bin/xcrun", ["simctl", "boot", id], timeout: 60)
+            if mode == .windowed { _ = try checked("/usr/bin/open", ["-a", "Simulator", "--args", "-CurrentDeviceUDID", id], timeout: 8) }
+        }
     }
     private func inventory() throws -> SimulatorInventory {
         let result = try checked("/usr/bin/xcrun", ["simctl", "list", "devices", "--json"], timeout: 8)
@@ -124,7 +264,56 @@ final class DeviceControl {
     // enough to claim shutdown. Errors/malformed output remain inconclusive.
     func androidStopStatus(_ id: String) throws -> [String: Any] {
         guard Self.validID(id, platform: "android") else { throw WispError("Invalid emulator identifier") }
-        return androidStatus(id, inventory: try androidInventory(timeout: 2))
+        return try confirmedAndroidStatus(id, timeout: 2)
+    }
+    private func confirmedAndroidStatus(_ id: String, timeout: Double) throws -> [String: Any] {
+        let inventory = try androidInventory(timeout: timeout)
+        let target = androidStopLock.withLock { androidStopTargets[id] }
+        if inventory[id] == nil, let target, try emulatorProcesses.isRunning(target) { return pendingAndroidStatus(id) }
+        if inventory[id] == nil { androidStopLock.withLock { _ = androidStopTargets.removeValue(forKey: id) } }
+        return androidStatus(id, inventory: inventory)
+    }
+    private func pendingAndroidStatus(_ id: String, warning: String? = nil) -> [String: Any] {
+        var value: [String: Any] = ["ok": true, "id": id, "platform": "android", "state": "pending", "window_closed": false, "simulator_quit_requested": false]
+        if let warning { value["warning"] = warning }
+        return value
+    }
+    private func waitForAndroidStop(_ id: String, seconds: Double) -> [String: Any]? {
+        let deadline = clock() + seconds
+        while clock() < deadline {
+            let remaining = deadline - clock()
+            guard remaining > 0 else { break }
+            if let value = try? confirmedAndroidStatus(id, timeout: min(2, remaining)), value["state"] as? String == "stopped" { return value }
+            let budget = deadline - clock()
+            if budget > 0 { wait(min(0.25, budget)) }
+        }
+        return nil
+    }
+    private func stopAndroid(_ device: Device, adb: String) throws -> [String: Any] {
+        // Resolve before the first command, so a later port/PID replacement can
+        // never become the fallback target for this request.
+        let target = try? emulatorProcesses.resolve(device)
+        androidStopLock.withLock { androidStopTargets[device.id] = target }
+        do { _ = try checked(adb, ["-s", device.id, "emu", "kill"], timeout: 8) }
+        catch { if target == nil { throw error } }
+        if let stopped = waitForAndroidStop(device.id, seconds: 8) { return stopped }
+        guard let target else {
+            return pendingAndroidStatus(device.id, warning: "Normal shutdown is still pending; the local emulator process could not be identified safely.")
+        }
+        do {
+            for (number, seconds) in [(SIGTERM, 2.0), (SIGKILL, 3.0)] {
+                guard try emulatorProcesses.isRunning(target), try emulatorProcesses.signal(device, target, number) else {
+                    return pendingAndroidStatus(device.id, warning: "Emulator process exited or changed; no further termination was attempted. Refresh devices to confirm.")
+                }
+                if var stopped = waitForAndroidStop(device.id, seconds: seconds) {
+                    if number == SIGKILL { stopped["forced"] = true; stopped["warning"] = "Emulator force-stopped after normal shutdown stalled. Unsaved emulator state may be lost." }
+                    return stopped
+                }
+            }
+        } catch {
+            return pendingAndroidStatus(device.id, warning: "Could not safely finish stopping the emulator: \(error.localizedDescription)")
+        }
+        return pendingAndroidStatus(device.id, warning: "Emulator termination was requested, but process/ADB exit is not yet confirmed.")
     }
     private func androidStatus(_ id: String, inventory: [String: String]) -> [String: Any] {
         let present = inventory[id]
@@ -151,21 +340,7 @@ final class DeviceControl {
         guard Self.validID(device.id, platform: device.platform) else { throw WispError("Invalid simulator identifier") }
         if device.platform == "android" {
             guard let adb else { throw WispError("Android SDK adb unavailable") }
-            _ = try checked(adb, ["-s", device.id, "emu", "kill"], timeout: 8)
-            // Accepted kill is not failed shutdown. Allow up to eight monotonic
-            // seconds for ADB removal, including tool time; never resend kill.
-            let deadline = clock() + 8
-            while clock() < deadline {
-                let remaining = deadline - clock()
-                guard remaining > 0 else { break }
-                do {
-                    let inventory = try androidInventory(timeout: min(2, remaining))
-                    if inventory[device.id] == nil { return androidStatus(device.id, inventory: inventory) }
-                } catch { /* An accepted request with an unreadable inventory is pending. */ }
-                let sleepBudget = deadline - clock()
-                if sleepBudget > 0 { wait(min(0.25, sleepBudget)) }
-            }
-            return ["ok": true, "id": device.id, "platform": "android", "state": "pending", "window_closed": false, "simulator_quit_requested": false]
+            return try stopAndroid(device, adb: adb)
         }
         let before = try inventory()
         guard let selected = before.all.first(where: { $0.udid == device.id }), selected.isAvailable != false else { throw WispError("Unknown or unavailable simulator") }

@@ -3,31 +3,34 @@ const PREFIX = 'simwisp.ios-capture.v1:', SCALE_PREFIX = 'simwisp.ios-scaling.v1
 const SCALES = ['1', '0.5', '0.25'];
 let openMenu = null, nextID = 0;
 export class IOSCapture {
-  #trigger; #menu; #choice = 'current'; #scaling = '1'; #key; #scaleKey; #change; #listeners = []; #disposed = false;
-  constructor(trigger, name, udid, change) {
+  #trigger; #menu; #choice = 'current'; #scaling = '1'; #key; #scaleKey; #change; #listeners = []; #disposed = false; #headless = false;
+  constructor(trigger, name, udid, change, { headless = false } = {}) {
+    this.#headless = headless;
     this.#trigger = trigger; this.#change = change; this.#key = PREFIX + encodeURIComponent(udid);
     this.#scaleKey = SCALE_PREFIX + encodeURIComponent(udid);
     try { if (localStorage.getItem(this.#key) === 'native') this.#choice = 'native'; const scale = localStorage.getItem(this.#scaleKey); if (SCALES.includes(scale)) this.#scaling = scale; } catch {}
+    if (headless) this.#choice = 'native';
     const m = document.createElement('section'); this.#menu = m;
     m.className = 'backend-popover ios-capture-popover'; m.hidden = true; m.id = 'ios-capture-' + ++nextID;
     m.setAttribute('role', 'dialog'); m.setAttribute('aria-label', 'iOS backends');
     m.innerHTML = `<header class="backend-header"><div><h2>iOS backends</h2><p class="backend-device"></p></div><button class="backend-close" type="button" aria-label="Close iOS backends">×</button></header><div class="backend-availability"><span class="backend-effective" data-effective="capture" aria-live="polite">Starting…</span></div><div class="backend-warning" role="status" hidden></div><section class="backend-field"><div class="backend-options" role="radiogroup" aria-label="Capture backend"><button type="button" role="radio" data-kind="capture" data-choice="current">Mac window</button><button type="button" role="radio" data-kind="capture" data-choice="native">Native</button></div></section><section class="backend-field" data-scaling hidden><div class="backend-field-heading"><span class="backend-field-label">Scaling</span><span class="backend-effective" data-effective="scaling">Before H.264</span></div><div class="backend-options" role="radiogroup" aria-label="Scaling backend">${SCALES.map(scale => `<button type="button" role="radio" data-kind="scaling" data-choice="${scale}">x${scale}</button>`).join('')}</div></section><footer class="backend-footer">Only affects this simulator</footer>`;
     m.querySelector('.backend-device').textContent = name;
+    if (headless) { m.querySelector('[data-choice=current]').disabled = true; m.querySelector('.backend-footer').textContent = 'Headless view-only session · Saved preferences unchanged'; }
     document.body.append(m);
     trigger.setAttribute('aria-controls', m.id); trigger.setAttribute('aria-haspopup', 'dialog'); trigger.setAttribute('aria-expanded', 'false');
     const listen = (n, t, f, o) => { n.addEventListener(t, f, o); this.#listeners.push(() => n.removeEventListener(t, f, o)); };
     listen(trigger, 'click', () => this.open(m.hidden, true));
     listen(m.querySelector('.backend-close'), 'click', () => this.open(false, true));
     listen(m, 'click', e => {
-      const b = e.target.closest('[data-choice]'); if (!b || !m.contains(b)) return;
+      const b = e.target.closest('[data-choice]'); if (!b || b.disabled || !m.contains(b)) return;
       if (b.dataset.kind === 'scaling') {
         if (this.#choice !== 'native' || !SCALES.includes(b.dataset.choice) || this.#scaling === b.dataset.choice) return;
         this.#scaling = b.dataset.choice;
-        try { localStorage.setItem(this.#scaleKey, this.#scaling); } catch {}
+        try { if (!this.#headless) localStorage.setItem(this.#scaleKey, this.#scaling); } catch {}
       } else {
         if (!['current', 'native'].includes(b.dataset.choice) || this.#choice === b.dataset.choice) return;
         this.#choice = b.dataset.choice;
-        try { localStorage.setItem(this.#key, this.#choice); } catch {}
+        try { if (!this.#headless) localStorage.setItem(this.#key, this.#choice); } catch {}
       }
       this.#render(); m.querySelector('[data-effective]').textContent = 'Starting…';
       m.querySelector('.backend-warning').hidden = true;
@@ -35,7 +38,7 @@ export class IOSCapture {
     });
     listen(m, 'keydown', e => {
       const b = e.target.closest('[data-choice]'); if (!b || !['ArrowLeft','ArrowRight','Home','End'].includes(e.key)) return;
-      e.preventDefault(); const buttons = [...m.querySelectorAll('[data-kind="' + b.dataset.kind + '"]')], i = buttons.indexOf(b);
+      e.preventDefault(); const buttons = [...m.querySelectorAll('[data-kind="' + b.dataset.kind + '"]:not(:disabled)')], i = buttons.indexOf(b);
       const count = buttons.length, next = e.key === 'Home' ? 0 : e.key === 'End' ? count - 1 : (i + (e.key === 'ArrowRight' ? 1 : count - 1)) % count;
       buttons[next].click(); buttons[next].focus({ preventScroll: true });
     });

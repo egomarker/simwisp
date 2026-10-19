@@ -41,6 +41,7 @@ const permsList      = $('perms-list');
 let allSims = [];
 let hasAdb = false;
 let canStopDevices = false;
+let canLaunchHeadless = false;
 const stoppingIds = new Set();
 let deviceAction = null; // latest keyed action owns the single status banner
 let simsLoadVersion = 0;
@@ -289,6 +290,7 @@ async function loadSims({ reconcileAction = true } = {}) {
     terminalCapability(info.features?.terminal);
     metroDiscovery.capability(info.features?.metroConsole);
     canStopDevices = info.features?.device_stop === true;
+    canLaunchHeadless = info.features?.headless_launch === true;
 
     if (info.bundle_id) {
       projFilterWrap.classList.add('visible');
@@ -309,7 +311,10 @@ async function loadSims({ reconcileAction = true } = {}) {
 
 // ── Add-simulator popover ─────────────────────────────────────────────────────
 let _addDevices = [];
+let _bootError = '';
 let _bootingIds = new Set();
+// Original icon: detached window corners surrounding a play triangle.
+const headlessRunIcon = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 4H4v4m12-4h4v4M4 16v4h4m12-4v4h-4"/><path d="m10 8 6 4-6 4Z" fill="currentColor" stroke="none"/></svg>';
 
 let addReturnFocus = null;
 function openAddPopover() {
@@ -318,7 +323,7 @@ function openAddPopover() {
   addPopover.classList.remove('hidden');
   addPopover.setAttribute('aria-hidden', 'false');
   [...$('sidebar').children].forEach(el => { el.inert = el !== addPopover; });
-  addSearch.value = '';
+  addSearch.value = ''; _bootError = '';
   addList.innerHTML = '<div class="add-list-empty">Loading…</div>';
   addSearch.focus();
 
@@ -353,7 +358,7 @@ function renderAddList(query) {
     (groups[g] = groups[g] || []).push(d);
   }
 
-  addList.innerHTML = Object.entries(groups).map(([label, devs]) => `
+  addList.innerHTML = (_bootError ? `<div class="add-list-empty" role="alert">${esc(_bootError)}</div>` : '') + Object.entries(groups).map(([label, devs]) => `
     <div class="add-group">
       <div class="add-group-label">${label}</div>
       ${devs.map(d => {
@@ -366,9 +371,10 @@ function renderAddList(query) {
             <span class="add-device-name">${esc(d.name)}</span>
             ${d.runtime ? `<span class="add-device-sub">${esc(d.runtime)}</span>` : ''}
           </span>
-          <button class="add-boot-btn${booting ? ' booting' : ''}" title="${booting ? 'Booting…' : 'Boot'}">
+          <button type="button" class="add-boot-btn${booting ? ' booting' : ''}" data-launch-mode="windowed" title="${booting ? 'Booting…' : 'Run'}" aria-label="Run ${esc(d.name)}" ${booting ? 'disabled' : ''}>
             ${booting ? '<span class="add-spinner"></span>' : '▶'}
           </button>
+          ${canLaunchHeadless ? `<button type="button" class="add-boot-btn add-headless-btn${booting ? ' booting' : ''}" data-launch-mode="headless" title="Run headless" aria-label="Run ${esc(d.name)} headless" ${booting ? 'disabled' : ''}>${headlessRunIcon}</button>` : ''}
         </div>`;
       }).join('')}
     </div>`).join('');
@@ -377,59 +383,43 @@ function renderAddList(query) {
     const item = btn.closest('.add-device-item');
     btn.addEventListener('click', () => handleAddBoot(
       item.dataset.id, item.dataset.name, item.dataset.platform,
-      parseInt(item.dataset.w), parseInt(item.dataset.h)
+      parseInt(item.dataset.w), parseInt(item.dataset.h), btn.dataset.launchMode
     ));
   });
 }
 
-async function handleAddBoot(id, name, platform, w, h) {
+async function handleAddBoot(id, name, platform, w, h, mode = 'windowed') {
   if (_bootingIds.has(id)) return;
-  _bootingIds.add(id);
-  renderAddList(addSearch.value);
-
-  const prevAndroidIds = new Set(allSims.filter(s => s.id.startsWith('emulator-')).map(s => s.id));
-
+  _bootError = ''; _bootingIds.add(id); renderAddList(addSearch.value);
   try {
-    if (platform === 'android') await bootAvd(id);
-    else await bootSim(id);
-  } catch { /* poll handles it */ }
-
-  closeAddPopover();
-  closeMobileSidebar();
-
-  // Show a booting row in the sidebar while we wait
-  if (platform === 'android') {
-    _pendingBoots.set(id, { name, platform });
-    renderDeviceList();
+    if (platform === 'android') await bootAvd(id, mode);
+    else await bootSim(id, mode);
+  } catch (error) {
+    _bootError = `Could not run ${name}: ${error.message || 'Unknown error'}`;
+    _bootingIds.delete(id); renderAddList(addSearch.value);
+    deviceActionMessage(_bootError, true);
+    return; // Never hide an actual launch failure behind a discovery poll.
   }
-
-  // Android emulators can take 2-3 minutes to fully boot
+  closeAddPopover(); closeMobileSidebar();
+  _pendingBoots.set(id, { name, platform, headless: mode === 'headless' }); renderDeviceList();
   const timeout = platform === 'android' ? 180_000 : 90_000;
-
+  let checking = false, finished = false;
+  const clear = () => { finished = true; clearInterval(poll); clearTimeout(expiry); _bootingIds.delete(id); _pendingBoots.delete(id); };
   const poll = setInterval(async () => {
-    const sims = await fetchSims().catch(() => null);
-    if (!sims) return;
-    let booted = null;
-    if (platform === 'android') {
-      booted = sims.find(s => s.id.startsWith('emulator-') && !prevAndroidIds.has(s.id));
-    } else {
-      booted = sims.find(s => s.id === id);
-    }
-    if (booted) {
-      clearInterval(poll);
-      _bootingIds.delete(id);
-      _pendingBoots.delete(id);
-      allSims = sims;
-      renderDeviceList();
+    if (checking || finished) return; checking = true;
+    try {
+      const sims = await fetchSims();
+      if (finished) return;
+      const booted = sims.find(s => platform === 'android' ? s.platform === 'android' && s.avd === id : s.id === id);
+      if (!booted) return;
+      clear(); allSims = sims; renderDeviceList();
       addSimPanel(booted.id, booted.name, booted.width, booted.height, booted.platform);
-    }
+    } catch { /* A temporary discovery failure is not successful boot. */ }
+    finally { checking = false; }
   }, 2000);
-
-  setTimeout(() => {
-    clearInterval(poll);
-    _bootingIds.delete(id);
-    _pendingBoots.delete(id);
-    renderDeviceList();
+  const expiry = setTimeout(() => {
+    clear(); renderDeviceList();
+    deviceActionMessage(`Could not confirm ${name} started. Refresh devices to check its state.`, true);
   }, timeout);
 }
 
@@ -451,7 +441,7 @@ function forgetStoppedDevice(id) {
   if (cached) { try { localStorage.setItem(_SIMS_CACHE, JSON.stringify({ ...cached, sims: allSims })); } catch {} }
 }
 function pendingStopMessage(action) {
-  return `Stop requested for ${action.name}; awaiting confirmation. Refresh devices to check its state.`;
+  return `Stop requested for ${action.name}; awaiting confirmation. ${action.warning || 'Refresh devices to check its state.'}`;
 }
 async function reconcileDeviceAction(action, version) {
   if (!action || deviceAction !== action || version !== simsLoadVersion) return;
@@ -475,7 +465,7 @@ async function handleDeviceStop(id) {
   if (!canStopDevices || stoppingIds.has(id)) return;
   const device = allSims.find(s => s.id === id);
   if (!device || (device.platform === 'android' && !device.id.startsWith('emulator-'))) return;
-  const sharedApp = device.platform === 'ios' ? '\nSimulator may also quit if no iOS devices or windows remain.' : '';
+  const sharedApp = device.platform === 'ios' ? '\nSimulator may also quit if no iOS devices or windows remain.' : '\nIf normal shutdown stalls, Simwisp may force-stop only this emulator.';
   if (!window.confirm(`Stop ${device.name}?\nThis shuts down the simulator. Unsaved app state may be lost.${sharedApp}`)) return;
   stoppingIds.add(id);
   const action = { id, name: device.name, platform: device.platform, phase: 'stopping' };
@@ -487,6 +477,7 @@ async function handleDeviceStop(id) {
   renderDeviceList();
   try {
     const result = await stopSim(id);
+    action.warning = result.warning || '';
     action.phase = result.state === 'pending' ? 'pending' : 'stopped';
     if (action.phase === 'stopped') forgetStoppedDevice(id);
     if (deviceAction === action) deviceActionMessage(action.phase === 'pending' ? pendingStopMessage(action) : (result.warning || `Stopped ${device.name}.${result.simulator_quit_requested ? ' Simulator quit requested.' : ''}`), !!result.warning);
@@ -520,7 +511,7 @@ function renderDeviceList() {
       <span class="device-icon">${simIcon(b.name)}</span>
       <span class="device-info">
         <span class="device-name">${esc(b.name)}</span>
-        <span class="device-dims">Booting…</span>
+        <span class="device-dims">${b.headless ? 'Headless · ' : ''}Booting…</span>
       </span>
       <span class="add-spinner" style="flex-shrink:0;margin-right:2px"></span>
     </div>`).join('');
@@ -536,12 +527,12 @@ function renderDeviceList() {
     <button type="button" class="device-item${simPanels.has(s.id) ? ' active' : ''}"
         aria-pressed="${simPanels.has(s.id)}" title="${esc(s.name)}" ${stoppingIds.has(s.id) ? 'disabled' : ''}
         data-udid="${esc(s.id)}" data-name="${esc(s.name)}"
-        data-platform="${esc(s.platform)}"
+        data-platform="${esc(s.platform)}" data-headless="${s.headless === true}"
         data-w="${s.width}" data-h="${s.height}">
       <span class="device-icon">${simIcon(s.name)}</span>
       <span class="device-info">
         <span class="device-name">${esc(s.name)}</span>
-        <span class="device-dims">${stoppingIds.has(s.id) ? 'Stopping…' : `${s.platform === 'android' ? (s.physical ? 'Android device' : 'Android') : 'iOS'} · ${s.width && s.height ? `${s.width} × ${s.height}` : s.physical ? 'Connected' : 'Emulator'}`}</span>
+        <span class="device-dims">${stoppingIds.has(s.id) ? 'Stopping…' : `${s.platform === 'android' ? (s.physical ? 'Android device' : 'Android') : 'iOS'}${s.headless ? ' · Headless' : ''} · ${s.width && s.height ? `${s.width} × ${s.height}` : s.physical ? 'Connected' : 'Emulator'}`}</span>
       </span>
       ${s.project_app ? '<span class="device-badge" title="Project app installed">★</span>' : ''}
       ${simPanels.has(s.id) ? '<span class="device-open-indicator" aria-hidden="true"></span>' : ''}
@@ -614,7 +605,19 @@ function addSimPanel(udid, name, w, h, platform) {
   frameEl.append(canvasEl, overlayEl);
 
   const physical = platform === 'android' && !udid.startsWith('emulator-');
+  const headless = !physical && allSims.find(s => s.id === udid)?.headless === true;
+  const viewOnly = headless && platform === 'ios';
+  panelEl.dataset.headless = String(headless);
   const pillEl = createPill(udid, name, platform, physical);
+  if (viewOnly) {
+    for (const button of pillEl.querySelectorAll('[data-action]')) {
+      if (['close', 'metro-console'].includes(button.dataset.action)) continue;
+      button.disabled = true; button.title = 'Headless iOS is view-only; input support is coming later';
+    }
+    const notice = document.createElement('p'); notice.className = 'headless-notice';
+    notice.textContent = 'Headless iOS · View only — touch and keyboard support will be added later.';
+    panelEl.appendChild(notice);
+  }
   stageEl.appendChild(frameEl);
   panelEl.append(stageEl, pillEl);
 
@@ -628,14 +631,14 @@ function addSimPanel(udid, name, w, h, platform) {
     stream: null, panelEl, stageEl, frameEl, canvasEl, name,
     overlayEl, pillEl, dotEl, statsEl,
     statusEl: pillEl.querySelector('.panel-status'),
-    platform, physical,
+    platform, physical, headless, viewOnly,
     accessibility: null, backends: null,
     ro: null, appearMode: 'dark', twoFingerMode: false,
   };
   simPanels.set(udid, panel);
   if (platform === 'android') {
     const identity = physical ? 'device:' + udid : allSims.find(s => s.id === udid)?.avd || name;
-    panel.backends = new AndroidBackends(pillEl.querySelector('.backend-trigger'), name, identity, choices => panel.stream?.switchBackends(choices), { physical });
+    panel.backends = new AndroidBackends(pillEl.querySelector('.backend-trigger'), name, identity, choices => panel.stream?.switchBackends(choices), { physical, headless });
     const button = pillEl.querySelector('[data-action="accessibility"]');
     // Optional assets and pane are created only on an explicit first open.
     const firstOpen = async () => {
@@ -656,7 +659,7 @@ function addSimPanel(udid, name, w, h, platform) {
     button.addEventListener('click', firstOpen);
   }
 
-  if (platform === 'ios') panel.backends = new IOSCapture(pillEl.querySelector('.backend-trigger'), name, udid, choices => panel.stream?.switchBackends(choices));
+  if (platform === 'ios') panel.backends = new IOSCapture(pillEl.querySelector('.backend-trigger'), name, udid, choices => panel.stream?.switchBackends(choices), { headless });
 
   rebuildDividers();
 
@@ -670,6 +673,7 @@ function addSimPanel(udid, name, w, h, platform) {
     quality: parseInt(qualSlider.value),
     data_saver: dsBtn.classList.contains('active'),
     backends: panel.backends?.choices,
+    viewOnly,
     onBackends: message => panel.backends?.receive(message),
     onStatus:            (s, message) => updatePanelStatus(udid, s, message),
     onFirstFrame:        () => overlayEl.classList.add('hidden'),
@@ -997,7 +1001,7 @@ function createPill(udid, name, platform, physical = false) {
 
   pill.addEventListener('click', e => {
     const btn = e.target.closest('[data-action]');
-    if (!btn) return;
+    if (!btn || btn.disabled) return;
     const action = btn.dataset.action;
     const panel  = simPanels.get(udid);
 

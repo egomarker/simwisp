@@ -9,13 +9,15 @@ export function backendChoice(value, physical = false) {
 }
 // Browser-local, stable AVD identity: neither credentials nor reusable ADB serials.
 export class AndroidBackends {
-  #trigger; #menu; #choice; #key; #change; #physical; #modes; #listeners = []; #disposed = false;
+  #trigger; #menu; #choice; #key; #change; #physical; #modes; #listeners = []; #disposed = false; #headless = false;
   #state = { effective_capture: 'starting', effective_input: 'starting', available: false, reason: null };
-  constructor(trigger, name, avd, change, { physical = false } = {}) {
+  constructor(trigger, name, avd, change, { physical = false, headless = false } = {}) {
+    this.#headless = !physical && headless;
     this.#physical = physical; this.#modes = physical ? { capture: ['jpeg', 'scrcpy'], scaling: MODES.scaling, input: ['scrcpy'] } : { capture: MODES.capture, scaling: MODES.scaling, input: MODES.input };
     this.#trigger = trigger; this.#change = change;
     this.#key = PREFIX + encodeURIComponent(String(avd || name).slice(0, 256));
     try { this.#choice = backendChoice(JSON.parse(localStorage.getItem(this.#key)), physical); } catch { this.#choice = backendChoice(null, physical); }
+    if (this.#headless) { this.#choice.capture = 'raw'; this.#modes = { ...this.#modes, capture: ['scrcpy', 'jpeg', 'raw'] }; }
     const menu = document.createElement('section'); this.#menu = menu;
     menu.className = 'backend-popover'; menu.hidden = true; menu.setAttribute('role', 'dialog'); menu.setAttribute('aria-label', 'Android backends');
     menu.id = `android-backends-${++AndroidBackends.nextID}`;
@@ -27,6 +29,7 @@ export class AndroidBackends {
       menu.querySelector('.backend-footer span').textContent = 'Only affects this device';
     }
     menu.querySelector('.backend-device').textContent = name;
+    if (this.#headless) menu.querySelector('.backend-footer span').textContent = 'Headless session · Saved preferences unchanged';
     document.body.append(menu);
     const listen = (node, type, handler, options) => { node.addEventListener(type, handler, options); this.#listeners.push(() => node.removeEventListener(type, handler, options)); };
     listen(trigger, 'click', () => this.open(menu.hidden, true));
@@ -51,7 +54,7 @@ export class AndroidBackends {
   #select(kind, mode) {
     if (this.#disposed || !this.#modes[kind]?.includes(mode) || this.#choice[kind] === mode) return;
     this.#choice[kind] = mode;
-    try { localStorage.setItem(this.#key, JSON.stringify(this.#choice)); } catch { /* Private browsing/full storage: still switch this session. */ }
+    try { if (!this.#headless) localStorage.setItem(this.#key, JSON.stringify(this.#choice)); } catch { /* Private browsing/full storage: still switch this session. */ }
     this.#state = { effective_capture: 'starting', effective_input: 'starting', available: false, reason: null };
     this.#render(); this.#change(this.choices);
   }

@@ -13,6 +13,7 @@ const OUTPUT_STALE = 2000;
 const RECOVERY_TIMEOUT = 3000;
 
 export class SimStream {
+  #viewOnly = false;
   #liveTouch = false;
   #twoFinger = false;
   #udid; #canvas; #ctx;
@@ -38,7 +39,7 @@ export class SimStream {
       fps = 60,
       quality = 20,
       data_saver = false,
-      backends, onBackends,
+      backends, onBackends, viewOnly = false,
       onStatus,
       onFirstFrame,
       onOrientationChange,
@@ -49,7 +50,7 @@ export class SimStream {
       onStopped,
     } = {}
   ) {
-    this.#udid = udid;
+    this.#udid = udid; this.#viewOnly = viewOnly;
     this.#canvas = canvas;
     this.#ctx = canvas.getContext('2d', { alpha: false });
     this.#portraitW = canvas.width;
@@ -67,11 +68,12 @@ export class SimStream {
     this.settings = { fps, quality, data_saver, dev_w: canvas.width, dev_h: canvas.height };
     if (backends) Object.assign(this.settings, { capture_backend: backends.capture, input_backend: backends.input, jpeg_scale: backends.scaling, native_scale: backends.nativeScaling });
 
-    this.#setupPointer();
+    if (!this.#viewOnly) this.#setupPointer();
     this.#connect();
   }
 
   send(msg) {
+    if (this.#viewOnly && !['video_ready', 'video_feedback', 'video_keyframe', 'settings'].includes(msg?.type)) return;
     if (msg?.type === 'rotate') this.#onRotateStart();
     if (this.#ws?.readyState === WebSocket.OPEN) {
       this.#ws.send(JSON.stringify(msg));

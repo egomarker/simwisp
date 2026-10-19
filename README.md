@@ -75,6 +75,15 @@ Collapsing the panel preserves tabs. Closing a tab terminates its shell and fore
 4. Choose **Open workspace**, or **Copy link** to open the **HTTPS** pairing link on another device.
 5. Select a running simulator from the sidebar. Use **Add simulator** to boot another device.
 
+### Run with or without a native window
+
+Each available iOS simulator or Android AVD has **Run** and **Run headless** buttons. The new detached-window/play icon starts the selected device without opening its native window: iOS uses `simctl boot` without opening Simulator, and Android adds `-no-window` to its existing emulator launch arguments. Both actions open the browser view after the exact device is discovered; Android matching uses the AVD identity, not the first new emulator serial.
+
+- Normal **Run** keeps its existing windowed behavior and saved backend choices.
+- **Run headless** selects **Native** for the iOS panel or **Raw** for Android. These headless-session overrides do **not** rewrite saved backend/scaling preferences. Capture failure is reported rather than silently opening a native window. Launch intent is held by the running server, including across browser refreshes; it is not a persisted default or reliable detection of externally launched/minimized windows.
+- Headless iOS is **view-only** in this version. Touch, keyboard, Home and other input controls are disabled; window-independent iOS input is deferred. Windowed iOS input remains unchanged.
+- Closing a browser panel only closes its stream, **not** the simulator. The separate sidebar **Stop simulator** button shuts down the selected device by UUID/ADB serial, with the same capture-retirement barrier and state confirmation for headless and windowed devices. Other devices/windows stay untouched; the shared Simulator app can quit only when its complete device/window inventory is idle and no launch is pending.
+
 The default port is **4141**. Only one controlling browser connection is supported per device; a new connection replaces the previous one. Keep one controller per device to avoid competing reconnects.
 
 ### HTTPS and certificate trust
@@ -330,6 +339,7 @@ make test-tls # Optional production HTTPS/auth fixture (existing Node; port45152
 make test-browser-accessibility # Optional isolated browser/transport fixtures
 make test-device-control # Inert production AX/CG adapter + shutdown/window/quit-policy checks
 make test-browser-device-control # Production API/stream + responsive Stop fixtures (Node22/Chrome, port45152)
+make test-browser-headless # Inert launch modes, Native/Raw browser viewing, session-only choices, and headless/windowed Stop
 make test-android # Native protocol/socket/process/control + JPEG + Raw tests with owned fake peers (Node22)
 make test-android-jpeg-surface # Pure host-JVM RGBA stride/color-byte/pacing checks; existing JDK + Android SDK needed
 make test-android-jpeg # Synthetic JPEG→ImageIO→VideoToolbox→WebCodecs + manual UI/lifecycle checks

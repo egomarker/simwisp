@@ -5,6 +5,7 @@ import CoreMedia
 import CoreVideo
 import CoreImage
 import Darwin
+import IOSurface
 
 // Production Service/StreamSession/WindowCapture, but every destructive effect,
 // discovery source and SCK stream is inert. Only the owned TLS fixture is served.
@@ -25,6 +26,8 @@ final class World {
     var failShutdown = false, failClose = false, shutdownHolds: [String: DispatchSemaphore] = [:], gates: [String: Latch] = [:]
     let names = [a: "iPhone 11", b: "iPhone SE", "emulator-5554": "Pixel 6 API 36", "emulator-5556": "Pixel second emulator"]
     var quits = 0
+    private var headlessIDs = Set<String>()
+    private var failBoot = false
     private var adbTime = 0.0, adbDelay = 0.0
     private var pendingADB: [String: Double] = [:]
     private var failADBList = false, malformedADBList = false, failADBKill = false, failSims = false
@@ -36,7 +39,7 @@ final class World {
         lock.withLock {
             states = [a: "Booted", b: single ? "Shutdown" : "Booted", "emulator-5554": single ? "Shutdown" : "Booted", "emulator-5556": single ? "Shutdown" : "Booted"]
             refs = [window(a)] + (single ? [] : [window(b)])
-            events = []; commands = []; failShutdown = false; failClose = false; quits = 0
+            events = []; commands = []; headlessIDs = []; failBoot = false; failShutdown = false; failClose = false; quits = 0
             adbTime = 0; adbDelay = 0; pendingADB = [:]; failADBList = false; malformedADBList = false; failADBKill = false; failSims = false
         }
     }
@@ -45,6 +48,7 @@ final class World {
     func gate(_ type: String, _ id: String) -> Latch? { lock.withLock { gates[type + ":" + id] } }
     func configure(_ value: [String: Any]) {
         lock.withLock {
+            if let flag = value["failBoot"] as? Bool { failBoot = flag }
             if let flag = value["failShutdown"] as? Bool { failShutdown = flag }
             if let flag = value["failClose"] as? Bool { failClose = flag }
             if let delay = value["adbDelay"] as? Double { adbDelay = delay }
@@ -70,13 +74,23 @@ final class World {
     var snapshot: [String: Any] { lock.withLock { ["states": states, "events": events, "commands": commands, "windows": refs.map { ["id": $0.id, "title": $0.title] }, "quits": quits, "real_device_actions": false, "real_window_actions": false, "real_capture": false, "real_input": false] } }
     func discovery() -> ([Device], [[String: Any]], [String: DeviceWindow]) {
         lock.withLock {
-            let running = ids.filter { states[$0] == "Booted" }.map { Device(id: $0, name: names[$0]!, platform: $0.hasPrefix("emulator-") ? "android" : "ios", width: 320, height: 640, project_app: $0 == a || $0 == "emulator-5554") }
-            let available: [[String: Any]] = ids.filter { states[$0] == "Shutdown" && !$0.hasPrefix("emulator-") }.map { ["id": $0, "name": names[$0]!, "platform": "ios", "width": 320, "height": 640, "runtime": "fixture"] }
-            let windows = Dictionary(uniqueKeysWithValues: running.map { device in (device.id, DeviceWindow(id: device.id == a ? 1001 : device.id == b ? 1002 : device.id == "emulator-5554" ? 3001 : 3002, pid: 0, title: device.id, bounds: CGRect(x: 0, y: 0, width: 320, height: 640), crop: CGRect(x: 0, y: 0, width: 320, height: 640))) })
+            let running = ids.filter { states[$0] == "Booted" }.map { Device(id: $0, name: names[$0]!, platform: $0.hasPrefix("emulator-") ? "android" : "ios", width: 320, height: 640, project_app: $0 == a || $0 == "emulator-5554", avd: $0 == "emulator-5554" ? "Pixel_6_API_36" : $0 == "emulator-5556" ? "Pixel_second_emulator" : nil) }
+            var available: [[String: Any]] = ids.filter { states[$0] == "Shutdown" && !$0.hasPrefix("emulator-") }.map { ["id": $0, "name": names[$0]!, "platform": "ios", "width": 320, "height": 640, "runtime": "fixture"] }
+            available += ids.filter { states[$0] == "Shutdown" && $0.hasPrefix("emulator-") }.map { ["id": $0 == "emulator-5554" ? "Pixel_6_API_36" : "Pixel_second_emulator", "name": names[$0]!, "platform": "android"] }
+            let windows = Dictionary(uniqueKeysWithValues: running.filter { !headlessIDs.contains($0.id) }.map { device in (device.id, DeviceWindow(id: device.id == a ? 1001 : device.id == b ? 1002 : device.id == "emulator-5554" ? 3001 : 3002, pid: 0, title: device.id, bounds: CGRect(x: 0, y: 0, width: 320, height: 640), crop: CGRect(x: 0, y: 0, width: 320, height: 640))) })
             return (running, available, windows)
         }
     }
-    func boot(_ id: String) throws { lock.withLock { states[id] = "Booted"; if id == a || id == b { refs.append(window(id)) }; events.append(["event": "boot", "id": id]) } }
+    func boot(_ id: String, _ mode: DeviceLaunchMode) throws {
+        try lock.withLock {
+            if failBoot { throw WispError("fixture boot refused <img src=x onerror=window.__injected=true>") }
+            let target = id == "Pixel_6_API_36" ? "emulator-5554" : id == "Pixel_second_emulator" ? "emulator-5556" : id
+            states[target] = "Booted"
+            if mode == .headless { headlessIDs.insert(target) } else { headlessIDs.remove(target) }
+            if (target == a || target == b) && mode == .windowed { refs.append(window(target)) }
+            events.append(["event": "boot", "id": target, "mode": mode.rawValue])
+        }
+    }
     var windows: SimulatorWindowEffects {
         SimulatorWindowEffects(snapshot: { self.lock.withLock { SimulatorWindowSnapshot(applications: [901], windows: self.refs, reliable: true) } }, close: { target in
             try self.lock.withLock {
@@ -148,7 +162,15 @@ var settings = Settings(); settings.port = 45152; settings.shareLAN = false; set
 settings.projectDirectory = root.path; settings.androidSDK = root.appendingPathComponent("sdk").path; settings.pairingToken = "isolated-device-stop-token"
 let control = DeviceControl(adb: fakeADB.path, launches: world.launches, windows: world.windows, run: world.run, wait: world.wait, clock: { world.clock })
 let devices = Devices(settings: settings, control: control, discovery: world.discovery, boot: world.boot)
-let service = Service(settings: settings, pairingStateURL: root.appendingPathComponent("pairing-state.json"), tlsDirectory: root.appendingPathComponent("tls"), devices: devices, captureStopTimeout: 1.5, scrcpyInstallation: { throw WispError("Isolated fixture: scrcpy unavailable") }, makeCapture: { window in
+final class HeadlessSurface: NativeSurfaceSource {
+    private var closed = false
+    func surface() throws -> IOSurface? { if closed { return nil }; return CVPixelBufferGetIOSurface(pixels!)!.takeUnretainedValue() as IOSurface }
+    func close() { closed = true }
+}
+let service = Service(settings: settings, pairingStateURL: root.appendingPathComponent("pairing-state.json"), tlsDirectory: root.appendingPathComponent("tls"), devices: devices, captureStopTimeout: 1.5, scrcpyInstallation: { throw WispError("Isolated fixture: scrcpy unavailable") }, rawDiscovery: { _ in
+    guard let data = try? Data(contentsOf: root.appendingPathComponent("raw-peer.json")), let port = dictionary(data)["port"] as? Int else { throw WispError("Owned raw peer unavailable") }
+    return try EmulatorRawEndpoint(port: port, token: "owned-raw-fixture-secret")
+}, makeNative: { _ in NativeCapture(source: { HeadlessSurface() }) }, makeCapture: { window in
     let native = FakeStream(window.title)
     return WindowCapture(target: window, makeStream: { capture in native.capture = capture; return native })
 })

@@ -12,6 +12,7 @@ final class Service {
     private let terminals: TerminalManager
     private let metro: MetroConsoleManager
     private let workers = DispatchQueue(label: "Simwisp.device-actions", qos: .userInitiated)
+    private var launching = Set<String>() // network queue owns duplicate-launch admission
     private var stopping = Set<String>() // network queue owns destructive-action admission
     private let makeCapture: (DeviceWindow) -> WindowCapture
     private let scrcpyInstallation: ScrcpySession.Installation
@@ -157,7 +158,7 @@ final class Service {
         if request.method != "GET" && !request.sameOrigin { complete(.json(["error": "Origin denied"], status: 403)); return }
         switch (request.method, request.path) {
         case ("GET", "/api/info"):
-            var info: [String: Any] = ["mode": "fast2 (ScreenCaptureKit / scrcpy H.264; Quartz / scrcpy input)", "video_codec": "h264", "transport": "https", "app": "Simwisp", "version": "0.2.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true, "device_stop": true, "metroConsole": true, "androidBackends": true]]
+            var info: [String: Any] = ["mode": "fast2 (ScreenCaptureKit / scrcpy H.264; Quartz / scrcpy input)", "video_codec": "h264", "transport": "https", "app": "Simwisp", "version": "0.2.0", "has_adb": devices.adb != nil, "binary_path": Bundle.main.bundleURL.path, "permissions": ["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "idb": false], "features": ["terminal": settings.terminalEnabled == true, "device_stop": true, "headless_launch": true, "metroConsole": true, "androidBackends": true]]
             if settings.terminalEnabled == true { info["project_dir"] = settings.projectDirectory }
             if let bundle = devices.projectBundleID { info["bundle_id"] = bundle }
             complete(.json(info))
@@ -187,21 +188,27 @@ final class Service {
                 complete(.json(["screen_recording": CGPreflightScreenCaptureAccess(), "accessibility": AXIsProcessTrusted(), "binary_path": Bundle.main.bundleURL.path]))
             }
         case ("POST", "/api/boot-avd"):
-            guard let avd = dictionary(request.body)["avd"] as? String else { complete(.json(["error": "Missing AVD"], status: 400)); return }; boot(avd, complete: complete)
+            guard let avd = dictionary(request.body)["avd"] as? String else { complete(.json(["error": "Missing AVD"], status: 400)); return }; boot(avd, body: request.body, complete: complete)
         default:
-            if request.method == "POST", request.path.hasPrefix("/api/boot/") { boot(String(request.path.dropFirst(10)), complete: complete) }
+            if request.method == "POST", request.path.hasPrefix("/api/boot/") { boot(String(request.path.dropFirst(10)), body: request.body, complete: complete) }
             else if request.method == "POST", request.path.hasPrefix("/api/stop/") { stopDevice(String(request.path.dropFirst(10)), complete: complete) }
             else if request.method == "GET", request.path.hasPrefix("/api/stop-status/") { stopStatus(String(request.path.dropFirst("/api/stop-status/".count)), complete: complete) }
             else { complete(.json(["error": "Not found"], status: 404)) }
         }
     }
-    private func boot(_ id: String, complete: @escaping (HTTPResponse) -> Void) {
+    private func boot(_ id: String, body: Data, complete: @escaping (HTTPResponse) -> Void) {
+        let mode: DeviceLaunchMode
+        do { mode = try DeviceLaunchMode.parse(body) }
+        catch { complete(.json(["error": "Launch mode must be windowed or headless in a JSON object"], status: 400)); return }
         guard !stopping.contains(id) else { complete(.json(["error": "This simulator is stopping"], status: 409)); return }
+        guard launching.insert(id).inserted else { complete(.json(["error": "This simulator is already launching"], status: 409)); return }
         devices.control.launches.begin(); lifecycle.enter()
         workers.async {
-            defer { self.devices.control.launches.end(); self.lifecycle.leave() }
-            do { try self.devices.boot(id); complete(.json(["ok": true])) }
-            catch { complete(.json(["error": error.localizedDescription], status: 409)) }
+            let response: HTTPResponse
+            do { try self.devices.boot(id, mode: mode); response = .json(["ok": true, "mode": mode.rawValue]) }
+            catch { response = .json(["error": error.localizedDescription], status: 409) }
+            self.devices.control.launches.end()
+            self.server.queue.async { self.launching.remove(id); complete(response); self.lifecycle.leave() }
         }
     }
     private func stopStatus(_ id: String, complete: @escaping (HTTPResponse) -> Void) {
