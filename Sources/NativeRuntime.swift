@@ -104,28 +104,14 @@ enum NativeInvoke {
     }
 }
 
-protocol NativeSurfaceSource: AnyObject {
-    func surface() throws -> IOSurface?
-    func close()
-}
-
-final class NativeFramebufferSource: NativeSurfaceSource {
-    // Keep framework handles process-wide. dlclose while another stream holds
-    // private ObjC objects/classes is unsafe. Device/IO refs remain per capture.
+// Shared on-demand loader/resolver; capture discovery and polling are unchanged.
+// Handles remain process-wide: unloading ObjC code used by another capture or
+// input client is unsafe. Device, IO and HID references remain per owner.
+enum NativeSimulatorDevice {
     private static let loadLock=NSLock()
     private static var handles:[String:UnsafeMutableRawPointer]=[:]
     private static var loadedDeveloper:String?
-    private var device:NSObject?, io:NSObject?
-    private var closed=false,discovered=false
-    static let maxPorts=256
-    private struct PortMetadata {
-        // Own the key object: an ObjectIdentifier must not outlive its owner.
-        let owner:NSObject, descriptor:NSObject?
-        let surfaceGetter:String?
-    }
-    private var portMetadata:[ObjectIdentifier:PortMetadata]=[:]
-    init(udid:String) throws {
-        guard UUID(uuidString:udid) != nil else { throw WispError("Native requires an iOS Simulator UUID") }
+    static func load() throws -> String {
         let result=try command("/usr/bin/xcode-select",["-p"],timeout:5)
         let developer=String(data:result.output,encoding:.utf8)?.trimmingCharacters(in:.whitespacesAndNewlines) ?? ""
         guard result.status==0,developer.hasPrefix("/"),!developer.contains("\n") else { throw WispError("Native requires a selected Xcode developer directory") }
@@ -142,6 +128,11 @@ final class NativeFramebufferSource: NativeSurfaceSource {
             try load(["\(developer)/Library/PrivateFrameworks/SimulatorKit.framework/SimulatorKit","\(developer)/../SharedFrameworks/SimulatorKit.framework/SimulatorKit"],required:false)
             Self.loadedDeveloper=developer
         }
+        return developer
+    }
+    static func resolve(udid:String) throws -> NSObject {
+        guard UUID(uuidString:udid) != nil else { throw WispError("Native requires an iOS Simulator UUID") }
+        let developer=try load()
         guard let cls=NSClassFromString("SimServiceContext") else { throw WispError("Native CoreSimulator service class unavailable") }
         let set=try NativeInvoke.deviceSet(NativeInvoke.context(cls,developer:developer))
         var devices=try NativeInvoke.objects(set,"availableDevices")
@@ -150,6 +141,27 @@ final class NativeFramebufferSource: NativeSurfaceSource {
             let raw=try NativeInvoke.object($0,"UDID")
             return ((raw as? NSUUID)?.uuidString ?? raw?.description ?? "").caseInsensitiveCompare(udid) == .orderedSame
         }) else { throw WispError("Native could not find selected simulator in default device set") }
+        return selected
+    }
+}
+
+protocol NativeSurfaceSource: AnyObject {
+    func surface() throws -> IOSurface?
+    func close()
+}
+
+final class NativeFramebufferSource: NativeSurfaceSource {
+    private var device:NSObject?, io:NSObject?
+    private var closed=false,discovered=false
+    static let maxPorts=256
+    private struct PortMetadata {
+        // Own the key object: an ObjectIdentifier must not outlive its owner.
+        let owner:NSObject, descriptor:NSObject?
+        let surfaceGetter:String?
+    }
+    private var portMetadata:[ObjectIdentifier:PortMetadata]=[:]
+    init(udid:String) throws {
+        let selected=try NativeSimulatorDevice.resolve(udid:udid)
         guard let client=try NativeInvoke.object(selected,"io") else { throw WispError("Native simulator IO unavailable") }
         device=selected;io=client
     }

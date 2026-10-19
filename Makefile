@@ -23,7 +23,7 @@ build:
 	codesign --verify --deep --strict '$(APP)'
 check: build
 	@/usr/libexec/PlistBuddy -c 'Print :LSUIElement' '$(APP)/Contents/Info.plist'
-test: test-metro-native test-pairing test-accessibility test-input test-capture test-device-control test-video test-stream-flow
+test: test-metro-native test-pairing test-accessibility test-input test-native-input test-headless-ios-controls test-headless-mode test-capture test-device-control test-android-crash-env test-simulator-quit test-video test-stream-flow
 test-pairing:
 	@mkdir -p '$(TEST_BUILD)'
 	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Tests/main.swift -o '$(TEST_BUILD)/pairing-tests'
@@ -40,6 +40,17 @@ test-device-control:
 	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-device-control-tests.XXXXXX); trap 'rm -rf "$$root"' EXIT; \
 	 xcrun swiftc -swift-version 5 -O -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/DeviceControl.swift Sources/Devices.swift Tests/DeviceControl/main.swift -o "$$root/device-tests"; \
 	 "$$root/device-tests"
+.PHONY: test-android-crash-env
+test-android-crash-env:
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-android-env-tests.XXXXXX); \
+	 trap 'status=$$?; if [[ -n "$(TEST_OUTPUT)" ]]; then mkdir -p "$(TEST_OUTPUT)"; for f in "$$root"/*.json; do [[ ! -f "$$f" ]] || cp "$$f" "$(TEST_OUTPUT)/"; done; fi; if [[ "$$root" == /tmp/simwisp-android-env-tests.* ]]; then rm -rf -- "$$root"; fi; exit $$status' EXIT; \
+	 xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/DeviceControl.swift Sources/Devices.swift Tests/AndroidCrashEnv/main.swift -o "$$root/tests"; \
+	 "$$root/tests" "$$root" $(ANDROID_CRASH_ENV_PHASE)
+
+.PHONY: test-simulator-quit
+# Compatibility alias: the old timing-only contract is superseded.
+test-simulator-quit: test-ios-window-processes
+
 test-capture:
 	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-capture-tests.XXXXXX); trap 'rm -rf "$$root"' EXIT; \
 	 xcrun swiftc -swift-version 5 -O -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Sources/H264SPS.swift Sources/Video.swift Sources/DeviceControl.swift Sources/Devices.swift Sources/Capture.swift Tests/Capture/main.swift -o "$$root/capture-tests"; \
@@ -138,3 +149,40 @@ test-native-browser:
 .PHONY: test-backend-ui
 test-backend-ui:
 	@TEST_OUTPUT="$(TEST_OUTPUT)" "$(NODE)" Tests/Browser/backend-copy.mjs
+
+.PHONY: test-ios-window-processes
+test-ios-window-processes: test-ios-boot-frame-state
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-window-process-tests.XXXXXX); \
+	 trap 'status=$$?; if [[ -n "$(TEST_OUTPUT)" ]]; then mkdir -p "$(TEST_OUTPUT)"; for f in "$$root"/*.json; do [[ ! -f "$$f" ]] || cp "$$f" "$(TEST_OUTPUT)/"; done; fi; if [[ "$$root" == /tmp/simwisp-window-process-tests.* ]]; then rm -rf -- "$$root"; fi; exit $$status' EXIT; \
+	 xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/DeviceControl.swift Sources/Devices.swift Tests/IOSWindowProcesses/main.swift -o "$$root/tests"; \
+	 "$$root/tests" "$$root" $(IOS_PROCESS_PHASE); "$(NODE)" Tests/IOSWindowProcesses/frontend.mjs "$$root"; "$(NODE)" Tests/IOSWindowProcesses/stream-refresh.mjs "$$root"
+
+.PHONY: test-ios-boot-frame-state
+test-ios-boot-frame-state:
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-boot-frame-tests.XXXXXX); \
+	 trap 'status=$$?; if [[ -n "$(TEST_OUTPUT)" ]]; then mkdir -p "$(TEST_OUTPUT)"; for f in "$$root"/*.json; do [[ ! -f "$$f" ]] || cp "$$f" "$(TEST_OUTPUT)/"; done; fi; if [[ "$$root" == /tmp/simwisp-boot-frame-tests.* ]]; then rm -rf -- "$$root"; fi; exit $$status' EXIT; \
+	 "$(NODE)" Tests/IOSWindowProcesses/boot-frame-state.mjs "$$root"
+
+.PHONY: test-headless-mode
+test-headless-mode:
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-mode-tests.XXXXXX); trap 'rm -rf "$$root"' EXIT; \
+	 xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/DeviceControl.swift Sources/Devices.swift Tests/HeadlessMode/main.swift -o "$$root/tests"; \
+	 "$$root/tests" "$$root"; \
+	 if [[ -n "$(TEST_OUTPUT)" ]]; then mkdir -p "$(TEST_OUTPUT)"; cp "$$root"/*.json "$(TEST_OUTPUT)/"; fi
+
+.PHONY: test-headless-ios-controls
+test-headless-ios-controls:
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-headless-control-tests.XXXXXX); trap 'rm -rf "$$root"' EXIT; \
+	 xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/NativeRuntime.swift Sources/NativeInput.swift Sources/NativeInputRuntime.swift Sources/HeadlessIOSControl.swift Tests/HeadlessControls/main.swift -o "$$root/tests"; \
+	 "$$root/tests" "$$root"; \
+	 if [[ -n "$(TEST_OUTPUT)" ]]; then mkdir -p "$(TEST_OUTPUT)"; cp "$$root"/*.json "$(TEST_OUTPUT)/"; fi
+
+.PHONY: test-native-input test-native-input-builders test-native-input-services test-native-input-browser
+test-native-input-browser:
+	@HEADLESS_REVIEW=1 NATIVE_INPUT_REVIEW=1 NATIVE_INPUT_PHASE="$(NATIVE_INPUT_PHASE)" NODE='$(NODE)' Tests/DeviceControl/run-service.sh
+
+test-native-input test-native-input-builders test-native-input-services:
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-native-input-tests.XXXXXX); trap 'rm -rf "$$root"' EXIT; \
+	 xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/NativeRuntime.swift Sources/NativeInput.swift Sources/NativeInputRuntime.swift Tests/NativeInput/main.swift -o "$$root/tests"; \
+	 "$$root/tests" "$$root" $(if $(filter test-native-input-builders,$@),--builders,$(if $(filter test-native-input-services,$@),--services,)); \
+	 if [[ -n "$(TEST_OUTPUT)" ]]; then mkdir -p "$(TEST_OUTPUT)"; cp "$$root"/*.json "$(TEST_OUTPUT)/"; fi

@@ -4,6 +4,11 @@ import ApplicationServices
 
 enum DeviceLaunchMode: String {
     case windowed, headless
+    static func quitConsent(_ body: Data) throws -> Bool {
+        guard !body.isEmpty, let value = try JSONSerialization.jsonObject(with: body) as? [String: Any], let raw = value["close_simulator"] else { return false }
+        guard CFGetTypeID(raw as CFTypeRef) == CFBooleanGetTypeID(), let consent = raw as? Bool else { throw WispError("close_simulator must be a boolean") }
+        return consent
+    }
     static func parse(_ body: Data) throws -> Self {
         if body.isEmpty { return .windowed } // Existing empty POST remains windowed.
         guard let value = try JSONSerialization.jsonObject(with: body) as? [String: Any] else { throw WispError("Expected a launch object") }
@@ -71,6 +76,72 @@ struct SimulatorWindowEffects {
     let quitIfEmpty: (pid_t) throws -> Bool
     static var live: Self {
         Self(snapshot: { try NativeSimulatorWindows.snapshot() }, close: { try NativeSimulatorWindows.close($0) }, quitIfEmpty: { try NativeSimulatorWindows.quitIfEmpty($0) })
+    }
+}
+
+// Owner-selected window signal. These helpers are observed, NEVER killed.
+struct SimulatorApplicationRef: Equatable {
+    let pid: pid_t
+    let launchedAt: TimeInterval
+}
+struct SimulatorGUIEffects {
+    let hasWindowed: () throws -> Bool
+    let applications: () throws -> [SimulatorApplicationRef]
+    let closeApplication: (SimulatorApplicationRef, Double) throws -> Bool
+    // Inert default keeps command/window test fixtures from controlling the host.
+    static let none = Self(hasWindowed: { false }, applications: { [] }, closeApplication: { _, _ in true })
+    static var live: Self { Self(hasWindowed: { try NativeSimulatorGUI.hasWindowed() }, applications: { try NativeSimulatorGUI.applications() }, closeApplication: { try NativeSimulatorGUI.close($0, timeout: $1) }) }
+}
+private enum NativeSimulatorGUI {
+    static let bundleID = "com.apple.iphonesimulator"
+    static func onMain<T>(_ body: () throws -> T) rethrows -> T { try Thread.isMainThread ? body() : DispatchQueue.main.sync(execute: body) }
+    static func hasWindowed() throws -> Bool {
+        let result = try command("/usr/bin/pgrep", ["-u", String(getuid()), "-x", "SimRenderServer"], timeout: 3)
+        guard result.status == 0 || result.status == 1 else { throw WispError("Cannot inspect SimRenderServer processes") }
+        let values = result.text.split(whereSeparator: { $0.isWhitespace })
+        if result.status == 1 { guard values.isEmpty else { throw WispError("Incomplete renderer inventory") }; return false }
+        guard !values.isEmpty, values.count <= 128 else { throw WispError("Incomplete renderer inventory") }
+        var found = false, seen = Set<pid_t>()
+        for value in values {
+            guard let pid = pid_t(value), pid > 1, seen.insert(pid).inserted else { throw WispError("Invalid renderer process identity") }
+            var info = proc_bsdinfo()
+            guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(MemoryLayout<proc_bsdinfo>.size)) == Int32(MemoryLayout<proc_bsdinfo>.size) else {
+                if errno == ESRCH { continue }; throw WispError("Cannot inspect renderer process identity")
+            }
+            if info.pbi_status == SZOMB { continue }
+            var path = [CChar](repeating: 0, count: 4096)
+            guard info.pbi_uid == getuid(), proc_pidpath(pid, &path, UInt32(path.count)) > 0 else { throw WispError("Cannot verify renderer owner") }
+            let executable = String(cString: path)
+            guard executable.contains("/CoreSimulator.framework/"), executable.hasSuffix("/SimRenderServer.xpc/Contents/MacOS/SimRenderServer") else { throw WispError("Unexpected SimRenderServer executable") }
+            found = true
+        }
+        return found
+    }
+    static func applications() throws -> [SimulatorApplicationRef] {
+        try onMain {
+            let apps = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).filter { !$0.isTerminated }
+            guard apps.count <= 8 else { throw WispError("Too many Simulator applications") }
+            return try apps.map { app in
+                guard app.processIdentifier > 1, let date = app.launchDate, app.executableURL?.lastPathComponent == "Simulator" else { throw WispError("Cannot verify Simulator application identity") }
+                return SimulatorApplicationRef(pid: app.processIdentifier, launchedAt: date.timeIntervalSince1970)
+            }
+        }
+    }
+    static func close(_ target: SimulatorApplicationRef, timeout: Double) throws -> Bool {
+        guard !Thread.isMainThread else { throw WispError("Simulator exit confirmation must run off the UI queue") }
+        let completed = DispatchSemaphore(value: 0), center = NSWorkspace.shared.notificationCenter
+        let observer = center.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: nil) { note in
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication, app.processIdentifier == target.pid, app.bundleIdentifier == bundleID { completed.signal() }
+        }
+        defer { center.removeObserver(observer) }
+        let accepted = onMain {
+            guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first(where: { !$0.isTerminated && $0.processIdentifier == target.pid && $0.launchDate?.timeIntervalSince1970 == target.launchedAt }) else { return true }
+            return app.terminate() // whole GUI application; no AX/window gate or helper kills
+        }
+        if try !applications().contains(target) { return true }
+        guard accepted else { return false }
+        _ = completed.wait(timeout: .now() + timeout) // action-scoped notification wait, not polling
+        return try !applications().contains(target)
     }
 }
 
@@ -187,13 +258,14 @@ final class DeviceControl {
     private let adb: String?
     private let run: (String, [String], Double) throws -> CommandResult
     private let windows: SimulatorWindowEffects
+    private let simulatorGUI: SimulatorGUIEffects
     private let emulatorProcesses: AndroidEmulatorProcessEffects
     private let androidStopLock = NSLock()
     private var androidStopTargets: [String: AndroidEmulatorProcess] = [:]
     private let launch: (String, [String]) throws -> Void
     private let wait: (Double) -> Void
     private let clock: () -> Double
-    init(adb: String?, launches: DeviceLaunches = DeviceLaunches(), windows: SimulatorWindowEffects = .live,
+    init(adb: String?, launches: DeviceLaunches = DeviceLaunches(), windows: SimulatorWindowEffects = .live, simulatorGUI: SimulatorGUIEffects = .none,
          emulatorProcesses: AndroidEmulatorProcessEffects = .none,
          run: @escaping (String, [String], Double) throws -> CommandResult = { try command($0, $1, timeout: $2) },
          launch: @escaping (String, [String]) throws -> Void = { path, args in
@@ -201,7 +273,39 @@ final class DeviceControl {
              p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice; p.standardInput = FileHandle.nullDevice; try p.run()
          }, wait: @escaping (Double) -> Void = { Thread.sleep(forTimeInterval: $0) }, clock: @escaping () -> Double = monotonic) {
         self.adb = adb; self.launches = launches; self.windows = windows; self.emulatorProcesses = emulatorProcesses
-        self.run = run; self.launch = launch; self.wait = wait; self.clock = clock
+        self.run = run; self.launch = launch; self.wait = wait; self.clock = clock; self.simulatorGUI = simulatorGUI
+    }
+    // Recovery is requested only by explicit refresh/connect/device actions,
+    // NEVER by the one-second streaming discovery tick. No on-screen heuristic:
+    // a complete all-window/AX inventory includes minimized/hidden/other Spaces.
+    static func recoveredIOSMode(_ device: Device, inventory: SimulatorInventory, snapshot: SimulatorWindowSnapshot) -> DeviceLaunchMode? {
+        guard device.platform=="ios",UUID(uuidString:device.id) != nil,
+              snapshot.reliable,snapshot.selectionReliable,
+              inventory.all.filter({$0.udid==device.id && $0.state=="Booted" && $0.name==device.name}).count==1,
+              inventory.all.filter({$0.name==device.name}).count==1 else {return nil}
+        var attached=Set<String>()
+        for window in snapshot.windows {
+            let matches=inventory.all.filter {title(window.title,matches:$0.name)}
+            guard matches.count==1 else {return nil} // unnamed/duplicate/unknown stays unknown
+            attached.insert(matches[0].udid)
+        }
+        return attached.contains(device.id) ? .windowed:.headless
+    }
+    func recoverLaunchModes(_ devices: [Device], inventory: SimulatorInventory) -> [String:DeviceLaunchMode] {
+        var result:[String:DeviceLaunchMode]=[:]
+        let ios=devices.filter {$0.platform=="ios"}
+        if !ios.isEmpty,let snapshot=try? windows.snapshot() {
+            for device in ios {result[device.id]=Self.recoveredIOSMode(device,inventory:inventory,snapshot:snapshot)}
+        }
+        for device in devices where device.platform=="android" && !device.physicalAndroid {
+            // Scoped existing identity resolver: reads selected emulator args,
+            // never signals a process or asks ADB to change device state.
+            if let process=try? emulatorProcesses.resolve(device),
+               (try? emulatorProcesses.isRunning(process))==true {
+                result[device.id]=process.arguments.contains("-no-window") ? .headless:.windowed
+            }
+        }
+        return result
     }
     static func validID(_ id: String, platform: String) -> Bool {
         if platform == "ios" { return UUID(uuidString: id) != nil }
@@ -228,14 +332,30 @@ final class DeviceControl {
         return result
     }
     // Launch by inventory identity, independently of capture/input or host windows.
-    func boot(_ id: String, platform: String, mode: DeviceLaunchMode = .windowed, emulator: String? = nil) throws {
+    func hasWindowedIOS() throws -> Bool { try simulatorGUI.hasWindowed() }
+    private func closeSimulatorApplication() throws -> Bool {
+        let apps = try simulatorGUI.applications(), deadline = clock() + 8
+        for app in apps {
+            let remaining = deadline - clock()
+            guard remaining > 0, try simulatorGUI.closeApplication(app, remaining) else { throw WispError("Simulator.app did not close. Close it manually or try again.") }
+        }
+        guard try simulatorGUI.applications().isEmpty else { throw WispError("Simulator.app reopened; refresh devices before retrying") }
+        return !apps.isEmpty
+    }
+    func boot(_ id: String, platform: String, mode: DeviceLaunchMode = .windowed, emulator: String? = nil, quitSimulatorConfirmed: Bool = false) throws {
         if platform == "android" {
             guard let emulator else { throw WispError("Android Emulator not found") }
             let args = [emulator, "-avd", id] + (mode == .headless ? ["-no-window", "-no-boot-anim", "-gpu", "host"] : ["-no-snapshot-load"])
-            try launch("/usr/bin/nohup", args)
+            // Disable crash-report prompts only in this emulator child, not globally.
+            try launch("/usr/bin/env", ["ANDROID_EMU_ENABLE_CRASH_REPORTING=0", "/usr/bin/nohup"] + args)
         } else {
             guard platform == "ios", Self.validID(id, platform: platform) else { throw WispError("Invalid simulator identifier") }
+            if mode == .headless {
+                guard try !simulatorGUI.hasWindowed() || quitSimulatorConfirmed else { throw WispError("Windowed iOS simulators are open. Confirm closing all Simulator windows before starting headless.") }
+                _ = try closeSimulatorApplication()
+            }
             _ = try checked("/usr/bin/xcrun", ["simctl", "boot", id], timeout: 60)
+            if mode == .headless, try !simulatorGUI.applications().isEmpty { throw WispError("Simulator.app reopened during boot. The device may be running; refresh devices before retrying.") }
             if mode == .windowed { _ = try checked("/usr/bin/open", ["-a", "Simulator", "--args", "-CurrentDeviceUDID", id], timeout: 8) }
         }
     }
@@ -344,65 +464,31 @@ final class DeviceControl {
         }
         let before = try inventory()
         guard let selected = before.all.first(where: { $0.udid == device.id }), selected.isAvailable != false else { throw WispError("Unknown or unavailable simulator") }
-        var warning: String?
-        var prepared: SimulatorWindowSnapshot?
-        do { prepared = try windows.snapshot() }
-        catch { warning = "Simulator stopped; its window could not be inspected safely. Check Accessibility and Screen Recording permissions." }
-        let target = prepared.flatMap { Self.selectedWindow(device: selected, inventory: before, snapshot: $0) }
-        if selected.state != "Shutdown" {
-            _ = try checked("/usr/bin/xcrun", ["simctl", "shutdown", device.id], timeout: 30)
-        }
+        if selected.state != "Shutdown" { _ = try checked("/usr/bin/xcrun", ["simctl", "shutdown", device.id], timeout: 30) }
         let after = try inventory()
-        guard after.all.first(where: { $0.udid == device.id })?.state == "Shutdown" else {
-            throw WispError("Shutdown requested, but the simulator is not confirmed shut down. Refresh devices to check its state.")
-        }
-        var closed = false, quit = false, closeFailed = false
-        if let target {
-            do {
-                let current = try windows.snapshot()
-                guard current.selectionReliable else { throw WispError("Selected Simulator window inventory is incomplete") }
-                if !current.windows.contains(where: { target.sameWindow($0) }) {
-                    closed = true // shutdown may already have closed the window
-                } else {
-                    guard current.windows.contains(where: { target.stillIdentifies($0) }) else { throw WispError("Selected Simulator window identity changed") }
-                    let preClose = try inventory()
-                    guard preClose.all.contains(where: { $0.udid == device.id && $0.state == "Shutdown" }) else { throw WispError("Selected simulator is no longer confirmed shut down") }
-                    try windows.close(target)
-                    for attempt in 0..<5 {
-                        let fresh = try windows.snapshot()
-                        if fresh.selectionReliable && !fresh.windows.contains(where: { target.sameWindow($0) }) { closed = true; break }
-                        if attempt < 4 { wait(0.1) }
-                    }
-                }
-                if !closed { closeFailed = true; warning = "Simulator stopped; its window did not finish closing. The Simulator app was left running." }
-            } catch { closeFailed = true; warning = "Simulator stopped; its window could not be closed safely. The Simulator app was left running." }
-        } else if prepared?.windows.contains(where: { Self.title($0.title, matches: selected.name) }) == true || prepared?.reliable == false {
-            warning = "Simulator stopped; its window was left unchanged because it could not be identified unambiguously."
-        }
-        // Initial ambiguity can become obsolete when shutdown removes the
-        // window itself. Always perform fresh checks; never override an actual
-        // close failure, incomplete inventory, active device or pending launch.
+        guard after.all.first(where: { $0.udid == device.id })?.state == "Shutdown" else { throw WispError("Shutdown requested, but the simulator is not confirmed shut down. Refresh devices to check its state.") }
+        // Owner policy: one short pause, then SimRenderServer presence is the
+        // window signal. AX/CG ambiguity and other headless devices do not gate
+        // cleanup of the last windowed Simulator application.
+        wait(0.3)
+        var quit = false, windowed = true, reason = "renderer_inventory_incomplete", warning: String?
         do {
-            let fresh = try windows.snapshot()
-            let finalDevices = try inventory()
-            let confirmed = finalDevices.all.contains(where: { $0.udid == device.id && $0.state == "Shutdown" })
-            if fresh.reliable, fresh.windows.isEmpty, confirmed, !closeFailed {
-                if target != nil || prepared?.windows.contains(where: { Self.title($0.title, matches: selected.name) }) == true { closed = true }
-                warning = nil // complete emptiness resolves the old inspection warning
-                if fresh.applications.count == 1, finalDevices.idle {
-                    quit = try launches.ifIdle {
-                        let lastDevices = try inventory()
-                        guard lastDevices.idle, lastDevices.all.contains(where: { $0.udid == device.id && $0.state == "Shutdown" }) else { return false }
-                        return try windows.quitIfEmpty(fresh.applications[0])
-                    }
+            windowed = try simulatorGUI.hasWindowed()
+            if windowed { reason = "windowed_simulators_remain" }
+            else {
+                var admitted = false
+                quit = try launches.ifIdle {
+                    admitted = true
+                    if try simulatorGUI.hasWindowed() { windowed = true; reason = "windowed_simulators_appeared"; return false }
+                    reason = "simulator_close_failed"
+                    let requested = try closeSimulatorApplication()
+                    reason = requested ? "quit_requested" : "simulator_not_running"
+                    return requested
                 }
-            } else if !fresh.reliable && warning == nil {
-                warning = "Simulator stopped; the final window inspection was incomplete, so the Simulator app was left running."
+                if !admitted { reason = "launch_pending" }
             }
-        } catch {
-            if warning == nil { warning = "Simulator stopped; the final idle check was inconclusive, so the Simulator app was left running." }
-        }
-        var result: [String: Any] = ["ok": true, "id": device.id, "platform": "ios", "window_closed": closed, "simulator_quit_requested": quit]
+        } catch { warning = "Simulator stopped; " + error.localizedDescription }
+        var result: [String: Any] = ["ok": true, "id": device.id, "platform": "ios", "window_closed": !windowed, "simulator_quit_requested": quit, "simulator_quit_reason": reason]
         if let warning { result["warning"] = warning }
         return result
     }

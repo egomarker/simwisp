@@ -25,10 +25,12 @@ export async function fetchAvailableDevices() {
   return _fetch('/api/devices').catch(() => []);
 }
 
-export async function bootSim(udid, mode = 'windowed') {
+export async function fetchIOSWindows() { return _fetch('/api/ios-windows'); }
+
+export async function bootSim(udid, mode = 'windowed', closeSimulator = false) {
   return _fetch(`/api/boot/${encodeURIComponent(udid)}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode }),
-  }, 70_000);
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, ...(closeSimulator ? { close_simulator: true } : {}) }),
+  }, mode === 'headless' ? 80_000 : 70_000);
 }
 
 export async function bootAvd(avd, mode = 'windowed') {

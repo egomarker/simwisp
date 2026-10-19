@@ -27,7 +27,9 @@ final class World {
     let names = [a: "iPhone 11", b: "iPhone SE", "emulator-5554": "Pixel 6 API 36", "emulator-5556": "Pixel second emulator"]
     var quits = 0
     private var headlessIDs = Set<String>()
-    private var failBoot = false
+    private var failBoot = false, nativeFailure = false, failHeadlessControl = false
+    private var nativeHolds: [String: DispatchSemaphore] = [:]
+    private var nativeInactive = Set<String>(), nativeLandscape = Set<String>(), nativeCleanupFailure = Set<String>()
     private var adbTime = 0.0, adbDelay = 0.0
     private var pendingADB: [String: Double] = [:]
     private var failADBList = false, malformedADBList = false, failADBKill = false, failSims = false
@@ -39,16 +41,54 @@ final class World {
         lock.withLock {
             states = [a: "Booted", b: single ? "Shutdown" : "Booted", "emulator-5554": single ? "Shutdown" : "Booted", "emulator-5556": single ? "Shutdown" : "Booted"]
             refs = [window(a)] + (single ? [] : [window(b)])
-            events = []; commands = []; headlessIDs = []; failBoot = false; failShutdown = false; failClose = false; quits = 0
+            events = []; commands = []; headlessIDs = []; failBoot = false; nativeFailure = false; failHeadlessControl = false; nativeHolds = [:]; nativeInactive = []; nativeLandscape = []; nativeCleanupFailure = []; failShutdown = false; failClose = false; quits = 0
             adbTime = 0; adbDelay = 0; pendingADB = [:]; failADBList = false; malformedADBList = false; failADBKill = false; failSims = false
         }
     }
     func window(_ id: String) -> SimulatorWindowRef { SimulatorWindowRef(id: id == a ? 1001 : 1002, pid: 901, title: names[id]! + " — iOS fixture", bounds: CGRect(x: 0, y: 0, width: 320, height: 640)) }
     func record(_ event: String, _ id: String) { lock.withLock { events.append(["event": event, "id": id]) } }
     func gate(_ type: String, _ id: String) -> Latch? { lock.withLock { gates[type + ":" + id] } }
+    var nativeFails: Bool { lock.withLock { nativeFailure } }
+    func nativeCleanupFails(_ id: String) -> Bool { lock.withLock {nativeCleanupFailure.contains(id)} }
+    func nativeDisplay(_ id: String) -> (Bool,Bool) { lock.withLock { (!nativeInactive.contains(id),nativeLandscape.contains(id)) } }
+    func waitNative(_ id: String, closing: Bool = false) throws {
+        let key=closing ? "close:"+id:id
+        if let held=lock.withLock({nativeHolds[key]}),held.wait(timeout:.now()+12) != .success {throw WispError("Inert Native input gate timeout")}
+    }
+    func recordNative(_ kind: String, _ id: String, _ instance: String, _ event: NativeHIDEvent? = nil) {
+        var record: [String:Any] = ["event":"native_"+kind,"id":id,"instance":instance]
+        if let event {switch event {
+        case .touch(let touch): record["phase"]=String(describing:touch.phase);record["identifier"]=touch.identifier;record["x"]=Double(touch.point.x);record["y"]=Double(touch.point.y);record["edge"]=touch.edge.rawValue
+        case .key(let usage,let down):record["usage"]=usage;record["down"]=down
+        case .home(let down):record["button"]="home";record["down"]=down
+        }}
+        lock.withLock {events.append(record)}
+    }
+    func headlessControl(_ action: String, _ id: String, _ geometry: NativeInputGeometry, _ admission: () throws -> Void) throws {
+        try admission();record("headless_begin_"+action,id)
+        try waitNative(id);try admission()
+        try lock.withLock {
+            guard headlessIDs.contains(id),states[id]=="Booted",id==a || id==b else {throw WispError("Inert headless target unavailable")}
+            events.append(["event":"headless_"+action,"id":id,"width":geometry.width,"height":geometry.height])
+            if failHeadlessControl {throw WispError("Inert headless control refused")}
+            if action=="rotate" {
+                if geometry.width>geometry.height {nativeLandscape.remove(id)} else {nativeLandscape.insert(id)}
+            }
+        }
+    }
     func configure(_ value: [String: Any]) {
         lock.withLock {
             if let flag = value["failBoot"] as? Bool { failBoot = flag }
+            if let flag = value["failHeadlessControl"] as? Bool { failHeadlessControl = flag }
+            // Simulate an already-booted windowless device after a server restart:
+            // no Devices.boot call means no in-memory launch intent is recorded.
+            if let ids = value["windowlessIDs"] as? [String] {
+                headlessIDs = Set(ids);refs = [a,b].filter {states[$0]=="Booted" && !headlessIDs.contains($0)}.map {window($0)}
+            }
+            if let flag = value["failNativeInput"] as? Bool { nativeFailure = flag }
+            if let ids = value["failNativeCleanupIDs"] as? [String] { nativeCleanupFailure = Set(ids) }
+            if let ids = value["nativeInactiveIDs"] as? [String] { nativeInactive = Set(ids) }
+            if let ids = value["nativeLandscapeIDs"] as? [String] { nativeLandscape = Set(ids) }
             if let flag = value["failShutdown"] as? Bool { failShutdown = flag }
             if let flag = value["failClose"] as? Bool { failClose = flag }
             if let delay = value["adbDelay"] as? Double { adbDelay = delay }
@@ -59,16 +99,20 @@ final class World {
             if let map = value["states"] as? [String: String] { states.merge(map) { _, new in new } }
             if let kind = value["hold"] as? String, let id = value["id"] as? String {
                 if kind == "shutdown" { shutdownHolds[id] = DispatchSemaphore(value: 0) }
+                else if kind == "native_input" { nativeHolds[id] = DispatchSemaphore(value:0) }
+                else if kind == "native_close" { nativeHolds["close:"+id] = DispatchSemaphore(value:0) }
                 else { gates[kind + ":" + id] = Latch() }
             }
         }
     }
     func release(_ type: String, _ id: String) {
         if type == "shutdown" { lock.withLock { shutdownHolds.removeValue(forKey: id) }?.signal() }
+        else if type == "native_input" { lock.withLock { nativeHolds.removeValue(forKey:id) }?.signal() }
+        else if type == "native_close" { lock.withLock { nativeHolds.removeValue(forKey:"close:"+id) }?.signal() }
         else { lock.withLock { gates.removeValue(forKey: type + ":" + id) }?.release() }
     }
     func releaseAll() {
-        let pending = lock.withLock { () -> ([Latch], [DispatchSemaphore]) in let values = (Array(gates.values), Array(shutdownHolds.values)); gates = [:]; shutdownHolds = [:]; return values }
+        let pending = lock.withLock { () -> ([Latch], [DispatchSemaphore]) in let values = (Array(gates.values), Array(shutdownHolds.values)+Array(nativeHolds.values)); gates = [:]; shutdownHolds = [:]; nativeHolds = [:]; return values }
         pending.0.forEach { $0.release() }; pending.1.forEach { $0.signal() }
     }
     var snapshot: [String: Any] { lock.withLock { ["states": states, "events": events, "commands": commands, "windows": refs.map { ["id": $0.id, "title": $0.title] }, "quits": quits, "real_device_actions": false, "real_window_actions": false, "real_capture": false, "real_input": false] } }
@@ -92,7 +136,7 @@ final class World {
         }
     }
     var windows: SimulatorWindowEffects {
-        SimulatorWindowEffects(snapshot: { self.lock.withLock { SimulatorWindowSnapshot(applications: [901], windows: self.refs, reliable: true) } }, close: { target in
+        SimulatorWindowEffects(snapshot: { self.record("mode_snapshot","");return self.lock.withLock { SimulatorWindowSnapshot(applications: [901], windows: self.refs, reliable: true) } }, close: { target in
             try self.lock.withLock {
                 if self.failClose { throw WispError("fixture window close refused") }
                 self.refs.removeAll { $0.id == target.id && $0.pid == target.pid }; self.events.append(["event": "window_close", "id": target.id])
@@ -143,6 +187,9 @@ CIContext().render(CIImage(cgImage: rep.cgImage!), to: pixels!)
 guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: pixels!, formatDescriptionOut: &format) == noErr else { fatalError("fixture format") }
 var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
 guard CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: pixels!, formatDescription: format!, sampleTiming: &timing, sampleBufferOut: &sample) == noErr else { fatalError("fixture sample") }
+var landscapePixels: CVPixelBuffer?
+guard CVPixelBufferCreate(nil,640,320,kCVPixelFormatType_32BGRA,[kCVPixelBufferIOSurfacePropertiesKey:[:]] as CFDictionary,&landscapePixels)==noErr else {fatalError("inert landscape pixels")}
+CIContext().render(CIImage(color:CIColor(red:0.2,green:0.4,blue:0.8)).cropped(to:CGRect(x:0,y:0,width:640,height:320)),to:landscapePixels!)
 let attachment = Unmanaged<NSMutableDictionary>.fromOpaque(CFArrayGetValueAtIndex(CMSampleBufferGetSampleAttachmentsArray(sample!, createIfNecessary: true)!, 0)).takeUnretainedValue()
 attachment[SCStreamFrameInfo.status.rawValue] = SCFrameStatus.complete.rawValue
 final class FakeStream: CaptureStream {
@@ -163,14 +210,34 @@ settings.projectDirectory = root.path; settings.androidSDK = root.appendingPathC
 let control = DeviceControl(adb: fakeADB.path, launches: world.launches, windows: world.windows, run: world.run, wait: world.wait, clock: { world.clock })
 let devices = Devices(settings: settings, control: control, discovery: world.discovery, boot: world.boot)
 final class HeadlessSurface: NativeSurfaceSource {
+    private let id: String
     private var closed = false
-    func surface() throws -> IOSurface? { if closed { return nil }; return CVPixelBufferGetIOSurface(pixels!)!.takeUnretainedValue() as IOSurface }
+    init(_ id: String) {self.id=id}
+    func surface() throws -> IOSurface? { let (active,landscape)=world.nativeDisplay(id);if closed || !active {return nil};return CVPixelBufferGetIOSurface(landscape ? landscapePixels!:pixels!)!.takeUnretainedValue() as IOSurface }
     func close() { closed = true }
 }
-let service = Service(settings: settings, pairingStateURL: root.appendingPathComponent("pairing-state.json"), tlsDirectory: root.appendingPathComponent("tls"), devices: devices, captureStopTimeout: 1.5, scrcpyInstallation: { throw WispError("Isolated fixture: scrcpy unavailable") }, rawDiscovery: { _ in
+final class InertNativeInput: NativeInputTransport {
+    private let id: String, instance=UUID().uuidString
+    private var closed=false
+    init(_ id: String) { self.id=id;world.recordNative("connect",id,instance) }
+    func send(_ event: NativeHIDEvent) throws {
+        guard !closed else {throw WispError("Inert Native peer closed")}
+        world.recordNative("event",id,instance,event)
+        if case .touch(let touch)=event,touch.phase == .down {try world.waitNative(id)}
+        if world.nativeFails {throw WispError("Inert Native input refused <img src=x onerror=window.__injected=true>")}
+    }
+    func close() throws {
+        guard !closed else{return};closed=true;world.recordNative("close_begin",id,instance)
+        defer {world.recordNative("close",id,instance)}
+        try world.waitNative(id,closing:true)
+        if world.nativeCleanupFails(id) {throw WispError("Inert Native cleanup refused")}
+    }
+}
+let inertInput=DeviceInput(devices:devices,handler:{message,id in world.record("quartz_"+(message["type"] as? String ?? "unknown"),id);return nil})
+let service = Service(settings: settings, pairingStateURL: root.appendingPathComponent("pairing-state.json"), tlsDirectory: root.appendingPathComponent("tls"), devices: devices, input: inertInput, captureStopTimeout: 1.5, scrcpyInstallation: { throw WispError("Isolated fixture: scrcpy unavailable") }, rawDiscovery: { _ in
     guard let data = try? Data(contentsOf: root.appendingPathComponent("raw-peer.json")), let port = dictionary(data)["port"] as? Int else { throw WispError("Owned raw peer unavailable") }
     return try EmulatorRawEndpoint(port: port, token: "owned-raw-fixture-secret")
-}, makeNative: { _ in NativeCapture(source: { HeadlessSurface() }) }, makeCapture: { window in
+}, makeNative: { id in NativeCapture(source: { HeadlessSurface(id) }) }, makeNativeInput: { InertNativeInput($0) }, headlessIOSControl: world.headlessControl, makeCapture: { window in
     let native = FakeStream(window.title)
     return WindowCapture(target: window, makeStream: { capture in native.capture = capture; return native })
 })

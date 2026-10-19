@@ -98,115 +98,7 @@ for id in ["emulator-0", "emulator-65536", "emulator-05554", "emulator-5554;kill
     let world = World(); fails(world, device(id, platform: "android"), "invalid ADB serial rejected")
     expect(world.commands.isEmpty, "invalid serial sends no command")
 }
-do {
-    let world = World(); let output = try world.control.stop(device())
-    expect(output["ok"] as? Bool == true && output["window_closed"] as? Bool == true && output["simulator_quit_requested"] as? Bool == true, "last device/window stops then normal quit requested")
-    expect(world.commands.filter { $0.contains("shutdown") } == [["/usr/bin/xcrun", "simctl", "shutdown", a]], "exact selected UDID shutdown, never all/booted")
-    expect(world.closeIDs == [1] && world.quits == 1, "only selected native window closed")
-    expect(!world.commands.contains { $0.contains("killall") || $0.contains("osascript") || $0.contains("open") }, "no force-kill/AppleScript/app launch")
-}
-for state in ["Booted", "Booting", "ShuttingDown", "Creating", "Unknown"] {
-    let world = World(); world.entries.append(["udid": b, "name": "iPhone SE", "state": state, "isAvailable": true])
-    let output = try world.control.stop(device())
-    expect(output["ok"] as? Bool == true && world.quits == 0, "headless/transitional \(state) device blocks shared-app quit")
-    expect(world.entries.last?["state"] as? String == state && world.closeIDs == [1], "other device remains unchanged")
-}
-for title in ["iPhone SE — iOS 26", "Minimized device", "Hidden device", "Device on another Space", "Simulator Settings"] {
-    let world = World(); world.refs.append(ref(2, title: title))
-    _ = try world.control.stop(device())
-    expect(world.quits == 0 && world.refs.map(\.id) == [2], "remaining \(title) window blocks shared quit")
-    expect(world.closeIDs == [1], "never closes remaining window")
-}
-do {
-    let world = World(); world.refs = [ref(2, title: "iPhone 11 Pro — iOS 26")]
-    _ = try world.control.stop(device())
-    expect(world.closeIDs.isEmpty && world.quits == 0 && world.refs.count == 1, "partial name cannot close Pro window")
-}
-do {
-    let world = World(); world.entries.append(["udid": b, "name": "iPhone 11", "state": "Booted", "isAvailable": true])
-    let output = try world.control.stop(device())
-    expect(world.closeIDs.isEmpty && world.quits == 0 && output["warning"] is String, "ambiguous same-name devices only shut down exact UDID")
-}
-do {
-    let world = World(); world.refs.append(ref(2))
-    let output = try world.control.stop(device())
-    expect(world.closeIDs.isEmpty && world.quits == 0 && output["warning"] is String, "ambiguous matching windows are not guessed")
-}
-do {
-    let world = World(); world.apps = [901, 902]
-    _ = try world.control.stop(device())
-    expect(world.quits == 0, "multiple Simulator instances are not globally quit")
-}
-do {
-    let world = World(); world.reliable = false
-    let output = try world.control.stop(device())
-    expect(world.closeIDs.isEmpty && world.quits == 0 && output["warning"] is String, "incomplete initial window data cannot close or quit")
-}
-for failure in ["snapshot", "close", "uncertain", "closePending"] {
-    let world = World()
-    if failure == "snapshot" { world.failSnapshot = true }
-    if failure == "close" { world.failClose = true }
-    if failure == "uncertain" { world.uncertainAfterClose = true }
-    if failure == "closePending" { world.closeNeverCompletes = true }
-    let output = try world.control.stop(device())
-    expect(output["ok"] as? Bool == true && output["warning"] is String && world.quits == 0, "\(failure) degrades safely after verified shutdown")
-}
-for failure in ["inventory", "invalidInventory", "shutdown", "neverShutdown"] {
-    let world = World()
-    if failure == "inventory" { world.failInventory = true }
-    if failure == "invalidInventory" { world.invalidInventory = true }
-    if failure == "shutdown" { world.failShutdown = true }
-    if failure == "neverShutdown" { world.neverShutdown = true }
-    fails(world, device(), "\(failure) is propagated")
-    expect(world.closeIDs.isEmpty && world.quits == 0, "\(failure) cannot close/quit app")
-}
-do {
-    let world = World(); world.launches.begin()
-    _ = try world.control.stop(device())
-    expect(world.quitAttempts == 0, "pending launch blocks quit before native request")
-    world.launches.end(); expect(world.launches.ifIdle { true }, "launch tracking ends without timers")
-}
-do {
-    let world = World()
-    world.onSnapshot = { n in if n == 3 { world.refs.append(ref(3, title: "New simulator window")) } }
-    _ = try world.control.stop(device())
-    expect(world.quits == 0 && world.refs.count == 1, "window opened during stop prevents quit")
-}
-do {
-    let world = World(); world.onQuit = { world.refs.append(ref(3, title: "Last-moment window")) }
-    let output = try world.control.stop(device())
-    expect(world.quitAttempts == 1 && world.quits == 0 && output["simulator_quit_requested"] as? Bool == false, "final native recheck protects last-moment window")
-}
-do {
-    let world = World(); world.onQuit = { world.apps = [902] }
-    _ = try world.control.stop(device())
-    expect(world.quits == 0, "final native recheck protects replaced app identity")
-}
-do {
-    let world = World(); world.quitRefused = true
-    let output = try world.control.stop(device())
-    expect(output["simulator_quit_requested"] as? Bool == false && world.quits == 0, "normal quit refusal never escalates to force quit")
-}
-do {
-    let world = World(); world.refs = []
-    let output = try world.control.stop(device())
-    expect(output["window_closed"] as? Bool == false && world.quits == 1, "headless selected device can leave app truly idle")
-}
-do {
-    let world = World(); world.apps = []; world.refs = []
-    _ = try world.control.stop(device())
-    expect(world.quitAttempts == 0, "already-absent app is not launched/quit")
-}
-do {
-    let world = World(); world.entries[0]["state"] = "Shutdown"
-    _ = try world.control.stop(device())
-    expect(world.commands.filter { $0.contains("shutdown") }.isEmpty && world.closeIDs == [1], "already-shutdown selected device closes only its lingering window")
-}
-do {
-    let world = World(); world.entries[0]["isAvailable"] = false
-    fails(world, device(), "unavailable device rejected")
-    expect(world.closeIDs.isEmpty && world.commands.count == 1, "unavailable device sends no shutdown")
-}
+// iOS GUI cleanup now follows SimRenderServer policy; see Tests/IOSWindowProcesses.
 do {
     let world = World(); let output = try world.control.stop(device("emulator-5554", platform: "android"))
     expect(world.commands.first == ["/fixture/adb", "-s", "emulator-5554", "emu", "kill"], "ADB kill is explicitly serial-scoped")
@@ -269,22 +161,6 @@ for id in [a, "all", "emulator-05554", "emulator-5554/extra", "physical-device"]
     do { _ = try world.control.androidStopStatus(id); fatalError("FAIL: invalid status selector accepted") } catch { checks += 1 }
     expect(world.commands.isEmpty, "invalid confirmation selector sends no command")
 }
-do {
-    let world = World(); world.entries.append(["udid": b, "name": "iPhone 11", "state": "Shutdown", "isAvailable": true])
-    let output = try world.control.stop(device())
-    expect(world.closeIDs.isEmpty && world.quits == 0 && output["warning"] is String, "shutdown same-name sibling still makes its lingering window ambiguous")
-}
-do {
-    let world = World(); world.entries.append(["udid": b, "name": "iPhone 11 — Custom", "state": "Booted", "isAvailable": true])
-    world.refs = [ref(2, title: "iPhone 11 — Custom — iOS 26")]
-    _ = try world.control.stop(device())
-    expect(world.closeIDs.isEmpty && world.quits == 0, "delimiter in another device name cannot select its window")
-}
-do {
-    let world = World(); world.onSnapshot = { n in if n == 2 { world.refs = [] } }
-    let output = try world.control.stop(device())
-    expect(output["window_closed"] as? Bool == true && output["warning"] == nil && world.closeIDs.isEmpty && world.quits == 1, "selected window already closed by shutdown is benign and can leave shared app idle")
-}
 expect(ref().stillIdentifies(ref()), "unchanged native window identity retained")
 expect(!ref().stillIdentifies(ref(title: "iPhone SE — iOS 26")), "reused window with another device title rejected")
 expect(!ref().stillIdentifies(ref(pid: 902)), "replaced app identity rejected")
@@ -334,9 +210,6 @@ for title in ["Hidden device", "Minimized device", "Another Space", "Simulator S
     let bounds = CGRect(x: -500, y: -100, width: 250, height: 450)
     let result = assemble([ax(), ax(bounds, title: title)], [cg(1), cg(2, bounds: bounds, layer: 8, title: title, onscreen: false)], [])
     expect(result.reliable && result.windows.count == 2, "hidden/minimized/other-Space/untitled actual windows remain in full inventory")
-    let world = World(); world.refs = result.windows
-    _ = try world.control.stop(device())
-    expect(world.closeIDs == [1] && world.quits == 0 && world.refs.count == 1, "adapter output preserves every independent remaining window during selected Stop")
 }
 for bounds in [CGRect(x: 0, y: 0, width: 1, height: 1), menuBounds, auxiliaryBounds] {
     let result = assemble([ax()], [cg(1), cg(2, bounds: bounds, layer: 0, onscreen: false)], [])
@@ -384,10 +257,6 @@ do {
     expect(original.stillIdentifies(unchanged), "same opaque AX identity is retained")
     expect(!original.sameWindow(replacement), "reused CG ID and title with different AX identity rejected")
     expect(!original.sameWindow(ref()), "native identity cannot be replaced with missing AX identity")
-    let world = World(); world.refs = [original]
-    world.onSnapshot = { n in if n == 2 { world.refs = [replacement] } }
-    _ = try world.control.stop(device())
-    expect(world.closeIDs.isEmpty && world.quits == 0 && world.refs.count == 1, "reused native identity after shutdown never closes replacement window")
 }
 do {
     expect(!assemble([], [cg(2, bounds: auxiliaryBounds)], [button, ax(auxiliaryBounds, role: kAXWindowRole, title: "Child window")]).reliable, "child AXWindow evidence overrides coincident auxiliary bounds")
@@ -395,10 +264,6 @@ do {
     let original = SimulatorWindowRef(id: 1, pid: 901, title: "iPhone 11", bounds: windowBounds, element: proxy)
     let renumbered = SimulatorWindowRef(id: 2, pid: 901, title: "iPhone 11", bounds: windowBounds, element: proxy)
     expect(original.sameWindow(renumbered), "opaque AX identity survives CG number replacement")
-    let world = World(); world.refs = [original]
-    world.onSnapshot = { n in if n == 2 { world.refs = [renumbered] } }
-    let output = try world.control.stop(device())
-    expect(world.closeIDs == [1] && output["window_closed"] as? Bool == true, "renumbered existing window is actually closed, never falsely declared absent")
 }
 do {
     let before = actualLayout
@@ -419,75 +284,8 @@ do {
     expect(!SimulatorWindowAdapter.stable(before: before, after: [[:]], pids: [901]), "failed CG owner metadata cannot establish a stable inventory")
 }
 let adapterChecks = checks - adapterStart
-let raceStart = checks
-for initial in ["ambiguous", "queryError", "duplicateTitle"] {
-    let world = World()
-    if initial == "duplicateTitle" { world.refs.append(ref(2)) }
-    world.onSnapshot = { n in
-        if n == 1 { world.reliable = initial != "ambiguous"; world.failSnapshot = initial == "queryError" }
-        else { world.reliable = true; world.failSnapshot = false; world.refs = [] }
-    }
-    let output = try world.control.stop(device())
-    expect(output["warning"] == nil && output["simulator_quit_requested"] as? Bool == true && world.quits == 1, "fresh complete emptiness resolves initial ambiguity/query error/duplicate title after auto-close")
-    expect(world.closeIDs.isEmpty && world.commands.filter { $0.contains("shutdown") }.count == 1, "recovery uses no guessed close or repeated shutdown")
-}
-for blocker in ["otherBooted", "otherBooting", "unknownDevice", "pendingLaunch", "multipleApps", "uncertain", "remainingWindow", "quitRefused", "inventoryError"] {
-    let world = World()
-    world.onSnapshot = { n in
-        if n == 1 { world.reliable = false }
-        else {
-            world.refs = []; world.reliable = blocker != "uncertain"
-            if blocker == "remainingWindow" { world.refs = [ref(2, title: "Hidden other device")] }
-            if blocker == "multipleApps" { world.apps = [901, 902] }
-            if n == 2 {
-                if ["otherBooted", "otherBooting", "unknownDevice"].contains(blocker) { world.entries.append(["udid": b, "name": "iPhone SE", "state": blocker == "otherBooted" ? "Booted" : blocker == "otherBooting" ? "Booting" : "Unknown", "isAvailable": true]) }
-                if blocker == "pendingLaunch" { world.launches.begin() }
-                if blocker == "inventoryError" { world.failInventory = true }
-            }
-        }
-    }
-    world.quitRefused = blocker == "quitRefused"
-    let output = try world.control.stop(device())
-    expect(world.quits == 0 && output["simulator_quit_requested"] as? Bool == false && world.closeIDs.isEmpty, "fresh-idle recovery retains every device/launch/window/identity/error blocker")
-}
-do {
-    let world = World(); world.reliable = false; world.selectionReliable = true
-    let output = try world.control.stop(device())
-    expect(world.closeIDs == [1] && output["window_closed"] as? Bool == true && world.quits == 0 && output["warning"] is String, "known selected AX window can close while unrelated unknown surfaces still forbid shared quit")
-}
-do {
-    let world = World(); world.onSnapshot = { n in if n == 2 { world.refs = [ref(title: "iPhone SE — iOS 26")] } }
-    let output = try world.control.stop(device())
-    expect(world.closeIDs.isEmpty && world.quits == 0 && output["warning"] is String, "same native number with changed title is revalidated before any close")
-}
-do {
-    let world = World(); world.failClose = true
-    world.onSnapshot = { n in if n == 3 { world.refs = [] } }
-    let output = try world.control.stop(device())
-    expect(world.quits == 0 && output["warning"] is String, "fresh emptiness never overrides an actual close failure")
-}
-for change in ["reboot", "inventoryError", "invalidInventory"] {
-    let world = World()
-    world.onInventory = { n in if n == 3 {
-        if change == "reboot" { world.entries[0]["state"] = "Booted" }
-        if change == "inventoryError" { world.failInventory = true }
-        if change == "invalidInventory" { world.invalidInventory = true }
-    } }
-    let output = try world.control.stop(device())
-    expect(world.closeIDs.isEmpty && world.quits == 0 && output["warning"] is String, "fresh pre-close selected-state query prevents reboot/inventory races")
-}
-for change in ["otherBooted", "selectedBooted", "inventoryError", "invalidInventory"] {
-    let world = World(); world.refs = []
-    world.onInventory = { n in if n == 4 {
-        if change == "otherBooted" { world.entries.append(["udid": b, "name": "iPhone SE", "state": "Booted", "isAvailable": true]) }
-        if change == "selectedBooted" { world.entries[0]["state"] = "Booted" }
-        if change == "inventoryError" { world.failInventory = true }
-        if change == "invalidInventory" { world.invalidInventory = true }
-    } }
-    _ = try world.control.stop(device())
-    expect(world.quitAttempts == 0 && world.quits == 0, "last device recheck inside launch lock prevents late boot/unreadable inventory before quit")
-}
-let raceChecks = checks - raceStart
+// Superseded AX-based Stop races are archived with the change evidence.
+let raceChecks = 0 // Process-policy races live in Tests/IOSWindowProcesses.
 
 let launchStart = checks
 for (body, mode) in [("", DeviceLaunchMode.windowed), ("{}", .windowed), ("{\"mode\":\"windowed\"}", .windowed), ("{\"mode\":\"headless\"}", .headless)] {
@@ -507,7 +305,7 @@ for mode in [DeviceLaunchMode.windowed, .headless] {
     commands = []
     try control.boot("Pixel_6_API_36", platform: "android", mode: mode, emulator: "/fixture/emulator")
     expect(commands.isEmpty, "Android launch issues no simctl or host input")
-    expect(spawned == [["/usr/bin/nohup", "/fixture/emulator", "-avd", "Pixel_6_API_36"] + (mode == .headless ? ["-no-window", "-no-boot-anim", "-gpu", "host"] : ["-no-snapshot-load"])], "Android launch preserves args and adds no-window only for headless")
+    expect(spawned == [["/usr/bin/env", "ANDROID_EMU_ENABLE_CRASH_REPORTING=0", "/usr/bin/nohup", "/fixture/emulator", "-avd", "Pixel_6_API_36"] + (mode == .headless ? ["-no-window", "-no-boot-anim", "-gpu", "host"] : ["-no-snapshot-load"])], "Android launch disables crash reporting in child and preserves mode-specific args")
 }
 do {
     var calls = 0

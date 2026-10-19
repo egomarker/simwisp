@@ -1,4 +1,4 @@
-import { fetchInfo, fetchSims, fetchAvailableDevices, bootSim, bootAvd, stopSim, fetchStopStatus, requestPermission } from './api.js';
+import { fetchInfo, fetchSims, fetchAvailableDevices, fetchIOSWindows, bootSim, bootAvd, stopSim, fetchStopStatus, requestPermission } from './api.js';
 import { SimStream } from './stream.js';
 import { AndroidBackends, backendIcon } from './android-backends.js';
 import { IOSCapture } from './ios-capture.js';
@@ -258,6 +258,28 @@ function _writeSimsCache(sims, info) {
   } catch {}
 }
 
+// Fresh server mode is authoritative. Reconfigure an existing picker/session
+// once when it changes; cached sidebar rows never flip an already-live panel.
+function synchronizePanelMode(udid, headless) {
+  const panel = simPanels.get(udid);
+  if (!panel || panel.physical || typeof headless !== 'boolean' || panel.headless === headless) return;
+  panel.headless = headless; panel.panelEl.dataset.headless = String(headless);
+  panel.backends?.destroy();
+  const change = choices => panel.stream?.switchBackends(choices);
+  if (panel.platform === 'ios') {
+    const shake = panel.pillEl.querySelector('[data-action=shake]');
+    shake.title = headless ? 'Shake' : 'Shake (Control–Command–Z)';shake.setAttribute('aria-label',shake.title);
+    panel.backends = new IOSCapture(panel.pillEl.querySelector('.backend-trigger'),panel.name,udid,change,{headless});
+  } else if (panel.platform === 'android') {
+    const identity = allSims.find(s => s.id === udid)?.avd || panel.name;
+    panel.backends = new AndroidBackends(panel.pillEl.querySelector('.backend-trigger'),panel.name,identity,change,{physical:false,headless});
+  }
+  panel.stream?.switchBackends(panel.backends?.choices);
+}
+function synchronizePanelModes(sims) {
+  for (const sim of sims) synchronizePanelMode(sim.id,sim.headless);
+}
+
 // ── Device list ──────────────────────────────────────────────────────────────
 async function loadSims({ reconcileAction = true } = {}) {
   const version = ++simsLoadVersion;
@@ -283,6 +305,7 @@ async function loadSims({ reconcileAction = true } = {}) {
     if (version !== simsLoadVersion) return;
     if (!Array.isArray(sims)) throw new Error('Invalid device list');
     allSims = sims;
+    synchronizePanelModes(sims);
     hasAdb = info.has_adb !== false;
     _writeSimsCache(sims, info);
     updateModeBadge(info);
@@ -391,9 +414,21 @@ function renderAddList(query) {
 async function handleAddBoot(id, name, platform, w, h, mode = 'windowed') {
   if (_bootingIds.has(id)) return;
   _bootError = ''; _bootingIds.add(id); renderAddList(addSearch.value);
+  const iosHeadless = platform === 'ios' && mode === 'headless';
+  let closeSimulator = false;
   try {
+    if (iosHeadless) {
+      const state = await fetchIOSWindows();
+      if (typeof state.windowed !== 'boolean') throw new Error('Could not determine whether Simulator windows are open');
+      if (state.windowed) {
+        if (!window.confirm(`Run ${name} headless?\nThis will close Simulator.app and ALL windowed iOS simulators. Unsaved app state may be lost. Continue?`)) {
+          _bootingIds.delete(id); renderAddList(addSearch.value); return;
+        }
+        closeSimulator = true;
+      }
+    }
     if (platform === 'android') await bootAvd(id, mode);
-    else await bootSim(id, mode);
+    else await bootSim(id, mode, closeSimulator);
   } catch (error) {
     _bootError = `Could not run ${name}: ${error.message || 'Unknown error'}`;
     _bootingIds.delete(id); renderAddList(addSearch.value);
@@ -401,6 +436,16 @@ async function handleAddBoot(id, name, platform, w, h, mode = 'windowed') {
     return; // Never hide an actual launch failure behind a discovery poll.
   }
   closeAddPopover(); closeMobileSidebar();
+  if (iosHeadless) {
+    // Boot acknowledged the exact UUID and confirmed GUI exit. Open that stream
+    // directly; do NOT fetch/reconcile the whole device list before video.
+    // Boot acceptance is not video readiness. Keep the launch pending and
+    // keep it out of the normal device rows until this stream draws a frame.
+    _pendingBoots.set(id, { name, platform, headless: true, awaitingFirstFrame: true });
+    renderDeviceList();
+    addSimPanel(id, name, w, h, platform, true);
+    return;
+  }
   _pendingBoots.set(id, { name, platform, headless: mode === 'headless' }); renderDeviceList();
   const timeout = platform === 'android' ? 180_000 : 90_000;
   let checking = false, finished = false;
@@ -412,7 +457,7 @@ async function handleAddBoot(id, name, platform, w, h, mode = 'windowed') {
       if (finished) return;
       const booted = sims.find(s => platform === 'android' ? s.platform === 'android' && s.avd === id : s.id === id);
       if (!booted) return;
-      clear(); allSims = sims; renderDeviceList();
+      clear(); allSims = sims; synchronizePanelModes(sims); renderDeviceList();
       addSimPanel(booted.id, booted.name, booted.width, booted.height, booted.platform);
     } catch { /* A temporary discovery failure is not successful boot. */ }
     finally { checking = false; }
@@ -430,6 +475,16 @@ addSearch.addEventListener('input', () => renderAddList(addSearch.value));
 addPopover.addEventListener('keydown', e => {
   if (e.key === 'Escape') { e.stopPropagation(); closeAddPopover(); }
 });
+
+function refreshDevicesAfterHeadlessFirstFrame(udid, panel) {
+  if (!panel.refreshDevicesOnFirstFrame || simPanels.get(udid) !== panel) return;
+  const pending = _pendingBoots.get(udid);
+  if (!pending?.awaitingFirstFrame || panel.pendingHeadlessBoot !== pending) return;
+  panel.refreshDevicesOnFirstFrame = false;
+  _pendingBoots.delete(udid); _bootingIds.delete(udid);
+  renderAddList(addSearch.value);
+  void loadSims({ reconcileAction: false }); // first displayed frame, once for this new stream
+}
 
 function deviceActionMessage(message, error = false) {
   deviceActionStatus.textContent = message;
@@ -494,12 +549,14 @@ async function handleDeviceStop(id) {
 
 function renderDeviceList() {
   updateKeyboardPlaceholder();
-  $('device-count').textContent = allSims.length;
+  // Even an unrelated/cache discovery must not promote an awaiting-video launch.
+  const readySims = allSims.filter(s => !_pendingBoots.get(s.id)?.awaitingFirstFrame);
+  $('device-count').textContent = readySims.length;
   const filterOn = projFilter.checked;
   const isReal = s => s.physical === true || (s.platform === 'android' && !s.id.startsWith('emulator-'));
   // Stable grouping on every render (including cache/filter/refresh); never
   // mutate discovery order, panel focus or relative order within either group.
-  const sims = (filterOn ? allSims.filter(s => s.project_app) : [...allSims])
+  const sims = (filterOn ? readySims.filter(s => s.project_app) : readySims)
     .sort((a, b) => Number(isReal(b)) - Number(isReal(a)));
   const adbHint = !hasAdb
     ? '<div class="device-list-hint">🤖 <span>No <code>adb</code> — install Android Studio for Android</span></div>'
@@ -572,8 +629,12 @@ function toggleDevice(udid, name, w, h, platform) {
   closeMobileSidebar();
 }
 
-function addSimPanel(udid, name, w, h, platform) {
-  if (simPanels.has(udid)) { setFocusedPanel(udid); return; }
+function addSimPanel(udid, name, w, h, platform, refreshDevicesOnFirstFrame = false) {
+  if (simPanels.has(udid)) {
+    if (!refreshDevicesOnFirstFrame) { setFocusedPanel(udid); return; }
+    // A previous same-UUID view/decoder must never satisfy the new boot's gate.
+    removeSimPanel(udid, { silent: true });
+  }
 
   // Headless Android starts with a 920px budget; preserve the existing iOS placeholder.
   if (!(w > 0 && h > 0)) { w = platform === 'android' ? 414 : 360; h = platform === 'android' ? 920 : 800; }
@@ -605,18 +666,12 @@ function addSimPanel(udid, name, w, h, platform) {
   frameEl.append(canvasEl, overlayEl);
 
   const physical = platform === 'android' && !udid.startsWith('emulator-');
-  const headless = !physical && allSims.find(s => s.id === udid)?.headless === true;
-  const viewOnly = headless && platform === 'ios';
+  const headless = !physical && (_pendingBoots.get(udid)?.headless === true || allSims.find(s => s.id === udid)?.headless === true);
   panelEl.dataset.headless = String(headless);
   const pillEl = createPill(udid, name, platform, physical);
-  if (viewOnly) {
-    for (const button of pillEl.querySelectorAll('[data-action]')) {
-      if (['close', 'metro-console'].includes(button.dataset.action)) continue;
-      button.disabled = true; button.title = 'Headless iOS is view-only; input support is coming later';
-    }
-    const notice = document.createElement('p'); notice.className = 'headless-notice';
-    notice.textContent = 'Headless iOS · View only — touch and keyboard support will be added later.';
-    panelEl.appendChild(notice);
+  if (headless && platform === 'ios') {
+    const shake = pillEl.querySelector('[data-action=shake]');
+    shake.title = 'Shake'; shake.setAttribute('aria-label', shake.title);
   }
   stageEl.appendChild(frameEl);
   panelEl.append(stageEl, pillEl);
@@ -631,7 +686,8 @@ function addSimPanel(udid, name, w, h, platform) {
     stream: null, panelEl, stageEl, frameEl, canvasEl, name,
     overlayEl, pillEl, dotEl, statsEl,
     statusEl: pillEl.querySelector('.panel-status'),
-    platform, physical, headless, viewOnly,
+    platform, physical, headless, refreshDevicesOnFirstFrame,
+    pendingHeadlessBoot: refreshDevicesOnFirstFrame ? _pendingBoots.get(udid) : null,
     accessibility: null, backends: null,
     ro: null, appearMode: 'dark', twoFingerMode: false,
   };
@@ -673,10 +729,15 @@ function addSimPanel(udid, name, w, h, platform) {
     quality: parseInt(qualSlider.value),
     data_saver: dsBtn.classList.contains('active'),
     backends: panel.backends?.choices,
-    viewOnly,
-    onBackends: message => panel.backends?.receive(message),
+    onBackends: message => {
+      if (typeof message.headless === 'boolean') {
+        const sim = allSims.find(s => s.id === udid); if (sim) sim.headless = message.headless;
+        synchronizePanelMode(udid,message.headless);
+      }
+      panel.backends?.receive(message);
+    },
     onStatus:            (s, message) => updatePanelStatus(udid, s, message),
-    onFirstFrame:        () => overlayEl.classList.add('hidden'),
+    onFirstFrame:        () => { overlayEl.classList.add('hidden'); refreshDevicesAfterHeadlessFirstFrame(udid, panel); },
     onOrientationChange: () => sizeFrame(panel),
     onRotateStart:       () => setPanelProgress(udid, 'Rotating…'),
     onRotateEnd:         ok => clearPanelProgress(udid, ok ? null : 'Rotate failed'),
@@ -702,6 +763,11 @@ function addSimPanel(udid, name, w, h, platform) {
 function removeSimPanel(udid, { silent = false } = {}) {
   const panel = simPanels.get(udid);
   if (!panel) return;
+  if (panel.refreshDevicesOnFirstFrame && panel.pendingHeadlessBoot === _pendingBoots.get(udid)) {
+    _pendingBoots.delete(udid); _bootingIds.delete(udid);
+    panel.refreshDevicesOnFirstFrame = false;
+    renderAddList(addSearch.value);
+  }
 
   metroDiscovery.setActive(udid, false);
   closeDeviceConsoles(udid);
@@ -856,7 +922,7 @@ function updatePanelStatus(udid, status, message = null) {
   const active = !document.hidden && !(isMobileViewport() && termOpen) && ['connected', 'streaming'].includes(status);
   panel.accessibility?.setActive(active);
   if (panel.accessibility?.isOpen) panel.stream?.updateSettings({ accessibility_enabled: active, accessibility_subscription: panel.accessibility.subscription });
-  panel.statusEl.textContent = ({ streaming: 'Live', connected: 'Ready', reconnecting: 'Reconnecting', 'no-frames': 'No frames', unsupported: 'Unsupported' })[status] || 'Connecting';
+  panel.statusEl.textContent = status === 'connected' && panel.refreshDevicesOnFirstFrame ? 'Booting…' : ({ streaming: 'Live', connected: 'Ready', reconnecting: 'Reconnecting', 'no-frames': 'No frames', unsupported: 'Unsupported' })[status] || 'Connecting';
   dotEl.className = 'status-dot';
   if (status === 'streaming' || status === 'connected') {
     dotEl.classList.add('connected');

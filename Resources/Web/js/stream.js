@@ -82,7 +82,7 @@ export class SimStream {
 
   updateSettings(patch) {
     Object.assign(this.settings, patch);
-    if (patch.stream_paused === true) this.#resetDecoder();
+    if (patch.stream_paused === true) { this.#cancelPointer(); this.#resetDecoder(); }
     this.send({ type: 'settings', ...patch });
   }
 
@@ -309,6 +309,7 @@ export class SimStream {
     if (!globalThis.isSecureContext || typeof VideoDecoder === 'undefined' || typeof EncodedVideoChunk === 'undefined') {
       this.#unsupported('H.264 requires WebCodecs in a secure context. Trust the public Simwisp local CA and open the HTTPS link in a current Chrome, Edge or Safari.'); return;
     }
+    this.#cancelPointer();
     this.#firstFrame = false; this.#captureUnavailable = false; this.#liveTouch = false;
     this.#onStatus('connecting');
     const sourceSize = this.#scrcpyBaseSize ?? { width: this.#portraitW, height: this.#portraitH };
@@ -371,6 +372,7 @@ export class SimStream {
           this.#sessionReady();
         } else if (msg.type === 'capture_error' || msg.type === 'input_error') {
           console.warn('Simwisp:', msg.message);
+          if (msg.type === 'input_error' && this.settings.input_backend === 'native') this.#onBackends(msg);
           if (msg.type === 'capture_error') { this.#captureUnavailable = true; this.#resetDecoder(); this.#onStatus('no-frames'); }
         } else if (msg.type === 'frame_heartbeat') {
           this.#lastMessageAt = Date.now();
@@ -448,7 +450,7 @@ export class SimStream {
     const finish = (e, cancelled = false) => {
       if (activePointer !== e.pointerId) return;
       e.preventDefault();
-      const end = norm(e);
+      const end = cancelled ? (lastSent ?? origin ?? norm(e)) : norm(e);
       if (raf) cancelAnimationFrame(raf);
       raf = 0;
       pending = null;
@@ -494,6 +496,9 @@ export class SimStream {
     };
 
     this.#cancelPointer = () => {
+      // Pause may keep a Quartz socket alive: release its pointer before the
+      // local gesture is forgotten. Native teardown also releases server-side.
+      if (activePointer !== null && live && lastSent) this.send({ type: 'touch_up', x: lastSent.x, y: lastSent.y });
       const id = activePointer; activePointer = null; origin = null; live = false; twoFingerGesture = false; dragging = false; pending = null; lastSent = null;
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
       if (id !== null && canvas.hasPointerCapture(id)) canvas.releasePointerCapture(id);

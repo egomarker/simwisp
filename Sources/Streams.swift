@@ -14,6 +14,14 @@ final class StreamSession: @unchecked Sendable {
     private let jpegInstallation: AndroidJPEGSession.Installation
     private let rawDiscovery: AndroidRawSession.Discovery
     private let makeNative: NativeCapture.Factory
+    private let makeNativeInput: NativeIOSInput.Factory
+    private let headlessIOSControl: HeadlessIOSControl.Runner
+    private let iosInputMode: IOSInputMode
+    private var nativeIOSInput: NativeIOSInput?
+    private var nativeInputRetiring=false
+    private var nativeInputGeneration: UInt64 = 0
+    private var iosInputFailed=false, iosInputEffective="idle"
+    private var iosInputReason: String?
     private let iosCaptureMode: IOSCaptureMode
     private let nativeScale:IOSCaptureScale
     private var nativeSourceSize=(0,0)
@@ -54,6 +62,7 @@ final class StreamSession: @unchecked Sendable {
     // Service replacement must join independent Android AND Native iOS sources.
     var usesScrcpy: Bool { scrcpy != nil || backendRetiring || jpeg != nil || jpegRetiring || raw != nil || rawRetiring || native != nil || nativeRetiring }
     var usesNativeCapture: Bool { iosCaptureMode == .native }
+    var requiresJoinedReplacement: Bool { usesNativeCapture || iosInputMode == .native || nativeIOSInput != nil || nativeInputRetiring }
     private var independentCapture: String? { backendChoice.capture == .raw ? "raw" : backendChoice.capture == .jpeg ? "jpeg" : nil }
     private let physicalAndroid: Bool
     private let captureScale: AndroidCaptureScale
@@ -92,8 +101,9 @@ final class StreamSession: @unchecked Sendable {
     private let accessibility: AccessibilitySession
     private var started = monotonic()
     var onClose: (() -> Void)?
-    init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeNative: @escaping NativeCapture.Factory = { NativeCapture(udid:$0) }, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
-        self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation; self.rawDiscovery = rawDiscovery; self.makeNative = makeNative
+    init(id: String, client: ClientConnection, request: HTTPRequest, settings: Settings, devices: Devices, input: DeviceInput, queue: DispatchQueue, lifecycle: DispatchGroup, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeNative: @escaping NativeCapture.Factory = { NativeCapture(udid:$0) }, makeNativeInput: @escaping NativeIOSInput.Factory = { try NativeHIDTransport(udid:$0) }, headlessIOSControl: @escaping HeadlessIOSControl.Runner = { try HeadlessIOSControl.perform($0,id:$1,geometry:$2,admission:$3) }, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
+        self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation; self.rawDiscovery = rawDiscovery; self.makeNative = makeNative; self.makeNativeInput = makeNativeInput; self.headlessIOSControl = headlessIOSControl
+        iosInputMode = .selected(request.query["input_backend"],platform:devices.device(id)?.platform ?? "")
         iosCaptureMode = .selected(request.query["capture_backend"],platform:devices.device(id)?.platform ?? "")
         nativeScale = iosCaptureMode == .native ? .normalized(request.query["native_scale"]) : .full
         physicalAndroid = devices.device(id)?.physicalAndroid == true
@@ -299,6 +309,7 @@ final class StreamSession: @unchecked Sendable {
         return { lifecycle.leave(); captures.leave() }
     }
     private func configure(_ window: DeviceWindow) {
+        releaseIOSInput()
         configuring = true; requestKeyframe(newEpoch: true)
         let old = capture; capture = nil; geometry = nil; captureHasFrame = false; reconcileAccessibility()
         let new = makeCapture(window), finish = beginCaptureWork()
@@ -320,6 +331,7 @@ final class StreamSession: @unchecked Sendable {
         }
     }
     private func releaseCapture() {
+        releaseIOSInput()
         let old = capture; capture = nil; geometry = nil; captureHasFrame = false; requestKeyframe(newEpoch: true)
         reconcileAccessibility()
         if let old {
@@ -328,7 +340,7 @@ final class StreamSession: @unchecked Sendable {
         }
     }
     private var backendSnapshot: [String: Any] {
-        var value: [String: Any] = ["type":"android_backends","capture":backendChoice.capture.rawValue,"input":backendChoice.input.rawValue,
+        var value: [String: Any] = ["type":"android_backends","headless":devices.device(id)?.headless as Any? ?? NSNull(),"capture":backendChoice.capture.rawValue,"input":backendChoice.input.rawValue,
          "effective_capture":effectiveCapture,"effective_input":effectiveInput,"available":backendAvailable as Any? ?? NSNull(),
          "reason":backendReason as Any? ?? NSNull(),"version":ScrcpyWire.version,"physical":physicalAndroid,"jpeg_scale":captureScale.rawValue,
          "jpeg_available":jpegAvailable as Any? ?? NSNull(),"jpeg_quality":AndroidJPEGWire.quality,"raw_available":rawAvailable as Any? ?? NSNull()]
@@ -564,10 +576,11 @@ final class StreamSession: @unchecked Sendable {
         }
     }
     private var iosCaptureSnapshot:[String:Any] {
-        ["type":"ios_capture","capture":iosCaptureMode.rawValue,"effective_capture":nativeFailed ? "unavailable":nativeEffective,"reason":nativeReason as Any? ?? NSNull(),"input":"window","native_scale":nativeScale.rawValue]
+        ["type":"ios_capture","headless":devices.device(id)?.headless as Any? ?? NSNull(),"capture":iosCaptureMode.rawValue,"effective_capture":nativeFailed ? "unavailable":nativeEffective,"reason":nativeReason as Any? ?? NSNull(),"input":iosInputMode.rawValue,"effective_input":iosInputMode == .quartz ? "current":iosInputEffective,"input_reason":iosInputReason as Any? ?? NSNull(),"native_scale":nativeScale.rawValue]
     }
     private func publishIOSCapture() { client.sendJSON(iosCaptureSnapshot) }
     private func releaseNative() {
+        releaseIOSInput()
         guard let old=native else{return}
         native=nil;nativeRetiring=true;captureHasFrame=false;nativeSourceSize=(0,0);old.cancel()
         let finish=beginCaptureWork()
@@ -598,10 +611,10 @@ final class StreamSession: @unchecked Sendable {
                 switch result {
                 case .success(let video):
                     guard let video else {
-                        if source.diagnostics["cached_image_available"] as? Bool != true {self.captureHasFrame=false;if self.nativeEffective != "starting" {self.nativeEffective="starting";self.publishIOSCapture()}};return
+                        if source.diagnostics["cached_image_available"] as? Bool != true {self.releaseIOSInput();self.captureHasFrame=false;if self.nativeEffective != "starting" {self.nativeEffective="starting";self.publishIOSCapture()}};return
                     }
                     if self.nativeSourceSize != (video.sourceWidth,video.sourceHeight) {
-                        self.input.cancel(self.id);self.nativeSourceSize=(video.sourceWidth,video.sourceHeight)
+                        self.releaseIOSInput();self.input.cancel(self.id);self.nativeSourceSize=(video.sourceWidth,video.sourceHeight)
                     }
                     if self.lastNativeGeneration != video.generation {self.requestKeyframe(newEpoch:true);self.lastNativeGeneration=video.generation}
                     if self.nativeEffective != "native" {self.nativeEffective="native";self.publishIOSCapture()}
@@ -651,7 +664,7 @@ final class StreamSession: @unchecked Sendable {
                 if changed { backendSettingsAt = monotonic() + 0.35 }
             }
             if let value = data["data_saver"] as? Bool, value != dataSaver { dataSaver = value; requestKeyframe() }
-            if let value = data["stream_paused"] as? Bool, value != paused { paused = value; requestKeyframe(newEpoch: true); if isAndroid { resetAndroid() }; if iosCaptureMode == .native { releaseNative();nativeFailed=false;nativeReason=nil;nativeEffective="starting";publishIOSCapture() } }
+            if let value = data["stream_paused"] as? Bool, value != paused { paused = value; releaseIOSInput(); if iosInputMode == .native { if !value {iosInputFailed=false;iosInputReason=nil};iosInputEffective=iosInputFailed ? "unavailable":(value ? "paused":"idle");publishIOSCapture() }; requestKeyframe(newEpoch: true); if isAndroid { resetAndroid() }; if iosCaptureMode == .native { releaseNative();nativeFailed=false;nativeReason=nil;nativeEffective="starting";publishIOSCapture() } }
             if let value = data["accessibility_enabled"] as? Bool { accessibility.update(paneOpen: value, streamActive: value && accessibilityStreamReady, subscription: data["accessibility_subscription"] as? Int) }
         } else {
             guard DeviceInput.supportedTypes.contains(type) else { return }
@@ -659,6 +672,26 @@ final class StreamSession: @unchecked Sendable {
             else if pendingInput.count < 128 { pendingInput.append(data) }
             else { client.close(); return }
             drainInput()
+        }
+    }
+    private func releaseIOSInput() {
+        // No idle generation churn; only owned/queued input needs invalidation.
+        guard nativeIOSInput != nil || (iosInputMode == .native && !pendingInput.isEmpty) else { return }
+        pendingInput.removeAll();nativeInputGeneration &+= 1
+        guard let old=nativeIOSInput else { return };nativeIOSInput=nil;nativeInputRetiring=true;old.invalidate()
+        if !iosInputFailed { iosInputEffective=paused ? "paused":"idle";if !closed {publishIOSCapture()} }
+        let finish=beginCaptureWork()
+        nativeInputWorker.async {
+            let error=old.close()
+            self.queue.async {
+                defer {self.nativeInputRetiring=false;finish()}
+                if let error {
+                    log("Native input cleanup: \(error)")
+                    if !self.closed {
+                        self.iosInputFailed=true;self.iosInputEffective="unavailable";self.iosInputReason=error;self.publishIOSCapture()
+                    }
+                }
+            }
         }
     }
     private func drainInput() {
@@ -674,6 +707,47 @@ final class StreamSession: @unchecked Sendable {
         }
         if physicalAndroid && (devices.device(id) == nil || !["touch_down","touch_move","touch_up","tap","drag","accessibility_swipe","key","text","home","back","menu","app_switcher"].contains(data["type"] as? String ?? "")) {
             completion(["type":"input_error","message":"Device unavailable or control unsupported on physical Android"]);return
+        }
+        let action=data["type"] as? String ?? ""
+        // Dispatch from authoritative mode, never from a missing on-screen
+        // window. Discovery recovers headless state before stream admission.
+        let headlessAction=devices.device(id)?.platform == "ios" && devices.device(id)?.headless == true
+            && ["rotate","shake"].contains(action)
+        if iosInputMode == .native || headlessAction {
+            guard !paused,videoReady,captureHasFrame,lastError==nil,!iosInputFailed,!nativeInputRetiring,devices.device(id)?.platform == "ios" else {
+                releaseIOSInput();completion(["type":"input_error","message":iosInputReason ?? (nativeInputRetiring ? "Native input is finishing previous cleanup" : "Native input requires an active, ready iOS stream")]);return
+            }
+            // Preserve windowed actions exactly. Headless actions use their own
+            // device-scoped route on this stream input worker, never host focus.
+            if !headlessAction && ["appearance","rotate","shake"].contains(action) {
+                guard data["type"] as? String == "appearance" || devices.window(id) != nil else { completion(["type":"input_error","message":"Rotate and Shake require a visible Simulator window"]);return }
+                releaseIOSInput();input.perform(data,id:id,completion:completion);return
+            }
+            let size: NativeInputGeometry?
+            if iosCaptureMode == .native { size=NativeInputGeometry(nativeSourceSize.0,nativeSourceSize.1) }
+            else if let geometry,let current=devices.window(id),current.id==geometry.id,current.crop==geometry.crop,current.bounds.size==geometry.bounds.size {
+                size=NativeInputGeometry(Int(geometry.crop.width),Int(geometry.crop.height))
+            } else { size=nil }
+            guard let size else { releaseIOSInput();completion(["type":"input_error","message":"Native input is waiting for current display geometry"]);return }
+            let source: NativeIOSInput
+            if let active=nativeIOSInput { source=active }
+            else { source=NativeIOSInput(id:id,makeTransport:makeNativeInput);nativeIOSInput=source }
+            let generation=nativeInputGeneration,finish=beginCaptureWork()
+            nativeInputWorker.async {
+                let result=Result {
+                    if headlessAction { try source.performAction { try self.headlessIOSControl(action,self.id,size,$0) } }
+                    else { try source.perform(data,geometry:size) }
+                },failure=source.failure,connected=source.connected
+                self.queue.async {
+                    defer { finish() }
+                    guard !self.closed,self.nativeIOSInput === source,self.nativeInputGeneration==generation else { completion(nil);return }
+                    if let failure {
+                        self.iosInputFailed=true;self.iosInputEffective="unavailable";self.iosInputReason=failure
+                        self.releaseIOSInput();self.publishIOSCapture()
+                    } else if connected,self.iosInputEffective != "native" { self.iosInputEffective="native";self.publishIOSCapture() }
+                    switch result { case .success:completion(nil);case .failure(let error):completion(["type":"input_error","message":error.localizedDescription]) }
+                }
+            };return
         }
         if iosCaptureMode == .native && ["touch_down","touch_move","touch_up","tap","drag","accessibility_swipe"].contains(data["type"] as? String ?? "") {
             guard !paused,captureHasFrame,lastError==nil,let window=devices.window(id),nativeSourceSize.0>0,nativeSourceSize.1>0,
@@ -711,7 +785,7 @@ final class StreamSession: @unchecked Sendable {
     func stop(completion: @escaping () -> Void = {}) {
         if !closed {
             closed = true; accessibility.stop()
-            timer?.cancel(); timer = nil; pendingInput.removeAll(); input.cancel(id); releaseAndroid(); releaseJPEG(); releaseRaw(); releaseNative(); releaseCapture(); onClose?(); onClose = nil
+            timer?.cancel(); timer = nil; pendingInput.removeAll(); releaseIOSInput(); input.cancel(id); releaseAndroid(); releaseJPEG(); releaseRaw(); releaseNative(); releaseCapture(); onClose?(); onClose = nil
         }
         // Await only this device's capture work, including an in-flight configure.
         // Other simulator captures do not delay or get stopped by this request.

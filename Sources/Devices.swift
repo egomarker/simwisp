@@ -12,10 +12,10 @@ struct Device: Codable {
     // Backend-only alias; keep the AVD name/serial and public inventory unchanged.
     var metroName: String? = nil
     var avd: String? = nil
-    var headless: Bool? = nil // Known launch intent, not an inference from a hidden/minimized window.
+    var headless: Bool? = nil // Explicit launch mode or complete native-inventory recovery; nil means unknown.
     var physicalAndroid: Bool { platform == "android" && !id.hasPrefix("emulator-") }
     private enum CodingKeys: String, CodingKey { case id, name, platform, width, height, project_app, avd, headless }
-    var json: [String: Any] { ["id": id, "name": name, "platform": platform, "width": width, "height": height, "project_app": project_app, "avd": avd as Any? ?? NSNull(), "physical": physicalAndroid, "headless": headless == true] }
+    var json: [String: Any] { ["id": id, "name": name, "platform": platform, "width": width, "height": height, "project_app": project_app, "avd": avd as Any? ?? NSNull(), "physical": physicalAndroid, "headless": headless as Any? ?? NSNull()] }
 }
 // React Native's Android device label is Build.MODEL + release + SDK_INT,
 // not the emulator's AVD name. Read once per existing tool-cache refresh on the
@@ -122,6 +122,7 @@ final class Devices {
     private let bootOverride: ((String, DeviceLaunchMode) throws -> Void)?
     private var launchModes: [String: DeviceLaunchMode] = [:]
     private var observedLaunches = Set<String>()
+    private var recoveredLaunches = Set<String>()
     let adb: String?
     let emulator: String?
     init(settings: Settings, control: DeviceControl? = nil, discovery: (() -> ([Device], [[String: Any]], [String: DeviceWindow]))? = nil, boot: ((String, DeviceLaunchMode) throws -> Void)? = nil) {
@@ -131,7 +132,7 @@ final class Devices {
         adb = roots.filter { !$0.isEmpty }.map { $0 + "/platform-tools/adb" }.first { FileManager.default.isExecutableFile(atPath: $0) }
         emulator = roots.filter { !$0.isEmpty }.map { $0 + "/emulator/emulator" }.first { FileManager.default.isExecutableFile(atPath: $0) }
         bundleID = Self.projectBundle(settings.projectDirectory)
-        self.control = control ?? DeviceControl(adb: adb, emulatorProcesses: .live(emulator: emulator))
+        self.control = control ?? DeviceControl(adb: adb, simulatorGUI: .live, emulatorProcesses: .live(emulator: emulator))
     }
     func setStreamingDemand(_ active: Bool) {
         lock.withLock { streamingDemand = active }
@@ -157,14 +158,14 @@ final class Devices {
     }
     func requestRefresh(completion: @escaping () -> Void) {
         queue.async {
-            if !self.lock.withLock({ self.stopped }) { self.refresh() }
+            if !self.lock.withLock({ self.stopped }) { self.refresh(recoverModes:true) }
             completion()
         }
     }
     func invalidate() {
         queue.async {
             guard !self.lock.withLock({ self.stopped }) else { return }
-            self.lastTools = 0; self.refresh()
+            self.lastTools = 0; self.refresh(recoverModes:true)
         }
     }
     var diagnostics: [String: Any] {
@@ -176,11 +177,11 @@ final class Devices {
     func device(_ id: String) -> Device? { list().first { $0.id == id } }
     var projectBundleID: String? { bundleID }
 
-    private func refresh() {
+    private func refresh(recoverModes: Bool = false) {
         lock.withLock { refreshCount &+= 1 }
         if let discoveryOverride {
             let snapshot = discoveryOverride()
-            let decorated = applyingLaunchModes(snapshot.0)
+            let decorated = applyingLaunchModes(snapshot.0,available:snapshot.1,recoverModes:recoverModes)
             lock.withLock { running = decorated; available = snapshot.1; windows = snapshot.2 }
             return
         }
@@ -229,7 +230,7 @@ final class Devices {
             }
             let runningNames = Set(androidCache.filter { !$0.physicalAndroid }.map { $0.avd ?? $0.name.replacingOccurrences(of: " ", with: "_") })
             library += avds.filter { !runningNames.contains($0) }.map { ["id": $0, "name": $0.replacingOccurrences(of: "_", with: " "), "platform": "android"] }
-            let decorated = applyingLaunchModes(devices)
+            let decorated = applyingLaunchModes(devices,available:library,recoverModes:recoverModes)
             lock.lock(); running = decorated; available = library; windows = mapped; lock.unlock()
         }
     }
@@ -272,26 +273,43 @@ final class Devices {
         guard let adb else { return [] }
         return AndroidDeviceInventory.read(adb: adb)
     }
-    private func applyingLaunchModes(_ devices: [Device]) -> [Device] {
-        lock.withLock {
-            let key: (Device) -> String = { $0.platform == "android" ? "android:" + ($0.avd ?? $0.id) : "ios:" + $0.id }
-            let present = Set(devices.map(key))
-            // Stop is still device-ID based. Forget intent after observed retirement,
-            // so a later external launch cannot inherit a stopped session's mode.
-            for retired in observedLaunches.subtracting(present) { launchModes.removeValue(forKey: retired); observedLaunches.remove(retired) }
-            return devices.map { device in
-                var next = device
-                if let mode = launchModes[key(device)] { next.headless = mode == .headless; observedLaunches.insert(key(device)) }
+    private static func launchKey(_ device: Device) -> String {
+        device.platform=="android" ? "android:"+(device.avd ?? device.id):"ios:"+device.id
+    }
+    private func applyingLaunchModes(_ devices: [Device], available: [[String:Any]], recoverModes: Bool) -> [Device] {
+        let candidates=lock.withLock {devices.filter {$0.platform == "ios" || launchModes[Self.launchKey($0)]==nil || recoveredLaunches.contains(Self.launchKey($0))}}
+        var recovered:[String:DeviceLaunchMode]=[:]
+        if recoverModes,!candidates.isEmpty {
+            let inventory:SimulatorInventory
+            if discoveryOverride != nil {
+                let booted=devices.filter {$0.platform=="ios"}.map {SimulatorEntry(udid:$0.id,name:$0.name,state:"Booted",isAvailable:true)}
+                let idle=available.filter {$0["platform"] as? String == "ios"}.compactMap {entry -> SimulatorEntry? in
+                    guard let id=entry["id"] as? String,let name=entry["name"] as? String else{return nil}
+                    return SimulatorEntry(udid:id,name:name,state:"Shutdown",isAvailable:true)
+                }
+                inventory=SimulatorInventory(devices:["inert":booted+idle])
+            } else {inventory=(try? JSONDecoder().decode(SimulatorInventory.self,from:jsonData(iosJSON))) ?? SimulatorInventory(devices:[:])}
+            recovered=control.recoverLaunchModes(candidates,inventory:inventory)
+        }
+        return lock.withLock {
+            let present=Set(devices.map(Self.launchKey))
+            for retired in observedLaunches.subtracting(present) {
+                launchModes.removeValue(forKey:retired);recoveredLaunches.remove(retired);observedLaunches.remove(retired)
+            }
+            return devices.map {device in
+                var next=device;let key=Self.launchKey(device)
+                if let mode=recovered[device.id] {launchModes[key]=mode;recoveredLaunches.insert(key)}
+                if let mode=launchModes[key] {next.headless=mode == .headless;observedLaunches.insert(key)}
                 return next
             }
         }
     }
-    func boot(_ id: String, mode: DeviceLaunchMode = .windowed) throws {
+    func boot(_ id: String, mode: DeviceLaunchMode = .windowed, quitSimulatorConfirmed: Bool = false) throws {
         guard let entry = library().first(where: { $0["id"] as? String == id }), let platform = entry["platform"] as? String else { throw WispError("Unknown or already running device") }
+        defer { invalidate() } // GUI closure can affect other devices even if boot fails.
         if let bootOverride { try bootOverride(id, mode) }
-        else { try control.boot(id, platform: platform, mode: mode, emulator: emulator) }
-        lock.withLock { let key = platform + ":" + id; launchModes[key] = mode; observedLaunches.remove(key) }
-        invalidate()
+        else { try control.boot(id, platform: platform, mode: mode, emulator: emulator, quitSimulatorConfirmed: quitSimulatorConfirmed) }
+        lock.withLock { let key = platform + ":" + id; launchModes[key] = mode; recoveredLaunches.remove(key); observedLaunches.remove(key) }
     }
     static func projectBundle(_ directory: String) -> String? {
         guard let entries = try? FileManager.default.contentsOfDirectory(atPath: directory) else { return nil }

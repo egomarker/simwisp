@@ -23,3 +23,20 @@ per-simulator selection, pull-only polling with no private callback registration
 bounded immutable BGRA/BGRX snapshots and shared H.264/HTTPS lifecycle integration.
 Original upstream attribution above is preserved; its modification list describes
 upstream SimKit, not additional features supplied by Simwisp.
+
+Simwisp optional Native iOS input implementation (2026)
+The IOHID parent/finger recipe and screen-edge routing are selectively informed by
+subdiox/SimKit Sources/Input/IOHIDDigitizerDispatch.swift and HIDInput.swift at
+74c895ea4b696ad51cf18f7204ab6fb79dde8915 (Apache License 2.0; attribution above).
+Simwisp supplies an original serial stream-scoped state machine, lazy device-bound
+transport, guarded installed-Xcode ABI/message layouts, acknowledged ownership
+transfer, cancellation/release/error barriers and independent Quartz/Native picker.
+No upstream package, actor/concurrency model, mouse-NSEvent bridge or SDK upgrade
+is bundled. Source and inert checks are not live private-API certification.
+
+Headless iOS orientation control (2026)
+The workspace orientation message is adapted from subdiox/SimKit
+Sources/Control/SimulatorOrientation.swift at the same pinned commit, derived
+from tddworks/baguette (Apache License 2.0). Simwisp adds selector ABI guards,
+validated device targeting, owned port release, bounded send, cancellation
+and per-stream lifecycle integration. No Simulator app code is bundled.
