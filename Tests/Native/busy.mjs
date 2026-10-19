@@ -57,7 +57,7 @@ export async function reviewNativeReuse({ev,api,connect,destroy,pixels,put,remov
   check('pooled immutable source renders expected fresh color '+i,true);
  }
  const state=await api();
- check('fresh motion reuses bounded owned buffers',state.capture_counters.source_frames>=13&&state.capture_counters.snapshot_buffers<=3&&state.capture_counters.snapshot_buffer_allocations<=3&&state.capture_counters.snapshot_buffer_reuses>=10);
+ check('fresh motion reuses ONE fullsize source reference after completed CI renders',state.capture_counters.source_frames>=13&&state.capture_counters.snapshot_buffers===1&&state.capture_counters.snapshot_buffer_allocations===1&&state.capture_counters.snapshot_buffer_reuses>=10);
  check('fresh motion keeps one encoder and decoder epoch',state.capture_counters.encoder_creations===1&&await ev(`audit.epoch===${audit.epoch}&&audit.decoderCreates===${audit.decoderCreates}`));
  check('fresh motion never queues source frames or uses JPEG',state.capture_counters.queued_frames===0&&state.capture_counters.jpeg_encodes===0&&state.capture_counters.jpeg_decodes===0);
  await destroy();remove('mode.json');

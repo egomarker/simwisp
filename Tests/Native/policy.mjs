@@ -6,7 +6,10 @@ assert.match(stream,/IOSCaptureMode/,'Native is admitted only by iOS policy, not
 console.log('Native iOS integration policy checks passed');
 
 const capture=fs.readFileSync('Sources/NativeCapture.swift','utf8');
-assert(capture.indexOf('let lease=acquire(layout)')<capture.indexOf('IOSurfaceLock(surface,.readOnly'), 'owned allocation precedes producer read lock');
+const allocation=capture.indexOf('let lease=acquire(layout,comparing:comparing)'),producerLock=capture.indexOf('IOSurfaceLock(surface,.readOnly');
+assert(allocation>=0&&producerLock>allocation, 'owned allocation precedes producer read lock');
+assert(!capture.includes('previous:Pixels?')&&capture.includes('snapshots.readReference(surface)'), 'Native capture no longer retains a duplicate fullsize Pixels comparison lease');
+assert(capture.includes('waitForCompletion:true')&&fs.readFileSync('Sources/Video.swift','utf8').includes('task.waitUntilCompleted()'), 'owned Native source render completes before its temporary borrow can retire');
 assert(capture.indexOf('IOSurfaceUnlock(surface,.readOnly')<capture.indexOf('if format==0x42475258'), 'alpha normalization touches owned bytes after unlock');
 assert(!capture.includes('Data(count:'), 'Native does not zero-allocate a full Data on every poll');
 assert.match(capture,/static let limit=3/, 'snapshot leases have a finite global per-capture limit');

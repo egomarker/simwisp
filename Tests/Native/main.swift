@@ -435,6 +435,93 @@ final class ScaleSource:NativeSurfaceSource {
     func surface()throws->IOSurface? {value}
     func close(){value=nil;closed=true}
 }
+// Native source-lifetime RED: retained comparison must not pin a second source buffer.
+do {
+    let src=ScaleSource(surface(96,192)),cap=NativeCapture(source:{src})
+    defer {cap.stop()}
+    _ = try cap.h264(quality:20,fps:60,forceKeyframe:false,dataSaver:false)
+    _ = try cap.h264(quality:20,fps:60,forceKeyframe:false,dataSaver:false)
+    expect(cap.diagnostics["snapshot_buffers"] as? Int==1,"source-lifetime keeps one reusable fullsize source reference with BGRA")
+}
+
+// Complete source-reference lifetime, including real CI render retention.
+do {
+    let src=ScaleSource(surface(96,192)),cap=NativeCapture(source:{src})
+    defer {cap.stop()}
+    let first=try cap.h264(quality:20,fps:60,forceKeyframe:false,dataSaver:false)!
+    for _ in 0..<300 {expect(try cap.h264(quality:20,fps:60,forceKeyframe:false,dataSaver:true)==nil,"reference static readable image idles only DSon")}
+    expect(cap.diagnostics["snapshot_buffers"] as? Int==1 && cap.diagnostics["snapshot_buffer_allocations"] as? Int==1,"static reference never retains a second fullsize source buffer")
+    expect(cap.diagnostics["snapshot_bytes_copied"] as? Int==96*192*4 && cap.diagnostics["snapshot_unchanged_bytes_reused"] as? Int==300*96*192*4,"static reference compares without rewriting owned bytes under producer lock")
+    let a=surface(96,192),b=surface(96,192,variant:true)
+    for i in 0..<300 {
+        src.value=i%2==0 ? b:a
+        let video=try cap.h264(quality:20,fps:60,forceKeyframe:false,dataSaver:true)!
+        expect(video.generation==first.generation,"motion source reference keeps encoder epoch")
+    }
+    expect(cap.diagnostics["snapshot_buffers"] as? Int==1 && cap.diagnostics["snapshot_buffer_allocations"] as? Int==1,"completed CI motion renders reuse ONE immutable source reference")
+    expect(cap.diagnostics["prepared_pixel_buffers"] as? Int==301,"only real source changes prepare output")
+    expect(cap.diagnostics["snapshot_leased_buffers"] as? Int==0,"no source Data/CI borrow survives completed preparation")
+    cap.stop();expect(cap.diagnostics["snapshot_buffer_bytes"] as? Int==0,"reference source stop releases all owned source storage")
+}
+func referencePixels(_ reader:NativeSnapshotReader,_ image:IOSurface)throws->(NativeCapture.Pixels,Bool) {
+    switch try reader.readReference(image) {
+    case .pixels(let pixels,_,let changed):return(pixels,changed)
+    case .busy:throw WispError("unexpected reference busy")
+    }
+}
+do {
+    let reader=NativeSnapshotReader(),image=surface(17,31),green=surface(17,31,variant:true)
+    var held:[NativeCapture.Pixels]=[]
+    for i in 0..<3 {held.append(try referencePixels(reader,i==1 ? green:image).0)}
+    expect(held[0].bytes[2]==255 && held[1].bytes[1]==255,"reference lease consumers stay immutable across later reads")
+    switch try reader.readReference(green) {case .busy(_,let why):expect(why == .storage,"reference fourth lease respects global3 bound");case .pixels:expect(false,"reference fourth lease cannot allocate")}
+    switch try reader.readReference(surface(19,33)) {case .busy(_,let why):expect(why == .storage,"reference retired layout leases still count toward3");case .pixels:expect(false,"reference layout cannot escape bound")}
+    held.removeAll();reader.reset();expect(reader.diagnostics["snapshot_buffers"]==0,"released reference leases and reset free every source buffer")
+}
+do {
+    let reader=NativeSnapshotReader(),image=surface(17,31)
+    _ = try referencePixels(reader,image)
+    expect(try referencePixels(reader,image).1==false,"reference equality includes packed bytes, not changing seeds")
+    let oldSeed=actualNativeSeed(image)
+    let base=IOSurfaceGetBaseAddress(image).assumingMemoryBound(to:UInt8.self)
+    base[0]=254 // TEST: producer mutation WITHOUT advancing seed must be noticed.
+    let sameSeedChanged=try referencePixels(reader,image).1
+    expect(actualNativeSeed(image)==oldSeed && sameSeedChanged,"reference detects changed bytes with identical producer seed")
+    forceNativeBusy(image,true)
+    switch try reader.readReference(image) {case .busy(_,let why):expect(why == .seed,"in-place reference seed mismatch stays busy");case .pixels:expect(false,"in-place torn reference rejected")}
+    forceNativeBusy(image,false)
+    expect(try referencePixels(reader,image).1,"in-place torn comparison reference forces next coherent preparation")
+    expect(try referencePixels(reader,image).1==false,"recovered coherent comparison becomes reusable")
+}
+do {
+    let reader=NativeSnapshotReader(),image=surface(17,31,format:0x42475258)
+    _ = try referencePixels(reader,image)
+    let p=IOSurfaceGetBaseAddress(image).assumingMemoryBound(to:UInt8.self);p[3]=123
+    expect(try referencePixels(reader,image).1==false,"BGRX ignored X changes do not invent source changes")
+    p[1]=1;expect(try referencePixels(reader,image).1,"BGRX real RGB change remains visible to reference")
+}
+
+// Late-row change keeps already-matching rows and copies the changed tail.
+do {
+    let reader=NativeSnapshotReader(),image=surface(17,31)
+    _ = try referencePixels(reader,image)
+    let p=IOSurfaceGetBaseAddress(image).assumingMemoryBound(to:UInt8.self)
+    p[30*IOSurfaceGetBytesPerRow(image)+16*4]=19
+    let next=try referencePixels(reader,image)
+    expect(next.1 && next.0.bytes[30*17*4+16*4]==19 && next.0.bytes[2]==255,"late-row in-place change preserves matching prefix and fresh tail")
+    expect(reader.diagnostics["snapshot_bytes_copied"]==17*31*4+17*4,"late-row reference copies only changed row and tail")
+}
+// A retained old lease requires a full copy even for an identical image.
+do {
+    let reader=NativeSnapshotReader(),image=surface(17,31)
+    let held=try referencePixels(reader,image).0
+    let next=try referencePixels(reader,image)
+    withExtendedLifetime(held) {
+        expect(!next.1 && next.0.bytes==held.bytes,"identical distinct lease receives initialized immutable bytes")
+        expect(reader.diagnostics["snapshot_bytes_copied"]==2*17*31*4,"distinct lease never skips matching rows")
+    }
+}
+
 // Regression RED: same-layout transient read must NOT invalidate last-readable
 // owned pixels, decoder generation or stream/input availability. Not packet replay.
 do {

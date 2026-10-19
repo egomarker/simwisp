@@ -97,13 +97,19 @@ final class H264Encoder {
         guard status == noErr else { throw WispError("H.264 \(operation) failed (\(status))") }
     }
     private func property(_ key: CFString, _ value: CFTypeRef) throws { try check(VTSessionSetProperty(session!, key: key, value: value), String(key)) }
-    func prepare(_ image:CIImage)throws->PreparedFrame {
+    func prepare(_ image:CIImage,waitForCompletion:Bool=false)throws->PreparedFrame {
         guard session != nil,let pool else { throw WispError("H.264 encoder closed") }
         var pixel: CVPixelBuffer?
         try check(CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(nil, pool, [kCVPixelBufferPoolAllocationThresholdKey: 3] as CFDictionary, &pixel), "bounded pixel allocation")
         let bounds = CGRect(x: 0, y: 0, width: codedWidth, height: codedHeight)
         let background = CIImage(color: .black).cropped(to: bounds)
-        context.render(image.composited(over: background), to: pixel!, bounds: bounds, colorSpace: colorSpace)
+        let composited=image.composited(over:background)
+        if waitForCompletion {
+            let destination=CIRenderDestination(pixelBuffer:pixel!)
+            destination.colorSpace=colorSpace;destination.alphaMode = .premultiplied;destination.isFlipped=true // Matches legacy CVPixelBuffer render row order.
+            let task=try context.startTask(toRender:composited,from:bounds,to:destination,at:.zero)
+            _ = try task.waitUntilCompleted()
+        } else {context.render(composited,to:pixel!,bounds:bounds,colorSpace:colorSpace)}
         return PreparedFrame(pixel:pixel!,owner:identity)
     }
     // Mac-window/JPEG retain their existing prepare-per-encode behavior.
