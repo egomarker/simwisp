@@ -125,7 +125,8 @@ let controlOnlyArgs=ScrcpySession.arguments(version:ScrcpyWire.version,scid:"000
 expect(controlOnlyArgs.contains("video=false") && controlOnlyArgs.contains("video_codec_options=profile=1,max-bframes=0,i-frame-interval=1"),"control-only input never requests video QP limits")
 expect(!controlOnlyArgs.contains{$0.contains("bitrate-mode=") || $0.contains("repeat-previous-frame-after")},"control-only requests neither bitrate mode nor repeat option")
 for (w,h) in [(0,800),(-1,800),(1,1),(8193,800),(Int.max,800)] { expect(ScrcpyVideoSize(width:w,height:h)==nil,"malformed size cannot reach encoder arguments") }
-expect(ScrcpyVideoSize.headless.width==360 && ScrcpyVideoSize.headless.height==800,"headless fallback matches existing UI")
+expect(ScrcpyVideoSize.headless.width==414 && ScrcpyVideoSize.headless.height==920,"headless fallback matches920px UI budget")
+expect(ScrcpyVideoSize.headless.maxSize==920 && ScrcpyVideoSize.headless.width*20==ScrcpyVideoSize.headless.height*9,"headless fallback preserves9:20 aspect and920px long edge")
 for c in AndroidBackendMode.allCases{for i in AndroidBackendMode.allCases{let v=AndroidBackendChoice(capture:c.rawValue,input:i.rawValue);expect(v.capture.rawValue==c.rawValue && v.input==i,"independent selections")}}
 expect(AndroidBackendChoice(capture:"bad",input:"bad")==AndroidBackendChoice(),"invalid preferences default safely")
 var header=Data();header.scrcpyAppend(UInt32(1)<<31);header.scrcpyAppend(UInt32(320));header.scrcpyAppend(UInt32(640))

@@ -19,7 +19,7 @@ struct AndroidBackendChoice: Equatable {
 // rounds the long-edge limit to the Android codec's supported size alignment.
 struct ScrcpyVideoSize: Equatable {
     let width: Int, height: Int
-    static let headless = ScrcpyVideoSize(width: 360, height: 800)!
+    static let headless = ScrcpyVideoSize(width: 414, height: 920)! // 920px long edge, 9:20 portrait fallback.
     init?(width: Int, height: Int) {
         guard (8...8192).contains(width), (8...8192).contains(height) else { return nil }
         self.width=min(width,height);self.height=max(width,height)

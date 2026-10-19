@@ -584,7 +584,8 @@ function toggleDevice(udid, name, w, h, platform) {
 function addSimPanel(udid, name, w, h, platform) {
   if (simPanels.has(udid)) { setFocusedPanel(udid); return; }
 
-  if (!(w > 0 && h > 0)) { w = 360; h = 800; } // Headless Android dimensions arrive with the first H.264 session.
+  // Headless Android starts with a 920px budget; preserve the existing iOS placeholder.
+  if (!(w > 0 && h > 0)) { w = platform === 'android' ? 414 : 360; h = platform === 'android' ? 920 : 800; }
   // ── Build DOM ──
   const panelEl = document.createElement('div');
   panelEl.className = 'sim-panel';

@@ -61,8 +61,8 @@ try{
   check('headless capture remains streaming',(await api()).state==='Streaming');
   await closeStream();await connect(432,960);await budget(432,960,500000);
   check('new headless session uses initial browser dimensions',launches().at(-1).args.includes('max_size=960'));
-  await closeStream();await connect(0,0);await budget(360,800,500000);
-  check('invalid initial dimensions use bounded UI fallback',launches().at(-1).args.includes('max_size=800'));
+  await closeStream();await connect(0,0);await budget(414,920,500000);
+  check('invalid initial dimensions use920px UI fallback',launches().at(-1).args.includes('max_size=920'));
   remove('headless');remove('window-size.json');await budget(320,640,500000);
   check('a window appearing later becomes authoritative',true);
   await closeStream();await connect(320,640,1,'current','scrcpy');
