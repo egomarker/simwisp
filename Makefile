@@ -23,7 +23,13 @@ build:
 	codesign --verify --deep --strict '$(APP)'
 check: build
 	@/usr/libexec/PlistBuddy -c 'Print :LSUIElement' '$(APP)/Contents/Info.plist'
-test: test-metro-native test-pairing test-accessibility test-input test-native-input test-headless-ios-controls test-headless-mode test-capture test-device-control test-android-crash-env test-simulator-quit test-video test-stream-flow
+test: test-metro-native test-pairing test-accessibility test-input test-native-input test-headless-ios-controls test-headless-mode test-capture test-device-control test-android-crash-env test-simulator-quit test-video test-stream-flow test-launcher
+.PHONY: test-launcher
+test-launcher:
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-launcher-results.XXXXXX); \
+	 trap 'status=$$?; if [[ -n "$(TEST_OUTPUT)" ]]; then mkdir -p "$(TEST_OUTPUT)"; cp "$$root/launcher.json" "$(TEST_OUTPUT)/" 2>/dev/null || true; fi; if [[ "$$root" == /tmp/simwisp-launcher-results.* ]]; then rm -rf -- "$$root"; fi; exit $$status' EXIT; \
+	 "$(NODE)" Tests/Launcher/simwisp.mjs "$$root"
+
 test-pairing:
 	@mkdir -p '$(TEST_BUILD)'
 	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/Support.swift Sources/Pairing.swift Tests/main.swift -o '$(TEST_BUILD)/pairing-tests'
