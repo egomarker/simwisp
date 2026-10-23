@@ -792,3 +792,32 @@
 .backend-explainer{font-size:11px;line-height:1.6;color:var(--text-tertiary);margin:17px 0 16px;max-width:280px}.backend-footer{display:flex;align-items:center;gap:5px;border-top:1px solid var(--border-subtle);padding:11px 0 12px;color:var(--text-tertiary);font-size:10px}.backend-footer svg{width:12px;height:12px}
 .backend-warning{padding:10px 11px;margin:-4px 0 17px;border:1px solid color-mix(in srgb,var(--warning) 24%,transparent);border-radius:7px;background:var(--warning-bg);color:var(--warning);font-size:11px;line-height:1.55;overflow-wrap:anywhere}
 @media(max-width:700px),(max-height:480px) and (max-width:900px){.backend-popover{padding:16px 16px 0}.backend-options button{min-height:44px}.backend-trigger>span{display:none}.backend-trigger{width:30px;padding:0;justify-content:center}.backend-close{width:36px;height:36px;margin-top:-6px;margin-right:-8px}}
+
+/* Android-only accessibility menu; switch position/ARIA state replaces status words. */
+.android-accessibility-menu[hidden]{display:none}
+.android-accessibility-menu{box-sizing:border-box;position:fixed;z-index:72;width:320px;max-width:calc(100vw - 24px);padding:7px;border:1px solid var(--border);border-radius:13px;background:var(--bg-elevated);box-shadow:var(--shadow-lg);color:var(--text-primary);overflow:auto;overscroll-behavior:contain}
+.android-a11y-settings{position:relative}
+.android-a11y-content[inert]{filter:blur(3px);pointer-events:none;user-select:none}
+.android-a11y-loading{position:absolute;inset:0;z-index:1;display:grid;place-items:center;cursor:wait;touch-action:none}
+.android-a11y-loading[hidden]{display:none}
+.android-a11y-loading .spinner{margin:0}
+@media(prefers-reduced-motion:reduce){.android-a11y-loading .spinner{animation:none}}
+.android-accessibility-menu header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 10px 13px}
+.android-accessibility-menu h2{font-size:14px;line-height:20px;font-weight:650}
+.android-a11y-platform{font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;background:var(--bg-overlay);color:var(--text-secondary);border-radius:12px;padding:4px 7px}
+.android-a11y-row{display:flex;align-items:center;gap:12px;width:100%;min-height:48px;padding:8px 10px;border:0;border-radius:7px;background:transparent;color:var(--text-primary);font:500 13px var(--font-sans);text-align:left;cursor:pointer}
+.android-a11y-row:hover:not(:disabled){background:var(--bg-overlay)}
+.android-a11y-row:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.android-a11y-row:disabled{opacity:.45;cursor:default}
+.android-a11y-row>svg,.android-a11y-letter{flex:0 0 20px;width:20px;color:var(--text-secondary)}
+.android-a11y-letter{font-size:15px;font-weight:600}.android-a11y-bold{font-size:18px;font-weight:750}
+.android-a11y-label{flex:1;min-width:0;overflow-wrap:anywhere}
+.android-a11y-switch{position:relative;flex:0 0 36px;width:36px;height:20px;border-radius:12px;background:var(--border-strong)}
+.android-a11y-switch::after{content:'';position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:var(--bg-elevated)}
+.android-a11y-row[aria-checked=true] .android-a11y-switch{background:var(--success)}
+.android-a11y-row[aria-checked=true] .android-a11y-switch::after{transform:translateX(16px)}
+.android-a11y-divider{height:1px;background:var(--border-subtle);margin:5px 7px}
+.android-a11y-request-status{padding:8px 10px 5px;font-size:11px;line-height:1.5;color:var(--text-secondary);overflow-wrap:anywhere}
+.android-a11y-request-status:empty{display:none}.android-a11y-request-status.error{color:var(--error)}
+.a11y-toggle[aria-expanded=true]{background:var(--accent-bg);color:var(--accent);border-color:var(--accent-border)}
+@media(max-width:700px){.android-a11y-row{min-height:50px}}

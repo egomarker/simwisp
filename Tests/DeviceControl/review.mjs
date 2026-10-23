@@ -35,6 +35,10 @@ async function rawStream(id){
 function cdp(method,params={}){return new Promise((resolve,reject)=>{const id=++seq,timer=setTimeout(()=>{pending.delete(id);reject(Error('CDP timeout '+method))},12000);pending.set(id,{resolve,reject,timer});ws.send(JSON.stringify({id,method,params}))})}
 async function evaluate(expression){const r=await cdp('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});if(r.exceptionDetails)throw Error(JSON.stringify(r.exceptionDetails));return r.result.value}
 const wait=expression=>until(()=>evaluate(expression));async function check(name,expression){assert(name,await evaluate(expression))}
+async function openInspector(selector = '[data-action="accessibility"]') {
+ await click(selector);
+ await click('.android-accessibility-menu:not([hidden]) [data-action="show-inspector"]');
+}
 async function click(selector){await evaluate('document.querySelector('+JSON.stringify(selector)+').click()');await delay(70)}
 async function pointer(selector){const p=await evaluate('(()=>{const e=document.querySelector('+JSON.stringify(selector)+'),r=e.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;return {x,y,hit:!e.disabled&&x>=0&&x<innerWidth&&y>=0&&y<innerHeight&&e.contains(document.elementFromPoint(x,y))}})()');if(!p.hit)throw Error('Unreachable '+selector);await cdp('Input.dispatchMouseEvent',{type:'mousePressed',x:p.x,y:p.y,button:'left',buttons:1,clickCount:1});await cdp('Input.dispatchMouseEvent',{type:'mouseReleased',x:p.x,y:p.y,button:'left',clickCount:1});await delay(80)}
 const stopSelector=id=>'[data-stop-id="'+id+'"]',panelSelector=id=>'.sim-panel[data-udid="'+id+'"]';
@@ -120,7 +124,7 @@ try{
  await click('#btn-terminal');await closePanels();await reset();await navigate();
  // Stop a monitored Android device, leaving a second Android view untouched.
  await click('[data-udid="emulator-5554"]');await click('[data-udid="emulator-5556"]');await wait("document.querySelectorAll('.panel-status').length===2&&[...document.querySelectorAll('.panel-status')].every(e=>e.textContent==='Live')");
- await click(panelSelector(android)+' [data-action="accessibility"]');await until(async()=>(await sessions()).find(s=>s.id===android)?.accessibility.reader?.running===true);
+ await openInspector(panelSelector(android)+' [data-action="accessibility"]');await until(async()=>(await sessions()).find(s=>s.id===android)?.accessibility.reader?.running===true);
  const readerPID=(await sessions()).find(s=>s.id===android).accessibility.reader.pid,otherBefore=(await sessions()).find(s=>s.id==='emulator-5556').frames;
  await check('Selected Android Stop has an active in-flow inspector',"!document.querySelector('#accessibility-emulator-5554').hidden&&document.querySelectorAll('.sim-panel').length===2");
  await pointer(stopSelector(android));await wait('!document.querySelector('+JSON.stringify(stopSelector(android))+')');

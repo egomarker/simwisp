@@ -50,6 +50,16 @@ export async function fetchStopStatus(id) {
   return _fetch(`/api/stop-status/${encodeURIComponent(id)}`);
 }
 
+// These functions are called only by explicit accessibility-menu actions.
+export async function fetchAndroidAccessibility(id) {
+  return _fetch(`/api/android-accessibility/${encodeURIComponent(id)}`, { cache: 'no-store' }, 20_000);
+}
+export async function setAndroidAccessibility(id, setting, enabled) {
+  return _fetch(`/api/android-accessibility/${encodeURIComponent(id)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ setting, enabled }),
+  }, 10_000);
+}
+
 export async function requestPermission(permission) {
   return _fetch('/api/request-permissions', {
     method: 'POST',

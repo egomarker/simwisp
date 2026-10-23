@@ -237,7 +237,12 @@ let inertInput=DeviceInput(devices:devices,handler:{message,id in world.record("
 let service = Service(settings: settings, pairingStateURL: root.appendingPathComponent("pairing-state.json"), tlsDirectory: root.appendingPathComponent("tls"), devices: devices, input: inertInput, captureStopTimeout: 1.5, scrcpyInstallation: { throw WispError("Isolated fixture: scrcpy unavailable") }, rawDiscovery: { _ in
     guard let data = try? Data(contentsOf: root.appendingPathComponent("raw-peer.json")), let port = dictionary(data)["port"] as? Int else { throw WispError("Owned raw peer unavailable") }
     return try EmulatorRawEndpoint(port: port, token: "owned-raw-fixture-secret")
-}, makeNative: { id in NativeCapture(source: { HeadlessSurface(id) }) }, makeNativeInput: { InertNativeInput($0) }, headlessIOSControl: world.headlessControl, makeCapture: { window in
+}, makeNative: { id in NativeCapture(source: { HeadlessSurface(id) }) }, makeNativeInput: { InertNativeInput($0) }, headlessIOSControl: world.headlessControl, androidAccessibilityRun: { _, args, _ in
+    // Never execute an SDK/guest command for accessibility-menu fixture reads.
+    guard args.count == 7, args[4] == "get" else { throw WispError("Fixture accessibility writes unavailable") }
+    let value = args[6] == "font_scale" ? "1.0" : args[6] == "enabled_accessibility_services" ? "null" : "0"
+    return CommandResult(status:0, output:Data(value.utf8), error:Data())
+}, makeCapture: { window in
     let native = FakeStream(window.title)
     return WindowCapture(target: window, makeStream: { capture in native.capture = capture; return native })
 })

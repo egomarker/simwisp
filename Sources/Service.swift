@@ -21,6 +21,7 @@ final class Service {
     private let makeNative: NativeCapture.Factory
     private let makeNativeInput: NativeIOSInput.Factory
     private let headlessIOSControl: HeadlessIOSControl.Runner
+    private let androidAccessibilityRun: AndroidAccessibility.Runner
     private let captureStopTimeout: Double
     private var streams: [String: StreamSession] = [:] // network queue owns registry
     private var retiring: [String: [StreamSession]] = [:] // disconnected/replaced captures still cleaning up
@@ -33,8 +34,9 @@ final class Service {
     private var usage = Usage() // sampled on the network queue for diagnostics only
     private var panelState: [String: Any] = ["visible": false, "refresh_timer": false, "refreshes": 0]
     var stateChanged: ((String) -> Void)?
-    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory, devices: Devices? = nil, input: DeviceInput? = nil, metroEndpoint: URL = URL(string: "http://127.0.0.1:8081/json/list")!, captureStopTimeout: Double = 20, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeNative: @escaping NativeCapture.Factory = { NativeCapture(udid:$0) }, makeNativeInput: @escaping NativeIOSInput.Factory = { try NativeHIDTransport(udid:$0) }, headlessIOSControl: @escaping HeadlessIOSControl.Runner = { try HeadlessIOSControl.perform($0,id:$1,geometry:$2,admission:$3) }, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
+    init(settings: Settings, pairingStateURL: URL = Settings.file.deletingLastPathComponent().appendingPathComponent("pairing-state.json"), tlsDirectory: URL = TLSIdentity.directory, devices: Devices? = nil, input: DeviceInput? = nil, metroEndpoint: URL = URL(string: "http://127.0.0.1:8081/json/list")!, captureStopTimeout: Double = 20, scrcpyInstallation: @escaping ScrcpySession.Installation = ScrcpyInstallation.find, jpegInstallation: @escaping AndroidJPEGSession.Installation = AndroidJPEGSession.bundledJar, rawDiscovery: @escaping AndroidRawSession.Discovery = EmulatorRawEndpoint.discover, makeNative: @escaping NativeCapture.Factory = { NativeCapture(udid:$0) }, makeNativeInput: @escaping NativeIOSInput.Factory = { try NativeHIDTransport(udid:$0) }, headlessIOSControl: @escaping HeadlessIOSControl.Runner = { try HeadlessIOSControl.perform($0,id:$1,geometry:$2,admission:$3) }, androidAccessibilityRun: @escaping AndroidAccessibility.Runner = { try command($0,$1,timeout:$2) }, makeCapture: @escaping (DeviceWindow) -> WindowCapture = { WindowCapture(target: $0) }) {
         self.pairingStateURL = pairingStateURL; self.tlsDirectory = tlsDirectory
+        self.androidAccessibilityRun = androidAccessibilityRun
         self.settings = settings; self.makeCapture = makeCapture; self.scrcpyInstallation = scrcpyInstallation; self.jpegInstallation = jpegInstallation; self.rawDiscovery = rawDiscovery; self.makeNative = makeNative; self.makeNativeInput = makeNativeInput; self.headlessIOSControl = headlessIOSControl; self.captureStopTimeout = captureStopTimeout
         let selectedDevices = devices ?? Devices(settings: settings)
         self.devices = selectedDevices; self.input = input ?? DeviceInput(devices: selectedDevices)
@@ -199,10 +201,30 @@ final class Service {
         case ("POST", "/api/boot-avd"):
             guard let avd = dictionary(request.body)["avd"] as? String else { complete(.json(["error": "Missing AVD"], status: 400)); return }; boot(avd, body: request.body, complete: complete)
         default:
-            if request.method == "POST", request.path.hasPrefix("/api/boot/") { boot(String(request.path.dropFirst(10)), body: request.body, complete: complete) }
+            if request.path.hasPrefix("/api/android-accessibility/") { androidAccessibility(request, id: String(request.path.dropFirst("/api/android-accessibility/".count)), complete: complete) }
+            else if request.method == "POST", request.path.hasPrefix("/api/boot/") { boot(String(request.path.dropFirst(10)), body: request.body, complete: complete) }
             else if request.method == "POST", request.path.hasPrefix("/api/stop/") { stopDevice(String(request.path.dropFirst(10)), complete: complete) }
             else if request.method == "GET", request.path.hasPrefix("/api/stop-status/") { stopStatus(String(request.path.dropFirst("/api/stop-status/".count)), complete: complete) }
             else { complete(.json(["error": "Not found"], status: 404)) }
+        }
+    }
+    private func androidAccessibility(_ request: HTTPRequest, id: String, complete: @escaping (HTTPResponse) -> Void) {
+        guard request.method == "GET" || request.method == "POST" else { complete(.json(["error": "GET or POST required"], status: 405)); return }
+        guard (request.headers["origin"] == nil || request.sameOrigin), request.headers["sec-fetch-site"] != "cross-site" else { complete(.json(["error": "Origin denied"], status: 403)); return }
+        guard let device = devices.device(id), device.platform == "android", DeviceControl.validADBSerial(id) else { complete(.json(["error": "Unknown Android device"], status: 404)); return }
+        guard !stopping.contains(id) else { complete(.json(["error": "This device is stopping"], status: 409)); return }
+        guard let adb = devices.adb else { complete(.json(["error": "ADB unavailable"], status: 503)); return }
+        let change: AndroidAccessibility.Change?
+        do { change = request.method == "POST" ? try AndroidAccessibility.change(request.body) : nil }
+        catch { complete(.json(["error": "Expected an accessibility setting and a boolean enabled value"], status: 400)); return }
+        lifecycle.enter()
+        workers.async {
+            defer { self.lifecycle.leave() }
+            do {
+                guard self.devices.device(id)?.platform == "android" else { throw WispError("Android device is no longer available") }
+                if let change { complete(.json(try AndroidAccessibility.set(change, adb: adb, serial: id, using: self.androidAccessibilityRun))) }
+                else { complete(.json(try AndroidAccessibility.read(adb: adb, serial: id, using: self.androidAccessibilityRun))) }
+            } catch { complete(.json(["error": error.localizedDescription], status: 503)) }
         }
     }
     private func boot(_ id: String, body: Data, complete: @escaping (HTTPResponse) -> Void) {

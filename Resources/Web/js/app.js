@@ -1,6 +1,7 @@
-import { fetchInfo, fetchSims, fetchAvailableDevices, fetchIOSWindows, bootSim, bootAvd, stopSim, fetchStopStatus, requestPermission } from './api.js';
+import { fetchInfo, fetchSims, fetchAvailableDevices, fetchIOSWindows, bootSim, bootAvd, stopSim, fetchStopStatus, requestPermission, fetchAndroidAccessibility, setAndroidAccessibility } from './api.js';
 import { SimStream } from './stream.js';
 import { AndroidBackends, backendIcon } from './android-backends.js';
+import { AndroidAccessibilityMenu } from './android-accessibility.js';
 import { IOSCapture } from './ios-capture.js';
 import { initTheme } from './theme.js';
 import { MetroDiscovery, consoleIdentity, resolveConsole } from './metro-discovery.js';
@@ -688,7 +689,7 @@ function addSimPanel(udid, name, w, h, platform, refreshDevicesOnFirstFrame = fa
     statusEl: pillEl.querySelector('.panel-status'),
     platform, physical, headless, refreshDevicesOnFirstFrame,
     pendingHeadlessBoot: refreshDevicesOnFirstFrame ? _pendingBoots.get(udid) : null,
-    accessibility: null, backends: null,
+    accessibility: null, accessibilityMenu: null, backends: null,
     ro: null, appearMode: 'dark', twoFingerMode: false,
   };
   simPanels.set(udid, panel);
@@ -696,23 +697,30 @@ function addSimPanel(udid, name, w, h, platform, refreshDevicesOnFirstFrame = fa
     const identity = physical ? 'device:' + udid : allSims.find(s => s.id === udid)?.avd || name;
     panel.backends = new AndroidBackends(pillEl.querySelector('.backend-trigger'), name, identity, choices => panel.stream?.switchBackends(choices), { physical, headless });
     const button = pillEl.querySelector('[data-action="accessibility"]');
-    // Optional assets and pane are created only on an explicit first open.
-    const firstOpen = async () => {
-      if (button.disabled) return;
-      button.disabled = true;
-      try {
-        const { AccessibilityPane, loadAccessibilityStyles } = await import('./accessibility.js');
-        await loadAccessibilityStyles();
+    panel.accessibilityMenu = new AndroidAccessibilityMenu(button, {
+      read: () => fetchAndroidAccessibility(udid),
+      write: (setting, enabled) => setAndroidAccessibility(udid, setting, enabled),
+      toggleInspector: async () => {
         if (simPanels.get(udid) !== panel) return;
-        panel.accessibility = new AccessibilityPane(panelEl, button, () => updateStreamVisibility());
-        button.removeEventListener('click', firstOpen);
-        panel.accessibility.setOpen(true);
-      } catch (error) {
-        button.title = 'Accessibility inspector failed to load — retry or reload';
-        console.warn('Simwisp accessibility:', error);
-      } finally { button.disabled = false; }
-    };
-    button.addEventListener('click', firstOpen);
+        const inspectorButton = panel.accessibilityMenu.inspectorButton;
+        if (inspectorButton.disabled) return;
+        inspectorButton.disabled = true;
+        try {
+          // Loading and logcat subscriptions remain exclusive to this action.
+          if (!panel.accessibility) {
+            const { AccessibilityPane, loadAccessibilityStyles } = await import('./accessibility.js');
+            await loadAccessibilityStyles();
+            if (simPanels.get(udid) !== panel) return;
+            panel.accessibility = new AccessibilityPane(panelEl, inspectorButton, () => {
+              panel.accessibilityMenu.setInspectorOpen(panel.accessibility.isOpen);
+              updateStreamVisibility();
+            }, { bindToggle: false, focusTarget: button });
+          }
+          panel.accessibility.setOpen(!panel.accessibility.isOpen);
+        } finally { inspectorButton.disabled = false; }
+      },
+      onError: () => deviceActionMessage('TalkBack inspector could not load; retry.', true),
+    });
   }
 
   if (platform === 'ios') panel.backends = new IOSCapture(pillEl.querySelector('.backend-trigger'), name, udid, choices => panel.stream?.switchBackends(choices), { headless });
@@ -772,6 +780,7 @@ function removeSimPanel(udid, { silent = false } = {}) {
   metroDiscovery.setActive(udid, false);
   closeDeviceConsoles(udid);
   panel.accessibility?.setOpen(false);
+  panel.accessibilityMenu?.destroy();
   panel.backends?.destroy();
   panel.stream?.destroy();
   panel.ro?.disconnect();
@@ -1046,7 +1055,7 @@ function createPill(udid, name, platform, physical = false) {
     ${udid.startsWith('emulator-')
       ? '<button class="pill-btn" data-action="two-finger" title="TalkBack scroll (ADB swipe)" aria-pressed="false">2F</button>'
       : ''}
-    ${platform === 'android' ? '<button class="pill-btn a11y-toggle" data-action="accessibility" title="TalkBack accessibility inspector" aria-pressed="false" aria-expanded="false"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="7" r="1"/><path d="m7 10 5 1 5-1M12 11v4m0 0-3 3m3-3 3 3"/></svg><span>A11y</span></button>' : ''}
+    ${platform === 'android' ? '<button class="pill-btn a11y-toggle" data-action="accessibility" title="Android accessibility" aria-haspopup="dialog" aria-expanded="false"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="7" r="1"/><path d="m7 10 5 1 5-1M12 11v4m0 0-3 3m3-3 3 3"/></svg><span>A11y</span></button>' : ''}
     <button class="pill-btn" data-action="kbd" title="Keyboard">
       <svg width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
         <rect x="1" y="5" width="18" height="11" rx="2"/>
@@ -1347,7 +1356,7 @@ termResizeHandle.addEventListener('pointermove', event => {
   updateViewportVars();
 });
 ['pointerup', 'pointercancel', 'lostpointercapture'].forEach(name => termResizeHandle.addEventListener(name, () => { termDrag = null; }));
-window.addEventListener('pagehide', () => { metroDisposed=true;metroDiscovery.destroy();picker?.close();simPanels.forEach(p=>{p.accessibility?.setOpen(false);p.stream?.destroy();});persistTerminalTabs();termTabs.forEach(tab=>tab.controller?.destroy({terminate:false}));terminalResizeObserver?.disconnect(); });
+window.addEventListener('pagehide', () => { metroDisposed=true;metroDiscovery.destroy();picker?.close();simPanels.forEach(p=>{p.accessibility?.setOpen(false);p.accessibilityMenu?.destroy();p.stream?.destroy();});persistTerminalTabs();termTabs.forEach(tab=>tab.controller?.destroy({terminate:false}));terminalResizeObserver?.disconnect(); });
 window.addEventListener('pageshow', e => { if (e.persisted) location.reload(); });
 
 // ── Session persistence ───────────────────────────────────────────────────────

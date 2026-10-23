@@ -17,6 +17,10 @@ async function evaluate(expression){const r=await cdp('Runtime.evaluate',{expres
 async function wait(expression,ms=4000){const end=Date.now()+ms;while(Date.now()<end){if(await evaluate(expression))return true;await delay(40)}throw Error('UI timeout: '+expression)}
 async function check(name,expression){const value=await evaluate(expression);report.checks.push({name,passed:value===true});if(value!==true)throw Error('FAIL '+name+': '+JSON.stringify(value));}
 async function nativeCheck(name,condition){const value=await condition();report.checks.push({name,passed:value===true});if(value!==true)throw Error('FAIL '+name);}
+async function openInspector(selector = '[data-action="accessibility"]') {
+ await click(selector);
+ await click('.android-accessibility-menu:not([hidden]) [data-action="show-inspector"]');
+}
 async function click(selector){await evaluate(`document.querySelector(${JSON.stringify(selector)}).click()`);await delay(80)}
 async function pointerClick(selector){
  const p=await evaluate("(()=>{const e=document.querySelector("+JSON.stringify(selector)+"),r=e.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;return {x,y,hit:x>=0&&x<innerWidth&&y>=0&&y<innerHeight&&e.contains(document.elementFromPoint(x,y))&&!e.disabled}})()");
@@ -112,11 +116,11 @@ try{
   await check(size.name+' Android button only',`document.querySelectorAll('[data-action="accessibility"]').length===1`);
   await nativeCheck(size.name+' video without pane never creates reader',async()=>Object.keys((await androidInfo()).reader).length===0);
   await check(size.name+' unopened pane has no JS/CSS load', `!document.querySelector('.accessibility-pane')&&!performance.getEntriesByType('resource').some(r=>r.name.endsWith('/js/accessibility.js')||r.name.endsWith('/css/accessibility.css'))`);
-  await click('[data-action="accessibility"]');
+  await openInspector();
   await wait(`document.querySelector('.a11y-speech').textContent.includes('Opens this decision support tool')`);
   await check(size.name+' speech only by default',`document.querySelector('.a11y-details').hidden && document.querySelector('.a11y-more').textContent==='More…' && document.querySelector('.a11y-speech').textContent==='ADHD. Attention-Deficit/Hyperactivity Disorder, Button, Opens this decision support tool'`);
   await check(size.name+' compact fits full viewport without footer',`(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),f=document.querySelector('.device-frame').getBoundingClientRect(),b=document.querySelector('#viewport-area').getBoundingClientRect();return p.top>=f.bottom-1&&p.bottom<=b.bottom+1&&document.documentElement.scrollWidth<=innerWidth+1&&document.documentElement.scrollHeight<=innerHeight+1})()`);
-  await check(size.name+' inspector controls and selectable text', `document.querySelector('[data-action="accessibility"]').getAttribute('aria-controls')===document.querySelector('.accessibility-pane').id&&document.querySelector('.a11y-more').getAttribute('aria-controls')===document.querySelector('.a11y-details').id&&getComputedStyle(document.querySelector('.a11y-details')).userSelect==='text'`);
+  await check(size.name+' inspector controls and selectable text', `document.querySelector('[data-action="accessibility"]').getAttribute('aria-controls')===document.querySelector('.android-accessibility-menu').id&&document.querySelector('[data-action="show-inspector"]').getAttribute('aria-controls')===document.querySelector('.accessibility-pane').id&&document.querySelector('.a11y-more').getAttribute('aria-controls')===document.querySelector('.a11y-details').id&&getComputedStyle(document.querySelector('.a11y-details')).userSelect==='text'`);
 
   await check(size.name+' default speech viewport is three lines',"(()=>{const b=document.querySelector('.a11y-body'),e=document.querySelector('.a11y-eyebrow'),s=getComputedStyle(b),h=b.clientHeight-parseFloat(s.paddingTop)-parseFloat(s.paddingBottom)-e.getBoundingClientRect().height-parseFloat(getComputedStyle(e).marginBottom),line=parseFloat(getComputedStyle(document.querySelector('.a11y-speech')).lineHeight);return Math.abs(h-3*line)<1.1})()");
   await check(size.name+' resize handle is inside top with no layout space',"(()=>{const p=document.querySelector('.accessibility-pane').getBoundingClientRect(),h=document.querySelector('.a11y-resize-handle'),r=h.getBoundingClientRect();return getComputedStyle(h).position==='absolute'&&r.top>=p.top&&r.top<=p.top+2&&r.bottom<p.bottom&&r.left>=p.left&&r.right<=p.right&&h.getAttribute('role')==='separator'&&h.getAttribute('aria-controls')===document.querySelector('.accessibility-pane').id})()");
@@ -159,7 +163,7 @@ try{
  await evaluate('window.__feedbackDelay=0');await closeStreams();
 
  // User sizing preferences are local to this private test browser/device.
- await navigate(1440,1000,false);await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ await navigate(1440,1000,false);await openInspector();await wait("document.querySelector('.a11y-status').textContent==='Live'");
  const original=await geometry(),readerBefore=await androidInfo();
  await mouseResize(70);const resized=await geometry();
  await nativeCheck('Mouse grip grows pane and proportionally refits simulator',async()=>Math.abs(resized.pane-original.pane-70)<=2&&resized.frame<original.frame-2&&resized.cw===original.cw&&resized.ch===original.ch&&Math.abs(resized.frameW-resized.frame*resized.cw/resized.ch)<1.5);
@@ -174,9 +178,9 @@ try{
  await click('.a11y-more');const expanded=await geometry();await mouseResize(40);const customExpanded=await geometry();
  await nativeCheck('Expanded mode supports manual resizing',async()=>Math.abs(customExpanded.pane-expanded.pane-40)<2);
  await click('.a11y-more');await nativeCheck('Less restores chosen compact height',async()=>Math.abs((await geometry()).pane-resized.pane)<2);
- await click('.a11y-close');await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ await click('.a11y-close');await openInspector();await wait("document.querySelector('.a11y-status').textContent==='Live'");
  await nativeCheck('Close/reopen remembers compact preference',async()=>Math.abs((await geometry()).pane-resized.pane)<2);
- await closeStreams();await navigate(1440,1000,false);await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ await closeStreams();await navigate(1440,1000,false);await openInspector();await wait("document.querySelector('.a11y-status').textContent==='Live'");
  await nativeCheck('Reload restores saved compact height per device',async()=>Math.abs((await geometry()).pane-resized.pane)<2);
  await click('.a11y-more');await nativeCheck('Reload restores independent expanded height',async()=>Math.abs((await geometry()).pane-customExpanded.pane)<2);
  await cdp('Emulation.setDeviceMetricsOverride',{width:375,height:420,deviceScaleFactor:1,mobile:true});await delay(200);
@@ -185,7 +189,7 @@ try{
  await nativeCheck('Viewport clamp never overwrites saved preferred height',async()=>Math.abs((await geometry()).pane-customExpanded.pane)<2);
  await click('.a11y-more');await shot('desktop-user-resized-pane');
  await closeStreams();await evaluate('localStorage.removeItem('+JSON.stringify(sizeKey)+')');
- await navigate(390,844,true);await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ await navigate(390,844,true);await openInspector();await wait("document.querySelector('.a11y-status').textContent==='Live'");
  const phoneDefault=await geometry();await touchResize(55);const phoneCustom=await geometry();
  await nativeCheck('Touch grip resizes without scrolling workspace or sending input',async()=>Math.abs(phoneCustom.pane-phoneDefault.pane-55)<3&&phoneCustom.inputs===phoneDefault.inputs);
  await touchResize(35,true);await nativeCheck('Cancelled touch restores size and releases drag',async()=>Math.abs((await geometry()).pane-phoneCustom.pane)<2);
@@ -194,14 +198,14 @@ try{
  await nativeCheck('Double-click grip resets chosen compact size',async()=>Math.abs((await geometry()).pane-phoneDefault.pane)<2);
  await shot('phone-fixed-three-lines-grip');
  await closeStreams();await evaluate('localStorage.setItem('+JSON.stringify(sizeKey)+','+JSON.stringify('{"compact":-1,"expanded":999999}')+')');
- await navigate(390,844,true);await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ await navigate(390,844,true);await openInspector();await wait("document.querySelector('.a11y-status').textContent==='Live'");
  await nativeCheck('Invalid stored sizes fall back to default',async()=>Math.abs((await geometry()).pane-phoneDefault.pane)<2);
  await evaluate('(()=>{const original=Storage.prototype.setItem;Storage.prototype.setItem=function(k,v){if(k==='+JSON.stringify(sizeKey)+')throw new Error("fixture blocked storage");return original.call(this,k,v)}})()');
  await touchResize(30);await nativeCheck('Blocked storage does not break resizing',async()=>Math.abs((await geometry()).pane-phoneDefault.pane-30)<3);
  await closeStreams();await evaluate('localStorage.removeItem('+JSON.stringify(sizeKey)+')');
 
  // Pause, visibility, stale delivery and pointer mapping on a normal phone.
- await navigate(390,844,true);await click('[data-action="accessibility"]');await wait(`document.querySelector('.a11y-speech').textContent.includes('Opens this')`);
+ await navigate(390,844,true);await openInspector();await wait(`document.querySelector('.a11y-speech').textContent.includes('Opens this')`);
  await evaluate(`Object.defineProperty(document,'hidden',{configurable:true,value:true});document.dispatchEvent(new Event('visibilitychange'))`);await delay(400);
  await nativeCheck('Hidden document stops native child',async()=>(await androidInfo()).reader.running===false);
  await evaluate(`Object.defineProperty(document,'hidden',{configurable:true,value:false});document.dispatchEvent(new Event('visibilitychange'))`);await wait(`document.querySelector('.a11y-speech').textContent.includes('Opens this') && document.querySelector('.a11y-status').textContent==='Live'`);
@@ -209,7 +213,7 @@ try{
  const injection=`(()=>{const socket=window.__wire.sockets.find(s=>s.readyState===1);const gen=window.__wire.settings.at(-1).accessibility_subscription;socket.dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'accessibility_event',subscription:gen-1,node:{speech:'STALE SHOULD NOT SHOW'}})}));return !document.querySelector('.a11y-speech').textContent.includes('STALE')})()`;
  await check('Old subscription cannot show stale event',injection);
  await check('Device data is text, not executable HTML',`(()=>{const s=window.__wire.sockets.find(s=>s.readyState===1),gen=window.__wire.settings.at(-1).accessibility_subscription;s.dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'accessibility_event',subscription:gen,node:{speech:'<img src=x onerror="window.__xss=1">',label:'<script>alert(1)</script>',properties:{enabled:'true'},actions:['ACTION_CLICK']}})}));return document.querySelector('.a11y-speech').textContent.startsWith('<img')&&!document.querySelector('.accessibility-pane img')&&!window.__xss})()`);
- await click('.a11y-close');await click('[data-action="accessibility"]');await wait(`document.querySelector('.a11y-speech').textContent.includes('Opens this')`);await click('.a11y-more');
+ await click('.a11y-close');await openInspector();await wait(`document.querySelector('.a11y-speech').textContent.includes('Opens this')`);await click('.a11y-more');
  const point=await evaluate(`(()=>{const r=document.querySelector('canvas').getBoundingClientRect();return {x:r.left+r.width*.5,y:r.top+r.height*.5}})()`);
  await cdp('Input.dispatchMouseEvent',{type:'mousePressed',x:point.x,y:point.y,button:'left',clickCount:1});await cdp('Input.dispatchMouseEvent',{type:'mouseReleased',x:point.x,y:point.y,button:'left',clickCount:1});
  await check('Shrunk sim preserves normalized pointer mapping',`window.__wire.inputs.some(m=>['touch_down','tap'].includes(m.type)&&Math.abs(m.x-.5)<.03&&Math.abs(m.y-.5)<.03)`);
@@ -336,7 +340,7 @@ try{
  // Real ADB compatibility check: only after the actual frontend pane opens.
  await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({real:true})});
  await navigate(390,844,true);await nativeCheck('Real ADB mode still has no reader while pane closed',async()=>Object.keys((await androidInfo()).reader).length===0);
- await click('[data-action="accessibility"]');await delay(1200);const actual=await androidInfo();
+ await openInspector();await delay(1200);const actual=await androidInfo();
  await nativeCheck('Real ADB fresh cursor accepted and child listening',async()=>actual.reader.running===true&&actual.state==='listening');
  report.realADB={childWasRunning:actual.reader.running,linesRead:actual.reader.lines,bytesRead:actual.reader.bytes,actualSpeechObserved:await evaluate(`document.querySelector('.a11y-status').textContent==='Live'`),navigationInjected:false};
  await click('.a11y-close');await delay(400);const realOff=await androidInfo();
@@ -348,7 +352,7 @@ try{
  await fetch(base+'/fixture/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({real:false})});
  await navigate(1440,1000,false);
  // Event-only reconnect restores opt-in only while the real pane remains open.
- await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ await openInspector();await wait("document.querySelector('.a11y-status').textContent==='Live'");
  await evaluate("window.__wire.sockets.find(s=>s.readyState===1).close()");await delay(400);
  await nativeCheck('Socket disconnect tears down reader',async()=>(await status()).sessions.length===0);
  await wait("document.querySelector('.a11y-status').textContent==='Live' && document.querySelector('.panel-status').textContent==='Live'",6000);
@@ -360,11 +364,11 @@ try{
  await nativeCheck('Closed pane reconnect never allocates reader',async()=>Object.keys((await androidInfo()).reader).length===0);
  const fps=[];
  async function sample(mode){const start=(await status()).sessions.find(s=>s.id==='emulator-5554').frames,at=performance.now();await delay(2500);const end=(await status()).sessions.find(s=>s.id==='emulator-5554').frames;fps.push({mode,fps:(end-start)*1000/(performance.now()-at)});}
- await sample('pane closed');await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");await sample('pane open, event-driven idle reader');await click('.a11y-close');await sample('pane closed again');
+ await sample('pane closed');await openInspector();await wait("document.querySelector('.a11y-status').textContent==='Live'");await sample('pane open, event-driven idle reader');await click('.a11y-close');await sample('pane closed again');
  report.fixtureFPS=fps;
  await nativeCheck('Fixture H.264/WebCodecs/presentation-ACK path stays above 50 FPS',async()=>fps.every(s=>s.fps>50));
  await nativeCheck('Idle inspector does not reduce fixture FPS by 10%',async()=>fps[1].fps/fps[0].fps>.9);
- await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");await click('.a11y-more');
+ await openInspector();await wait("document.querySelector('.a11y-status').textContent==='Live'");await click('.a11y-more');
  await evaluate("document.documentElement.dataset.theme='dark'");await shot('desktop-dark-expanded');
  await check('Dark theme inspector uses theme colors',"getComputedStyle(document.querySelector('.accessibility-pane')).backgroundColor!== 'rgb(255, 255, 255)'");
  await evaluate("window.__wire.sockets.find(s=>s.readyState===1).send(JSON.stringify({type:'settings',stream_paused:true}))");await delay(150);
@@ -376,7 +380,7 @@ try{
  await evaluate("document.querySelector('.device-item[data-udid=\"ios-fixture\"]')?.click()");
  await wait("document.querySelectorAll('.sim-panel').length===2");
  await check('Multi-device accessibility toggle belongs only to Android',"document.querySelectorAll('[data-action=\"accessibility\"]').length===1&&document.querySelectorAll('.accessibility-pane').length===0");
- await click('[data-action="accessibility"]');await wait("document.querySelector('.a11y-status').textContent==='Live'");
+ await openInspector();await wait("document.querySelector('.a11y-status').textContent==='Live'");
  await check('Android pane does not resize or cover iOS neighbor',"(()=>{const a=document.querySelector('.accessibility-pane').getBoundingClientRect(),i=document.querySelector('.sim-panel[data-udid=\"ios-fixture\"] .device-frame').getBoundingClientRect();return a.right<=i.left||a.left>=i.right})()");
  await closeStreams();
 

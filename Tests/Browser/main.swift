@@ -142,6 +142,11 @@ server.route={ request, complete in
     if request.path == "/api/pair" {var r=HTTPResponse.json(["ok":true]);r.headers["Set-Cookie"]="fixture=paired; Path=/; Secure; HttpOnly; SameSite=Strict";complete(r);return}
     if request.path == "/api/pair/options" {complete(.json(["totp":false]));return}
     if request.path == "/api/info" {complete(.json(["app":"Simwisp","version":"fixture","has_adb":true,"mode":"fast2 (Native H.264 test fixture)","video_codec":"h264","permissions":["screen_recording":true,"accessibility":true],"features":["terminal":terminalEnabled]]));return}
+    // Menu reads stay synthetic, including the explicitly opt-in real-logcat mode.
+    if request.path.hasPrefix("/api/android-accessibility/") {
+        guard request.method == "GET", sims.contains(where: { $0["id"] as? String == String(request.path.dropFirst("/api/android-accessibility/".count)) && $0["platform"] as? String == "android" }) else { complete(.json(["error":"Fixture writes unavailable"],status:400));return }
+        complete(.json(["talkback":false,"text_size":false,"bold_font":false,"high_contrast":false]));return
+    }
     if request.path == "/api/sims" {complete(.json(sims));return}
     if request.path == "/api/devices" {complete(.json([]));return}
     if request.path == "/fixture/status" {complete(.json(["sessions":registry.values.map(\.snapshot),"real_adb":useRealADB,"terminal":["active":terminalClients.count,"starts":terminalStarts,"output_acks":terminalACKs]]));return}

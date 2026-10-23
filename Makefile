@@ -23,7 +23,7 @@ build:
 	codesign --verify --deep --strict '$(APP)'
 check: build
 	@/usr/libexec/PlistBuddy -c 'Print :LSUIElement' '$(APP)/Contents/Info.plist'
-test: test-metro-native test-pairing test-accessibility test-input test-native-input test-headless-ios-controls test-headless-mode test-capture test-device-control test-android-crash-env test-simulator-quit test-video test-stream-flow test-launcher
+test: test-metro-native test-pairing test-accessibility test-input test-native-input test-headless-ios-controls test-headless-mode test-capture test-device-control test-android-crash-env test-simulator-quit test-video test-stream-flow test-launcher test-android-accessibility-native
 .PHONY: test-launcher
 test-launcher:
 	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-launcher-results.XXXXXX); \
@@ -192,3 +192,13 @@ test-native-input test-native-input-builders test-native-input-services:
 	 xcrun swiftc -swift-version 5 -O Sources/Support.swift Sources/Pairing.swift Sources/NativeRuntime.swift Sources/NativeInput.swift Sources/NativeInputRuntime.swift Tests/NativeInput/main.swift -o "$$root/tests"; \
 	 "$$root/tests" "$$root" $(if $(filter test-native-input-builders,$@),--builders,$(if $(filter test-native-input-services,$@),--services,)); \
 	 if [[ -n "$(TEST_OUTPUT)" ]]; then mkdir -p "$(TEST_OUTPUT)"; cp "$$root"/*.json "$(TEST_OUTPUT)/"; fi
+
+.PHONY: test-android-accessibility-native test-android-accessibility-ui test-android-accessibility
+test-android-accessibility: test-android-accessibility-native test-android-accessibility-ui
+test-android-accessibility-native:
+	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-a11y-tests.XXXXXX); \
+	 trap 'status=$$?; if [[ -n "$(TEST_OUTPUT)" ]]; then mkdir -p "$(TEST_OUTPUT)"; for f in "$$root"/*.json; do [[ ! -f "$$f" ]] || cp "$$f" "$(TEST_OUTPUT)/"; done; fi; rm -rf "$$root"; exit $$status' EXIT; \
+	 xcrun swiftc -swift-version 5 -O $(filter-out Sources/SimwispApp.swift,$(SOURCES)) Tests/AndroidAccessibility/main.swift -o "$$root/tests"; \
+	 "$$root/tests" "$$root" $(ANDROID_A11Y_PHASE)
+test-android-accessibility-ui:
+	@TEST_OUTPUT="$(TEST_OUTPUT)" "$(NODE)" Tests/AndroidAccessibility/frontend.mjs

@@ -23,7 +23,7 @@ export class AccessibilityPane {
   #status; #speech; #note; #details; #more; #body;
   #panel; #handle; #sizeObserver; #sizeKey; #drag = null;
   #preferred = { compact: null, expanded: null };
-  constructor(panel, button, onToggle) {
+  constructor(panel, button, onToggle, { bindToggle = true, focusTarget = button } = {}) {
     this.#button = button; this.#onToggle = onToggle; this.#panel = panel;
     this.#sizeKey = 'simwispAccessibilitySize.v1.' + panel.dataset.udid;
     try {
@@ -66,8 +66,8 @@ export class AccessibilityPane {
       this.#body.scrollTop = 0;
       this.#layout();
     });
-    this.el.querySelector('.a11y-close').addEventListener('click', () => { this.setOpen(false); button.focus(); });
-    button.addEventListener('click', () => this.setOpen(!this.#open));
+    this.el.querySelector('.a11y-close').addEventListener('click', () => { this.setOpen(false); focusTarget.focus(); });
+    if (bindToggle) button.addEventListener('click', () => this.setOpen(!this.#open));
   }
   #bounds() {
     const style = getComputedStyle(this.el);
