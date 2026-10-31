@@ -327,6 +327,8 @@ When the final simulator streaming client disconnects, capture is torn down and 
 
 Historical JPEG-build no-terminal idle lifecycle verification measured approximately **0.01–0.02% of one CPU core** on the development Mac. A later explicitly sampled terminal review measured **0.0423% with one idle terminal** and **0.0444% with two**, with unchanged PTY I/O counters and no capture demand. Sampling itself adds work; these are short observations, not universal CPU guarantees. The panel's CPU display uses **100% = one core**; measurements are app-process usage, not total simulator or system usage.
 
+React Native commands run in a **newly opened embedded terminal** can launch Metro into another Simwisp tab through their normal terminal-app hook. Simwisp supplies a private, session-specific `REACT_TERMINAL` launcher; no project or node_modules modification is required. The launcher accepts only a local owned `launchPackager.command` with its adjacent `.packager.env`, forwards it over authenticated same-user local IPC, and uses a new login-shell PTY. Normal login profiles provide Node/NVM configuration; later ad-hoc environment changes in the originating shell are not cloned. Repeated requests for the same launcher/environment in the same originating terminal focus its live launch tab. The tab follows the generated script’s lifetime (including React Native’s own “Press enter” exit prompt); once that script exits, a later request creates a fresh tab. The existing eight-terminal limit applies; detached/closed originating terminals cannot request new tabs. Explicit external `--terminal Terminal` remains external. This does not intercept arbitrary tools' AppleScript or Terminal.app calls. Existing terminals must be replaced after upgrading to receive the hook.
+
 Terminal connections never count as simulator streaming demand. PTY reads/writes and child exits are dispatch-event driven on a separate queue; idle terminals do not poll. Cursor blinking and smooth scrolling are disabled. Shell output waits for browser parsing acknowledgements, with at most one bounded chunk in flight; input and replay buffers are capped at 64 KiB. Connected terminal sockets use a low-frequency keepalive; disconnected retention and ACK deadlines are one-shot timers. Actual shell commands naturally consume CPU when doing work.
 
 Only one Simwisp app instance may run at a time; duplicate launches exit without starting another server.
@@ -386,6 +388,7 @@ RAW_BASELINE_ROOT=/path/to/pre-optimization-snapshot make test-raw-cpu # Serial 
 make test-android-parity # Shared bitrate curve, host resize/rotation, headless fallback and independent input budgets
 make test-android-performance # 60fps paced source → native HTTPS → WebCodecs/render regression; idle/resume and reset counters
 ANDROID_BROWSER=1 make test-android # Full native service/WebCodecs/UI tests, all four combinations (Chrome)
+make test-terminal-launch # Owned launch app/local IPC, shell PTY, lifecycle + UI policy; no project dependency
 make test-metro-native # Inert metadata/mapping/normalization/queue tests
 make test-metro-console # Owned fake Metro + HTTPS/CDP/Chrome/mixed-tab tests (ports 45152/45153)
 make run     # Build and open using saved settings

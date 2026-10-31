@@ -30,9 +30,9 @@ export class SimTerminal {
   #connectTimer; #reconnectTimer; #onStatus; #onSession; #retries = 0;
   #themeChanged = () => { this.#term.options.theme = terminalTheme(); };
   #clicked = () => this.focus();
-  #element;
-  constructor(element, { sessionId = null, onStatus = () => {}, onSession = () => {} } = {}) {
-    this.#element = element; this.#sessionId = sessionId; this.#onStatus = onStatus; this.#onSession = onSession;
+  #element; #onLaunch;
+  constructor(element, { sessionId = null, onStatus = () => {}, onSession = () => {}, onLaunch = () => false } = {}) {
+    this.#onLaunch = onLaunch; this.#element = element; this.#sessionId = sessionId; this.#onStatus = onStatus; this.#onSession = onSession;
     this.#term = new window.Terminal({
       fontFamily: '"SF Mono", Menlo, Monaco, "Courier New", monospace',
       fontSize: 13, lineHeight: 1.4, scrollback: 5000, scrollOnUserInput: false,
@@ -107,6 +107,12 @@ export class SimTerminal {
         if (message.type === 'session') {
           if (this.#connectedBefore) this.#term.reset();
           this.#connectedBefore = true; this.#sessionId = message.id; this.#onSession(message.id);
+        } else if (message.type === 'terminal_launch' && /^[a-f0-9]{32}$/.test(message.id)) {
+          let accepted = false;
+          try { accepted = this.#onLaunch(message.id) === true; } catch {}
+          if (!accepted) this.#send({ type: 'terminal_launch_rejected', id: message.id });
+        } else if (message.type === 'terminal_notice' && typeof message.message === 'string') {
+          this.#term.write('\r\n' + message.message.slice(0, 300).replace(/[\x00-\x1f\x7f]/g, '') + '\r\n');
         } else if (message.type === 'exit' || message.type === 'terminal_error') {
           this.#closing = true; clearTimeout(this.#reconnectTimer);
           this.#onStatus(message.type === 'exit' ? 'exited' : 'error');

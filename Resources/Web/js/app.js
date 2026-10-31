@@ -1267,8 +1267,13 @@ function addTermTab(saved={}) {
   if(!terminalEnabled||!SimTerminal||termTabs.filter(t=>t.type==='terminal').length>=8)return;
   const id='term-'+(++termSerial),el=tabElement(id);
   const tab={type:'terminal',id,label:saved.label||'Terminal '+termSerial,controller:null,el,status:'connecting'};termTabs.push(tab);
-  tab.controller=new SimTerminal(el,{sessionId:saved.sessionId||null,onStatus:status=>{tab.status=status;if(activeTermTabId===id)updateTerminalStatus();},onSession:()=>persistTerminalTabs()});
-  tab.controller.setFontSize(termFontSize);activateTermTab(id);persistTerminalTabs();
+  tab.controller=new SimTerminal(el,{sessionId:saved.sessionId||null,onStatus:status=>{tab.status=status;if(activeTermTabId===id)updateTerminalStatus();},onSession:()=>persistTerminalTabs(),onLaunch:sessionId=>{
+    if(!terminalEnabled||metroDisposed)return false;
+    const existing=termTabs.find(t=>t.type==='terminal'&&t.controller?.sessionId===sessionId);
+    if(existing){activateTermTab(existing.id);revealDeveloperPanel();return true;}
+    const child=addTermTab({sessionId,label:'Metro'});if(child)revealDeveloperPanel();return !!child;
+  }});
+  tab.controller.setFontSize(termFontSize);activateTermTab(id);persistTerminalTabs();return tab;
 }
 function syncConsoleVisibility(){for(const tab of termTabs)if(tab.type==='metro-console')tab.controller?.setVisible(termOpen&&tab.id===activeTermTabId&&!document.hidden);}
 function activateTermTab(id) {

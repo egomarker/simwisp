@@ -9,6 +9,12 @@ final class TerminalManager {
     private let settings: Settings
     private var sessions: [String: TerminalSession] = [:]
     private var bindings: [UUID: TerminalSession] = [:]
+    private var launches: [String: String] = [:]
+    private var pendingLaunches: [String: String] = [:]
+    private lazy var launcher = TerminalLaunchBridge(queue: queue) { [weak self] origin, script in
+        guard let self else { throw WispError("Terminal server is unavailable") }
+        return try self.launch(origin: origin, script: script)
+    } onError: { [weak self] origin in self?.sessions[origin]?.notice("Could not open Metro terminal. Check terminal availability and the eight-session limit.") }
     private var stopping = false
     private var stopCompletion: (() -> Void)?
     init(settings: Settings, network: DispatchQueue) { self.settings = settings; self.network = network }
@@ -37,6 +43,8 @@ final class TerminalManager {
                     if let cols = message["cols"] as? Int, let rows = message["rows"] as? Int { session.resize(cols: cols, rows: rows) }
                 case "output_ack": session.acknowledge(client.id)
                 case "close": session.terminate()
+                case "terminal_launch_rejected":
+                    if let id = message["id"] as? String, self.pendingLaunches[id] == session.id { self.sessions[id]?.terminate() }
                 default: break
                 }
             }
@@ -54,21 +62,41 @@ final class TerminalManager {
                     session = existing
                 } else {
                     guard self.sessions.count < 8 else { throw WispError("Terminal limit reached (8 sessions)") }
-                    session = try TerminalSession(settings: self.settings, queue: self.queue, network: self.network)
-                    self.sessions[session.id] = session
-                    session.onExit = { [weak self, weak session] in
-                        guard let self, let session else { return }
-                        self.sessions.removeValue(forKey: session.id)
-                        self.bindings = self.bindings.filter { $0.value !== session }
-                        if self.stopping && self.sessions.isEmpty { let complete = self.stopCompletion; self.stopCompletion = nil; complete?() }
-                    }
+                    session = try self.makeSession()
                 }
+                self.pendingLaunches.removeValue(forKey: session.id)
                 self.bindings[client.id] = session
                 session.attach(client)
             } catch {
                 self.network.async { client.sendJSON(["type": "terminal_error", "message": error.localizedDescription]); client.closeAfterSending() }
             }
         }
+    }
+    private func makeSession(script: URL? = nil) throws -> TerminalSession {
+        let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let app = try launcher.register(id)
+        do {
+            let session = try TerminalSession(id: id, launcher: app, script: script, settings: settings, queue: queue, network: network)
+            sessions[id] = session
+            session.onExit = { [weak self, weak session] in
+                guard let self, let session else { return }
+                self.launcher.unregister(session.id); self.sessions.removeValue(forKey: session.id)
+                self.launches = self.launches.filter { $0.value != session.id }
+                self.pendingLaunches.removeValue(forKey: session.id)
+                self.bindings = self.bindings.filter { $0.value !== session }
+                if self.stopping && self.sessions.isEmpty { let complete = self.stopCompletion; self.stopCompletion = nil; complete?() }
+            }
+            return session
+        } catch { launcher.unregister(id); throw error }
+    }
+    private func launch(origin: String, script: URL) throws -> String {
+        guard !stopping, settings.terminalEnabled == true, let parent = sessions[origin], parent.attached, !parent.closing else { throw WispError("Originating terminal is not attached") }
+        let key = origin + ":" + (try TerminalLaunchBridge.identity(script))
+        if let id = launches[key], let existing = sessions[id], !existing.closing, existing.running { parent.offerTerminal(id); return id }
+        guard sessions.count < 8 else { throw WispError("Terminal limit reached (8 sessions)") }
+        let child = try makeSession(script: script); launches[key] = child.id; pendingLaunches[child.id] = origin
+        child.expireIfUnattached(); parent.offerTerminal(child.id)
+        return child.id
     }
     var diagnostics: [String: Any] {
         queue.sync {
@@ -86,6 +114,7 @@ final class TerminalManager {
     func stop(completion: @escaping () -> Void) {
         queue.async {
             self.stopping = true
+            self.launcher.stop()
             guard !self.sessions.isEmpty else { completion(); return }
             self.stopCompletion = completion
             for session in Array(self.sessions.values) { session.terminate() }
@@ -96,7 +125,7 @@ private final class TerminalInputBudget { var bytes = 0 } // network queue only
 
 private final class TerminalSession {
     private struct Input { let data: Data; var offset = 0; let completion: () -> Void }
-    let id = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+    let id: String
     let pid: pid_t
     private let fd: Int32
     private let queue: DispatchQueue
@@ -121,10 +150,18 @@ private final class TerminalSession {
     private(set) var readEvents: UInt64 = 0
     private(set) var writeEvents: UInt64 = 0
     var attached: Bool { client != nil }
+    var running: Bool { !childExited }
+    func notice(_ text: String) { if let client { network.async { client.sendJSON(["type": "terminal_notice", "message": text]) } } }
+    func offerTerminal(_ id: String) { if let client { network.async { client.sendJSON(["type": "terminal_launch", "id": id]) } } }
+    func expireIfUnattached() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.setEventHandler { [weak self] in if self?.client == nil { self?.terminate() } }
+        expiry = timer; timer.schedule(deadline: .now() + 10); timer.resume()
+    }
     var replayBytes: Int { replay.count }
     var onExit: (() -> Void)?
-    init(settings: Settings, queue: DispatchQueue, network: DispatchQueue) throws {
-        self.queue = queue; self.network = network
+    init(id: String, launcher: URL, script: URL?, settings: Settings, queue: DispatchQueue, network: DispatchQueue) throws {
+        self.id = id; self.queue = queue; self.network = network
         let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/SimwispShell").path
         guard FileManager.default.isExecutableFile(atPath: helper) else { throw WispError("Terminal helper is missing; rebuild Simwisp") }
         let env = ProcessInfo.processInfo.environment
@@ -152,7 +189,9 @@ private final class TerminalSession {
         environment["HOME"] = NSHomeDirectory(); environment["SHELL"] = shell
         environment["PATH"] = env["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         environment["TERM"] = "xterm-256color"; environment["COLORTERM"] = "truecolor"
-        var argv: [UnsafeMutablePointer<CChar>?] = [helper, settings.projectDirectory, shell].map { value in value.withCString { strdup($0) } }
+        environment["REACT_TERMINAL"] = launcher.path
+        let arguments = [helper, script?.deletingLastPathComponent().path ?? settings.projectDirectory, shell] + (script.map { [$0.path] } ?? [])
+        var argv: [UnsafeMutablePointer<CChar>?] = arguments.map { value in value.withCString { strdup($0) } }
         var envp: [UnsafeMutablePointer<CChar>?] = environment.sorted { $0.key < $1.key }.map { entry in "\(entry.key)=\(entry.value)".withCString { strdup($0) } }
         argv.append(nil); envp.append(nil)
         defer { argv.forEach { free($0) }; envp.forEach { free($0) } }

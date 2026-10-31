@@ -11,6 +11,7 @@ build:
 	@mkdir -p '$(APP)/Contents/MacOS' '$(APP)/Contents/Resources'
 	@scripts/build-android-jpeg.sh '$(APP)/Contents/Resources/simwisp-jpeg.jar'
 	xcrun clang -O2 -Wall -Wextra -Werror -isysroot '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/TerminalHost.c -o '$(APP)/Contents/MacOS/SimwispShell'
+	xcrun clang -O2 -Wall -Wextra -Werror -fobjc-arc -framework AppKit -isysroot '$(SDK)' -target $(ARCH)-apple-macosx14.0 Sources/TerminalLauncher.m -o '$(APP)/Contents/MacOS/SimwispTerminal'
 	xcrun swiftc -swift-version 5 -O -g -sdk '$(SDK)' -target $(ARCH)-apple-macosx14.0 $(SOURCES) -o '$(APP)/Contents/MacOS/Simwisp'
 	@cp Resources/Info.plist '$(APP)/Contents/Info.plist'
 	@rm -rf '$(APP)/Contents/Resources/Web'
@@ -18,12 +19,13 @@ build:
 	@cp Resources/device-sizes.json '$(APP)/Contents/Resources/'
 	@cp -R Resources/Native '$(APP)/Contents/Resources/'
 	@rm -f '$(APP)/Contents/Resources/UPSTREAM-LICENSE'
+	codesign --force --sign - --identifier io.simwisp.terminal-launcher '$(APP)/Contents/MacOS/SimwispTerminal'
 	codesign --force --sign - --identifier io.simwisp.shell '$(APP)/Contents/MacOS/SimwispShell'
 	codesign --force --sign - --identifier io.simwisp.app -r '=designated => identifier "io.simwisp.app"' '$(APP)'
 	codesign --verify --deep --strict '$(APP)'
 check: build
 	@/usr/libexec/PlistBuddy -c 'Print :LSUIElement' '$(APP)/Contents/Info.plist'
-test: test-metro-native test-pairing test-accessibility test-input test-native-input test-headless-ios-controls test-headless-mode test-capture test-device-control test-android-crash-env test-simulator-quit test-video test-stream-flow test-launcher test-android-accessibility-native
+test: test-metro-native test-pairing test-accessibility test-input test-native-input test-headless-ios-controls test-headless-mode test-capture test-device-control test-android-crash-env test-simulator-quit test-video test-stream-flow test-launcher test-android-accessibility-native test-terminal-launch
 .PHONY: test-launcher
 test-launcher:
 	@set -euo pipefail; root=$$(mktemp -d /tmp/simwisp-launcher-results.XXXXXX); \
@@ -202,3 +204,7 @@ test-android-accessibility-native:
 	 "$$root/tests" "$$root" $(ANDROID_A11Y_PHASE)
 test-android-accessibility-ui:
 	@TEST_OUTPUT="$(TEST_OUTPUT)" "$(NODE)" Tests/AndroidAccessibility/frontend.mjs
+
+.PHONY: test-terminal-launch
+test-terminal-launch:
+	@NODE="$(NODE)" TEST_OUTPUT="$(TEST_OUTPUT)" Tests/TerminalLaunch/run.sh
